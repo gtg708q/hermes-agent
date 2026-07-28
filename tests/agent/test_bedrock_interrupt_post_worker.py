@@ -9,6 +9,8 @@ poll loop, interruptible_streaming_api_call would return that partial response
 and silently swallow the /stop signal.
 """
 from types import SimpleNamespace
+import threading
+import time
 from unittest.mock import patch
 
 import pytest
@@ -97,3 +99,37 @@ def test_bedrock_stream_returns_normally_when_not_interrupted():
         api_kwargs = {"__bedrock_region__": "us-east-1", "__bedrock_converse__": True}
         out = cch.interruptible_streaming_api_call(agent, api_kwargs)
         assert out is resp
+
+
+def test_bedrock_deadline_fences_worker_callbacks_after_bounded_return():
+    agent = _FakeAgent()
+    agent._turn_deadline_monotonic = time.monotonic() + 0.05
+    deltas = []
+    agent.stream_delta_callback = deltas.append
+    agent._has_stream_consumers = lambda: True
+    agent._fire_stream_delta = deltas.append
+    release = threading.Event()
+
+    def _blocking_stream(*_args, **kwargs):
+        release.wait(timeout=2)
+        kwargs["on_text_delta"]("late-bedrock-delta")
+        return SimpleNamespace(choices=[], usage=None, stop_reason="end_turn")
+
+    fake_client = SimpleNamespace(converse_stream=lambda **kw: {"stream": []})
+    with patch("agent.bedrock_adapter._get_bedrock_runtime_client", return_value=fake_client), \
+         patch("agent.bedrock_adapter.stream_converse_with_callbacks", side_effect=_blocking_stream), \
+         patch("agent.bedrock_adapter.is_stale_connection_error", return_value=False), \
+         patch("agent.bedrock_adapter.is_streaming_access_denied_error", return_value=False), \
+         patch("agent.bedrock_adapter.invalidate_runtime_client", lambda *a, **k: None):
+        started = time.monotonic()
+        with pytest.raises(Exception, match="wall_clock_budget_reached"):
+            cch.interruptible_streaming_api_call(
+                agent,
+                {"__bedrock_region__": "us-east-1", "__bedrock_converse__": True},
+            )
+        elapsed = time.monotonic() - started
+        release.set()
+        time.sleep(0.1)
+
+    assert elapsed < 0.3
+    assert deltas == []

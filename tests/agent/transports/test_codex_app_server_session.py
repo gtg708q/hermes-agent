@@ -152,6 +152,24 @@ class TestTurnInputCoercion:
 # ---- lifecycle ----
 
 class TestLifecycle:
+    def test_startup_and_turn_start_are_capped_by_remaining_whole_turn_budget(self):
+        class BlockingStartupClient(FakeClient):
+            def initialize(self, **kwargs):
+                timeout = kwargs["timeout"]
+                time.sleep(timeout)
+                raise TimeoutError("startup blocked")
+
+        client = BlockingStartupClient()
+        session = make_session(client)
+        started = time.monotonic()
+        with pytest.raises(Exception, match="wall_clock_budget_reached"):
+            session.run_turn(
+                "hi",
+                turn_timeout=10,
+                deadline_monotonic=time.monotonic() + 0.05,
+            )
+        assert time.monotonic() - started < 0.3
+
     def test_ensure_started_is_idempotent(self):
         client = FakeClient()
         s = make_session(client)

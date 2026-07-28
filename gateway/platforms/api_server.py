@@ -52,6 +52,7 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -650,6 +651,7 @@ class ResponseStore:
 
     def __init__(self, max_size: int = MAX_STORED_RESPONSES, db_path: str = None):
         self._max_size = max_size
+        self._lock = threading.RLock()
         if db_path is None:
             try:
                 from hermes_cli.config import get_hermes_home
@@ -680,6 +682,19 @@ class ResponseStore:
                 name TEXT PRIMARY KEY,
                 response_id TEXT NOT NULL
             )"""
+        )
+        self._conn.execute(
+            """CREATE TABLE IF NOT EXISTS run_idempotency (
+                run_id TEXT PRIMARY KEY,
+                request_fingerprint TEXT NOT NULL,
+                status_json TEXT NOT NULL,
+                updated_at REAL NOT NULL,
+                terminal_at REAL
+            )"""
+        )
+        self._conn.execute(
+            """CREATE INDEX IF NOT EXISTS idx_run_idempotency_terminal_at
+               ON run_idempotency(terminal_at)"""
         )
         self._conn.commit()
         # response_store.db contains conversation history (tool payloads,
@@ -791,6 +806,97 @@ class ResponseStore:
             (name, response_id),
         )
         self._conn.commit()
+
+    def claim_run(
+        self, run_id: str, request_fingerprint: str, status: Dict[str, Any]
+    ) -> tuple[bool, bool, Dict[str, Any]]:
+        """Cross-process CAS for idempotent run ownership."""
+        encoded = json.dumps(status, default=str, sort_keys=True)
+        now = time.time()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = self._conn.execute(
+                    """INSERT OR IGNORE INTO run_idempotency
+                       (run_id, request_fingerprint, status_json, updated_at, terminal_at)
+                       VALUES (?, ?, ?, ?, NULL)""",
+                    (run_id, request_fingerprint, encoded, now),
+                )
+                if cursor.rowcount == 1:
+                    self._conn.commit()
+                    return True, False, status
+                row = self._conn.execute(
+                    "SELECT request_fingerprint, status_json FROM run_idempotency WHERE run_id = ?",
+                    (run_id,),
+                ).fetchone()
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+        if row is None:  # pragma: no cover - defensive against external DB surgery
+            return False, True, {}
+        conflict = not hmac.compare_digest(str(row[0]), request_fingerprint)
+        try:
+            existing = json.loads(row[1])
+        except (json.JSONDecodeError, TypeError):
+            existing = {}
+        return False, conflict, existing
+
+    def put_run_status(self, run_id: str, status: Dict[str, Any]) -> None:
+        encoded = json.dumps(status, default=str, sort_keys=True)
+        now = time.time()
+        terminal_at = (
+            now
+            if status.get("status") in {"completed", "failed", "cancelled"}
+            else None
+        )
+        with self._lock:
+            self._conn.execute(
+                """UPDATE run_idempotency
+                   SET status_json = ?, updated_at = ?,
+                       terminal_at = CASE WHEN ? IS NULL THEN terminal_at ELSE ? END
+                   WHERE run_id = ?""",
+                (encoded, now, terminal_at, terminal_at, run_id),
+            )
+            self._conn.commit()
+
+    def get_run_status(self, run_id: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT status_json FROM run_idempotency WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            return json.loads(row[0])
+        except (json.JSONDecodeError, TypeError):
+            return None
+
+    def delete_terminal_run(self, run_id: str, cutoff: float) -> None:
+        with self._lock:
+            self._conn.execute(
+                """DELETE FROM run_idempotency
+                   WHERE run_id = ? AND terminal_at IS NOT NULL AND terminal_at < ?""",
+                (run_id, cutoff),
+            )
+            self._conn.commit()
+
+    def delete_expired_terminal_runs(self, cutoff: float, limit: int = 100) -> int:
+        """Delete one bounded batch of expired durable terminal run rows."""
+        limit = max(1, int(limit))
+        with self._lock:
+            cursor = self._conn.execute(
+                """DELETE FROM run_idempotency
+                   WHERE run_id IN (
+                       SELECT run_id FROM run_idempotency
+                       WHERE terminal_at IS NOT NULL AND terminal_at < ?
+                       ORDER BY terminal_at
+                       LIMIT ?
+                   )""",
+                (cutoff, limit),
+            )
+            self._conn.commit()
+            return max(0, cursor.rowcount)
 
     def close(self) -> None:
         """Close the database connection."""
@@ -5916,7 +6022,8 @@ class APIServerAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
-    _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
+    # Keep terminal replay long enough for at least five hourly client retries.
+    _RUN_STATUS_TTL = 6 * 3600
 
     def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
         """Update pollable run status without exposing private agent objects."""
@@ -5931,6 +6038,10 @@ class APIServerAdapter(BasePlatformAdapter):
         current.setdefault("created_at", fields.pop("created_at", now))
         current.update(fields)
         self._run_statuses[run_id] = current
+        try:
+            self._response_store.put_run_status(run_id, current)
+        except Exception:
+            logger.exception("Failed to persist durable run status for %s", run_id)
         return current
 
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
@@ -6034,11 +6145,30 @@ class APIServerAdapter(BasePlatformAdapter):
         if key_err is not None:
             return key_err
 
-        # Enforce concurrency limit (shared across all agent-serving
-        # endpoints; configurable via gateway.api_server.max_concurrent_runs).
-        limited = self._concurrency_limited_response()
-        if limited is not None:
-            return limited
+        # A run submission is retryable across network failures only when its
+        # identity is fixed before any work is admitted. Hash the exact header
+        # value received (no case-folding or whitespace normalization) so every
+        # process derives the same opaque run ID without retaining the raw key.
+        idempotency_key = request.headers.get("Idempotency-Key")
+        if (
+            idempotency_key is None
+            or not idempotency_key
+            or len(idempotency_key) > 255
+            or any(ord(char) < 0x21 or ord(char) > 0x7E for char in idempotency_key)
+        ):
+            return web.json_response(
+                _openai_error(
+                    "Idempotency-Key is required and must contain 1-255 visible ASCII characters.",
+                    code="invalid_idempotency_key",
+                ),
+                status=400,
+            )
+        run_id = "run_" + hashlib.sha256(
+            idempotency_key.encode("utf-8")
+        ).hexdigest()[:32]
+
+        # Durable ownership is claimed only after the request body has been
+        # parsed and validated, so malformed requests cannot reserve a key.
 
         try:
             body = await request.json()
@@ -6113,7 +6243,73 @@ class APIServerAdapter(BasePlatformAdapter):
         if selection_error:
             return web.json_response(_openai_error(selection_error), status=400)
 
-        run_id = f"run_{uuid.uuid4().hex}"
+        created_at = time.time()
+        initial_status = {
+            "object": "hermes.run",
+            "run_id": run_id,
+            "status": "queued",
+            "created_at": created_at,
+            "updated_at": created_at,
+            "session_id": session_id or run_id,
+            "model": body.get("model", self._model_name),
+        }
+        fingerprint_payload = {
+            "body": body,
+            "gateway_session_key": gateway_session_key,
+            "profile": _api_request_profile.get(),
+        }
+        request_fingerprint = hashlib.sha256(
+            json.dumps(
+                fingerprint_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        try:
+            owned, conflict, durable_status = self._response_store.claim_run(
+                run_id, request_fingerprint, initial_status
+            )
+        except Exception as exc:
+            logger.exception("Failed to claim durable run ownership for %s", run_id)
+            return web.json_response(
+                _openai_error(
+                    f"Unable to persist idempotent run ownership: {exc}",
+                    code="idempotency_store_unavailable",
+                ),
+                status=503,
+            )
+        response_headers = (
+            {"X-Hermes-Session-Key": gateway_session_key}
+            if gateway_session_key
+            else {}
+        )
+        if conflict:
+            return web.json_response(
+                _openai_error(
+                    "Idempotency-Key was already used with a different request payload.",
+                    code="idempotency_key_conflict",
+                ),
+                status=409,
+                headers=response_headers,
+            )
+        if not owned:
+            self._run_statuses[run_id] = durable_status
+            return web.json_response(durable_status, headers=response_headers)
+
+        # Only the durable CAS winner consumes an execution slot.
+        limited = self._concurrency_limited_response()
+        if limited is not None:
+            self._set_run_status(
+                run_id,
+                "failed",
+                error="Run concurrency limit reached before dispatch; retry with a new Idempotency-Key.",
+                last_event="run.failed",
+            )
+            return limited
+
+        self._run_statuses[run_id] = initial_status
         session_id = session_id or run_id
         # Approval queues gate host-side tool execution and must be isolated
         # per API run.  Client-provided session IDs and memory session keys are
@@ -6124,7 +6320,6 @@ class APIServerAdapter(BasePlatformAdapter):
         ephemeral_system_prompt = instructions
         loop = asyncio.get_running_loop()
         q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
-        created_at = time.time()
         self._run_streams[run_id] = q
         self._run_streams_created[run_id] = created_at
         self._run_approval_sessions[run_id] = approval_session_key
@@ -6432,6 +6627,10 @@ class APIServerAdapter(BasePlatformAdapter):
         run_id = request.match_info["run_id"]
         status = self._run_statuses.get(run_id)
         if status is None:
+            status = self._response_store.get_run_status(run_id)
+            if status is not None:
+                self._run_statuses[run_id] = status
+        if status is None:
             return web.json_response(
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),
                 status=404,
@@ -6649,6 +6848,12 @@ class APIServerAdapter(BasePlatformAdapter):
         ]
         for run_id in stale_statuses:
             self._run_statuses.pop(run_id, None)
+        try:
+            self._response_store.delete_expired_terminal_runs(
+                now - self._RUN_STATUS_TTL
+            )
+        except Exception:
+            logger.exception("Failed to sweep expired durable run statuses")
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface

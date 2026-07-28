@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import random
 import threading
@@ -303,11 +304,18 @@ def _parse_absolute_timestamp(value: Any) -> Optional[float]:
     """
     if value is None or value == "":
         return None
-    if isinstance(value, (int, float)):
-        numeric = float(value)
-        if numeric <= 0:
+    def _valid(numeric: float) -> Optional[float]:
+        seconds = numeric / 1000.0 if numeric > 1_000_000_000_000 else numeric
+        if (
+            not math.isfinite(seconds)
+            or seconds <= 0
+            or seconds > time.time() + 366 * 86400
+        ):
             return None
-        return numeric / 1000.0 if numeric > 1_000_000_000_000 else numeric
+        return seconds
+
+    if isinstance(value, (int, float)):
+        return _valid(float(value))
     if isinstance(value, str):
         raw = value.strip()
         if not raw:
@@ -317,9 +325,9 @@ def _parse_absolute_timestamp(value: Any) -> Optional[float]:
         except ValueError:
             numeric = None
         if numeric is not None:
-            return numeric / 1000.0 if numeric > 1_000_000_000_000 else numeric
+            return _valid(numeric)
         try:
-            return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+            return _valid(datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp())
         except ValueError:
             return None
     return None

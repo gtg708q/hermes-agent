@@ -1,4 +1,8 @@
+import copy
+import json
+import os
 import sys
+import time
 import types
 from types import SimpleNamespace
 
@@ -55,6 +59,63 @@ def _build_agent(monkeypatch):
     agent._persist_session = lambda messages, history=None: None
     agent._save_trajectory = lambda messages, user_message, completed: None
     return agent
+
+
+@pytest.mark.parametrize("platform", ["cli", "api_server", "cron", "subagent"])
+def test_worker_guard_config_propagates_to_all_agent_surfaces(monkeypatch, platform):
+    _patch_agent_bootstrap(monkeypatch)
+    from hermes_cli import config as config_mod
+
+    cfg = copy.deepcopy(config_mod.DEFAULT_CONFIG)
+    cfg["agent"].update({
+        "max_wall_clock_seconds": 123,
+        "repeated_tool_error_limit": 7,
+        "no_progress_tool_limit": 9,
+    })
+    monkeypatch.setattr(config_mod, "load_config", lambda: cfg)
+    for name in (
+        "HERMES_AGENT_MAX_WALL_CLOCK_SECONDS",
+        "HERMES_AGENT_REPEATED_TOOL_ERROR_LIMIT",
+        "HERMES_AGENT_NO_PROGRESS_TOOL_LIMIT",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+    agent = run_agent.AIAgent(
+        model="gpt-4o",
+        base_url="http://127.0.0.1:9208/v1",
+        api_key="test-key",
+        quiet_mode=True,
+        max_iterations=1,
+        platform=platform,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+
+    assert agent.max_wall_clock_seconds == 123
+    assert agent.repeated_tool_error_limit == 7
+    assert agent.no_progress_tool_limit == 9
+
+
+def test_worker_guard_environment_values_explicitly_override_config(monkeypatch):
+    _patch_agent_bootstrap(monkeypatch)
+    from hermes_cli import config as config_mod
+
+    cfg = copy.deepcopy(config_mod.DEFAULT_CONFIG)
+    cfg["agent"]["max_wall_clock_seconds"] = 123
+    monkeypatch.setattr(config_mod, "load_config", lambda: cfg)
+    monkeypatch.setenv("HERMES_AGENT_MAX_WALL_CLOCK_SECONDS", "17")
+
+    agent = run_agent.AIAgent(
+        model="gpt-4o",
+        base_url="http://127.0.0.1:9208/v1",
+        api_key="test-key",
+        quiet_mode=True,
+        max_iterations=1,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+
+    assert agent.max_wall_clock_seconds == 17
 
 
 def _build_copilot_agent(monkeypatch, *, model="gpt-5.4"):
@@ -2949,9 +3010,10 @@ def test_dump_api_request_debug_redacts_request_and_error_secrets(monkeypatch, t
     )
     agent.logs_dir = tmp_path
 
-    notion_token = "ntn_abc123def456ghi789jkl"
-    error_secret = "sk-ant-errorsecret1234567890"
-    response_secret = "sk-ant-responsesecret1234567890"
+    notion_token = "ntn_" + "a" * 32
+    error_secret = "sk-" + "b" * 36
+    response_secret = "sk-" + "c" * 36
+    url_secret = "opaque-super-secret-value"
     response = SimpleNamespace(status_code=400, text=f"provider echoed {response_secret}")
 
     class ProviderError(RuntimeError):
@@ -2965,7 +3027,10 @@ def test_dump_api_request_debug_redacts_request_and_error_secrets(monkeypatch, t
     dump_file = agent._dump_api_request_debug(
         {
             "model": "gpt-4o",
-            "messages": [{"role": "user", "content": f"use {notion_token}"}],
+            "messages": [{
+                "role": "user",
+                "content": f"use {notion_token} at https://example.test/cb?access_token={url_secret}",
+            }],
             "metadata": {"NOTION_API_KEY": notion_token},
         },
         reason="provider_error",
@@ -2975,13 +3040,163 @@ def test_dump_api_request_debug_redacts_request_and_error_secrets(monkeypatch, t
     assert dump_file is not None
     dumped_text = dump_file.read_text()
     stdout_text = capsys.readouterr().out
-    for raw in (notion_token, error_secret, response_secret, "providersecret1234567890"):
+    for raw in (notion_token, error_secret, response_secret, url_secret, "providersecret1234567890"):
         assert raw not in dumped_text
         assert raw not in stdout_text
+    for fingerprint in (notion_token[:7], notion_token[-4:], error_secret[:7], error_secret[-4:]):
+        assert fingerprint not in dumped_text
+        assert fingerprint not in stdout_text
 
     payload = json.loads(dumped_text)
-    assert payload["request"]["headers"]["Authorization"].startswith("Bearer sk-ant-p...")
-    assert "***" in dumped_text or "..." in dumped_text
+    assert payload["request"]["headers"]["Authorization"] == "[REDACTED]"
+    assert "redacted" in dumped_text.lower()
+
+
+def test_dump_api_request_debug_deduplicates_and_bounds_files(monkeypatch, tmp_path):
+    """Repeated quota failures must not create an unbounded dump storm."""
+    _patch_agent_bootstrap(monkeypatch)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"sessions": {"request_dumps": {
+            "max_files": 2, "ttl_days": 30, "deduplicate_seconds": 3600,
+        }}},
+    )
+    agent = run_agent.AIAgent(
+        model="gpt-4o", base_url="http://127.0.0.1:9208/v1",
+        api_key="test-key", quiet_mode=True, max_iterations=1,
+        skip_context_files=True, skip_memory=True,
+    )
+    agent.logs_dir = tmp_path
+    kwargs = {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}
+    error = RuntimeError("usage limit reached; resets in 2 hr")
+
+    first = agent._dump_api_request_debug(kwargs, reason="max_retries_exhausted", error=error)
+    duplicate = agent._dump_api_request_debug(kwargs, reason="max_retries_exhausted", error=error)
+
+    assert first is not None
+    assert duplicate is None
+    assert len(list(tmp_path.glob("request_dump_*.json"))) == 1
+
+
+def test_dump_api_request_debug_prunes_ttl_and_count(monkeypatch, tmp_path):
+    _patch_agent_bootstrap(monkeypatch)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"sessions": {"request_dumps": {
+            "max_files": 2, "ttl_days": 1, "deduplicate_seconds": 0,
+        }}},
+    )
+    agent = run_agent.AIAgent(
+        model="gpt-4o", base_url="http://127.0.0.1:9208/v1",
+        api_key="test-key", quiet_mode=True, max_iterations=1,
+        skip_context_files=True, skip_memory=True,
+    )
+    agent.logs_dir = tmp_path
+    stale = tmp_path / "request_dump_stale_0.json"
+    stale.write_text("{}")
+    old = time.time() - 2 * 86400
+    os.utime(stale, (old, old))
+    kwargs = {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}
+
+    for index in range(3):
+        agent._dump_api_request_debug(
+            kwargs, reason=f"failure-{index}", error=RuntimeError(f"error-{index}")
+        )
+
+    files = list(tmp_path.glob("request_dump_*.json"))
+    assert stale not in files
+    assert len(files) == 2
+
+
+def test_dump_api_request_debug_duplicate_still_enforces_existing_cap(monkeypatch, tmp_path):
+    _patch_agent_bootstrap(monkeypatch)
+    config = {"sessions": {"request_dumps": {
+        "max_files": 5, "ttl_days": 30, "deduplicate_seconds": 0,
+    }}}
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: config)
+    agent = run_agent.AIAgent(
+        model="gpt-4o", base_url="http://127.0.0.1:9208/v1",
+        api_key="test-key", quiet_mode=True, max_iterations=1,
+        skip_context_files=True, skip_memory=True,
+    )
+    agent.logs_dir = tmp_path
+    kwargs = {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}
+    target_error = RuntimeError("usage limit reached")
+    agent._dump_api_request_debug(kwargs, reason="target", error=target_error)
+    for index in range(4):
+        agent._dump_api_request_debug(
+            kwargs, reason=f"other-{index}", error=RuntimeError(f"other-{index}")
+        )
+
+    config["sessions"]["request_dumps"].update(
+        {"max_files": 2, "deduplicate_seconds": 3600}
+    )
+    duplicate = agent._dump_api_request_debug(
+        kwargs, reason="target", error=target_error
+    )
+
+    assert duplicate is None
+    assert len(list(tmp_path.glob("request_dump_*.json"))) == 2
+
+
+def test_dump_api_request_debug_truncates_oversized_payload(monkeypatch, tmp_path):
+    _patch_agent_bootstrap(monkeypatch)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"sessions": {"request_dumps": {
+            "max_files": 2, "max_bytes": 4096,
+            "ttl_days": 7, "deduplicate_seconds": 0,
+        }}},
+    )
+    agent = run_agent.AIAgent(
+        model="gpt-4o", base_url="http://127.0.0.1:9208/v1",
+        api_key="test-key", quiet_mode=True, max_iterations=1,
+        skip_context_files=True, skip_memory=True,
+    )
+    agent.logs_dir = tmp_path
+
+    dump_path = agent._dump_api_request_debug(
+        {"model": "gpt-4o", "messages": [{"role": "user", "content": "x" * 20_000}]},
+        reason="oversized",
+        error=RuntimeError("provider failed"),
+    )
+
+    assert dump_path is not None
+    payload = json.loads(dump_path.read_text(encoding="utf-8"))
+    assert dump_path.stat().st_size < 4096
+    assert payload["request"]["body"]["truncated"] is True
+    assert "x" * 100 not in dump_path.read_text(encoding="utf-8")
+
+
+def test_dump_api_request_debug_count_limit_is_thread_safe(monkeypatch, tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    _patch_agent_bootstrap(monkeypatch)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"sessions": {"request_dumps": {
+            "max_files": 1, "ttl_days": 30, "deduplicate_seconds": 0,
+        }}},
+    )
+    agent = run_agent.AIAgent(
+        model="gpt-4o", base_url="http://127.0.0.1:9208/v1",
+        api_key="test-key", quiet_mode=True, max_iterations=1,
+        skip_context_files=True, skip_memory=True,
+    )
+    agent.logs_dir = tmp_path
+    kwargs = {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(
+            lambda index: agent._dump_api_request_debug(
+                kwargs,
+                reason=f"concurrent-{index}",
+                error=RuntimeError(f"error-{index}"),
+            ),
+            range(8),
+        ))
+
+    assert len(list(tmp_path.glob("request_dump_*.json"))) == 1
 
 
 # --- Reasoning-only response tests (fix for empty content retry loop) ---

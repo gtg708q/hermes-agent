@@ -45,6 +45,24 @@ from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 logger = logging.getLogger(__name__)
 _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 
+
+def _turn_deadline_remaining(agent) -> Optional[float]:
+    deadline = getattr(agent, "_turn_deadline_monotonic", None)
+    if not isinstance(deadline, (int, float)) or not math.isfinite(deadline):
+        return None
+    return max(0.0, deadline - time.monotonic())
+
+
+def _turn_deadline_join_timeout(agent, maximum: float = 0.3) -> float:
+    remaining = _turn_deadline_remaining(agent)
+    if remaining is None:
+        return maximum
+    if remaining <= 0:
+        from agent.errors import TurnWallClockExceeded
+
+        raise TurnWallClockExceeded("wall_clock_budget_reached")
+    return min(maximum, remaining)
+
 # When the fallback chain is fully exhausted on a non-rate-limit failure
 # (e.g. every provider returns a non-retryable client error like HTTP 400),
 # arm a short cooldown so the NEXT turn's restore_primary_runtime stays gated
@@ -572,6 +590,18 @@ def interruptible_api_call(agent, api_kwargs: dict):
     the main retry loop can try again with backoff / credential rotation /
     provider fallback.
     """
+    remaining = _turn_deadline_remaining(agent)
+    if remaining is not None:
+        if remaining <= 0:
+            from agent.errors import TurnWallClockExceeded
+
+            raise TurnWallClockExceeded("wall_clock_budget_reached")
+        # Direct cron/subagent paths cannot be externally cancelled safely;
+        # bound the transport itself rather than claiming thread cancellation.
+        if agent.api_mode != "bedrock_converse":
+            api_kwargs = dict(api_kwargs)
+            api_kwargs["timeout"] = remaining
+
     # Cron and other non-interactive, nested-pool contexts must not spawn the
     # interrupt worker — it wedges before the socket opens on the 2nd+ call
     # (#62151). Run inline instead. See should_use_direct_api_call.
@@ -814,7 +844,12 @@ def interruptible_api_call(agent, api_kwargs: dict):
     t.start()
     _poll_count = 0
     while t.is_alive():
-        t.join(timeout=0.3)
+        try:
+            t.join(timeout=_turn_deadline_join_timeout(agent))
+        except TimeoutError:
+            _request_cancelled["value"] = True
+            _close_request_client_once("turn_deadline")
+            raise
         _poll_count += 1
 
         # Every ~30s: touch activity for the gateway inactivity monitor AND
@@ -2442,15 +2477,21 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 claim_stream_writer(agent)
 
                 def _on_text(text):
+                    if _turn_deadline_remaining(agent) == 0:
+                        return
                     _fire_first()
                     agent._fire_stream_delta(text)
                     deltas_were_sent["yes"] = True
 
                 def _on_tool(name):
+                    if _turn_deadline_remaining(agent) == 0:
+                        return
                     _fire_first()
                     agent._fire_tool_gen_started(name)
 
                 def _on_reasoning(text):
+                    if _turn_deadline_remaining(agent) == 0:
+                        return
                     _fire_first()
                     agent._fire_reasoning_delta(text)
 
@@ -2468,7 +2509,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         t = threading.Thread(target=_bedrock_call, daemon=True)
         t.start()
         while t.is_alive():
-            t.join(timeout=0.3)
+            t.join(timeout=_turn_deadline_join_timeout(agent))
             if agent._interrupt_requested:
                 raise InterruptedError("Agent interrupted during Bedrock API call")
             # Liveness watchdog: no Bedrock event for longer than the stale
@@ -3751,7 +3792,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     _last_heartbeat = time.time()
     _HEARTBEAT_INTERVAL = 30.0  # seconds between gateway activity touches
     while t.is_alive():
-        t.join(timeout=0.3)
+        try:
+            t.join(timeout=_turn_deadline_join_timeout(agent))
+        except TimeoutError:
+            _request_cancelled["value"] = True
+            _close_request_client_once("turn_deadline")
+            raise
 
         # Periodic heartbeat: touch the agent's activity tracker so the
         # gateway's inactivity monitor knows we're alive while waiting

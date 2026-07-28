@@ -20,6 +20,7 @@ preserved.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import re
 import sys
@@ -573,6 +574,34 @@ def init_agent(
 
     agent.model = model
     agent.max_iterations = max_iterations
+    try:
+        from hermes_cli.config import load_config
+        _agent_guard_cfg = (load_config().get("agent") or {})
+    except Exception:
+        _agent_guard_cfg = {}
+
+    def _bounded_setting(key: str, name: str, maximum: float, *, integer: bool = False):
+        raw = os.getenv(name)
+        # config.yaml is canonical; a non-empty env value is an explicit override.
+        value = raw if raw is not None and raw.strip() else _agent_guard_cfg.get(key, 0)
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return 0 if integer else 0.0
+        if not math.isfinite(parsed) or parsed <= 0:
+            return 0 if integer else 0.0
+        bounded = min(parsed, maximum)
+        return int(bounded) if integer else bounded
+
+    agent.max_wall_clock_seconds = _bounded_setting(
+        "max_wall_clock_seconds", "HERMES_AGENT_MAX_WALL_CLOCK_SECONDS", 7 * 24 * 3600
+    )
+    agent.repeated_tool_error_limit = _bounded_setting(
+        "repeated_tool_error_limit", "HERMES_AGENT_REPEATED_TOOL_ERROR_LIMIT", 1000, integer=True
+    )
+    agent.no_progress_tool_limit = _bounded_setting(
+        "no_progress_tool_limit", "HERMES_AGENT_NO_PROGRESS_TOOL_LIMIT", 1000, integer=True
+    )
     # Shared iteration budget — parent creates, children inherit.
     # Consumed by every LLM turn across parent + all subagents.
     agent.iteration_budget = iteration_budget or IterationBudget(max_iterations)

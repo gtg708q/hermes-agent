@@ -13,6 +13,7 @@ extracted functions reach back through the ``run_agent`` module via
 from __future__ import annotations
 
 import concurrent.futures
+import functools
 import json
 from pathlib import Path
 import logging
@@ -135,6 +136,29 @@ def _resolve_concurrent_tool_timeout() -> float | None:
     return value
 
 
+def _turn_deadline_remaining(agent) -> float | None:
+    deadline = getattr(agent, "_turn_deadline_monotonic", None)
+    if not isinstance(deadline, (int, float)):
+        return None
+    return max(0.0, deadline - time.monotonic())
+
+
+def _apply_tool_transport_deadline(agent, name: str, args: dict) -> dict:
+    """Cap tools with native timeout mechanisms to the remaining turn budget."""
+    remaining = _turn_deadline_remaining(agent)
+    if remaining is None:
+        return args
+    if name in {"terminal", "process"}:
+        args = dict(args)
+        configured = args.get("timeout")
+        try:
+            configured = float(configured) if configured is not None else remaining
+        except (TypeError, ValueError):
+            configured = remaining
+        args["timeout"] = max(0.01, min(configured, remaining))
+    return args
+
+
 def _flush_session_db_after_tool_progress(
     agent,
     messages: list,
@@ -148,15 +172,30 @@ def _flush_session_db_after_tool_progress(
     Flush the already-appended assistant/tool messages immediately so the
     transcript survives destructive-but-valid tool calls.
     """
-    try:
-        persisted = agent._flush_messages_to_session_db(messages) is not False
-        if not persisted:
+    deadline_fence = getattr(messages, "_deadline_fence", None)
+    deadline_lock = getattr(messages, "_deadline_lock", None)
+
+    def _persist() -> bool:
+        try:
+            persisted = agent._flush_messages_to_session_db(messages) is not False
+            if not persisted:
+                agent._incremental_persistence_failed = True
+            return persisted
+        except Exception as exc:
             agent._incremental_persistence_failed = True
-        return persisted
-    except Exception as exc:
-        agent._incremental_persistence_failed = True
-        logger.warning("Incremental tool-call persistence failed after %s: %s", stage, exc)
-        return False
+            logger.warning(
+                "Incremental tool-call persistence failed after %s: %s", stage, exc
+            )
+            return False
+
+    if deadline_lock is not None:
+        with deadline_lock:
+            if deadline_fence is not None and deadline_fence.is_set():
+                # The public thread already persisted the fully paired timeout
+                # transcript. Never overwrite it with a stale private prefix.
+                return True
+            return _persist()
+    return _persist()
 
 
 def _ra():
@@ -368,7 +407,37 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     # avoids rebuilding it per result inside the loop below).
     _tool_budget = _budget_for_agent(agent)
 
+    # Establish the execution deadline before any plugin/callback/checkpoint
+    # preflight can block.  Start permission is linearized against this
+    # deadline below, both before submission and inside each worker.
+    batch_started_monotonic = time.monotonic()
+    timeout_s = _resolve_concurrent_tool_timeout()
+    deadline = (
+        batch_started_monotonic + timeout_s if timeout_s is not None else None
+    )
+    turn_deadline = getattr(agent, "_turn_deadline_monotonic", None)
+    if isinstance(turn_deadline, (int, float)):
+        deadline = (
+            turn_deadline if deadline is None else min(deadline, turn_deadline)
+        )
+    if deadline is not None:
+        timeout_s = max(0.0, deadline - batch_started_monotonic)
+    deadline_fence = threading.Event()
+    dispatch_lock = threading.Lock()
+    started_indices: set[int] = set()
+
     # ── Pre-flight: interrupt check ──────────────────────────────────
+    if _turn_deadline_remaining(agent) == 0:
+        agent._wall_clock_expired = True
+        for tc in tool_calls:
+            messages.append(make_tool_result_message(
+                tc.function.name,
+                f"[Tool execution cancelled — {tc.function.name} was skipped because "
+                "the whole-turn wall-clock budget was reached]",
+                tc.id,
+                effect_disposition="none",
+            ))
+        return
     if agent._interrupt_requested:
         print(f"{agent.log_prefix}⚡ Interrupt: skipping {num_tools} tool call(s)")
         for tc in tool_calls:
@@ -461,6 +530,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             function_args=function_args,
             effective_task_id=effective_task_id,
             tool_call_id=getattr(tool_call, "id", "") or "",
+        )
+        function_args = _apply_tool_transport_deadline(
+            agent, function_name, function_args
         )
 
         # ── Block evaluation (BEFORE checkpoint preflight) ───────────
@@ -596,7 +668,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
     # ── Concurrent execution ─────────────────────────────────────────
     # Each slot holds (function_name, function_args, function_result, duration, error_flag, blocked_flag, middleware_trace)
-    results = [None] * num_tools
+    results: list[Any] = [None] * num_tools
     for i, (tc, name, args, middleware_trace, block_result, blocked_by_guardrail) in enumerate(parsed_calls):
         if block_result is not None:
             results[i] = (name, args, block_result, 0.0, True, True, middleware_trace)
@@ -637,6 +709,25 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # submit site below (GHSA-qg5c-hvr5-hjgr, #13617).
         start = time.time()
         try:
+            with dispatch_lock:
+                if deadline_fence.is_set() or (
+                    deadline is not None and time.monotonic() >= deadline
+                ):
+                    result = (
+                        f"[Tool execution cancelled — {function_name} was not started "
+                        "because the whole-turn wall-clock budget was reached]"
+                    )
+                    results[index] = (
+                        function_name,
+                        function_args,
+                        result,
+                        0.0,
+                        True,
+                        True,
+                        middleware_trace,
+                    )
+                    return
+                started_indices.add(index)
             try:
                 result = agent._invoke_tool(
                     function_name,
@@ -675,7 +766,11 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 logger.info("tool %s failed (%.2fs): %s", function_name, duration, result[:200])
             else:
                 logger.info("tool %s completed (%.2fs, %d chars)", function_name, duration, len(result))
-            results[index] = (function_name, function_args, result, duration, is_error, False, middleware_trace)
+            if not deadline_fence.is_set():
+                results[index] = (
+                    function_name, function_args, result, duration, is_error,
+                    False, middleware_trace,
+                )
         finally:
             # Tear down worker-tid tracking.  Clear any interrupt bit we may
             # have set so the next task scheduled onto this recycled tid
@@ -706,8 +801,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         futures = []
         future_to_index = {}
         timed_out_indices: set[int] = set()
-        timeout_s = _resolve_concurrent_tool_timeout()
-        deadline = time.monotonic() + timeout_s if timeout_s is not None else None
         if runnable_calls:
             max_workers = min(len(runnable_calls), _MAX_TOOL_WORKERS)
             # Daemon workers: an interrupted/timed-out batch is abandoned with
@@ -720,6 +813,28 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             abandon_executor = False
             try:
                 for submit_index, (i, tc, name, args) in enumerate(runnable_calls):
+                    with dispatch_lock:
+                        submit_allowed = not deadline_fence.is_set() and (
+                            deadline is None or time.monotonic() < deadline
+                        )
+                        if not submit_allowed:
+                            deadline_fence.set()
+                    if not submit_allowed:
+                        for skipped_i, _tc, skipped_name, skipped_args in runnable_calls[
+                            submit_index:
+                        ]:
+                            if results[skipped_i] is None:
+                                results[skipped_i] = (
+                                    skipped_name,
+                                    skipped_args,
+                                    f"[Tool execution cancelled — {skipped_name} was not started "
+                                    "because the whole-turn wall-clock budget was reached]",
+                                    0.0,
+                                    True,
+                                    True,
+                                    parsed_calls[skipped_i][3],
+                                )
+                        break
                     # Propagate the agent turn's ContextVars (e.g.
                     # _approval_session_key) AND thread-local approval/sudo
                     # callbacks into the worker thread; clears callbacks on exit.
@@ -785,11 +900,32 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
 
                     if deadline is not None and time.monotonic() >= deadline:
                         abandon_executor = True
-                        timed_out_indices = {
-                            future_to_index[f]
-                            for f in not_done
-                            if f in future_to_index
-                        }
+                        with dispatch_lock:
+                            deadline_fence.set()
+                            timed_out_indices = {
+                                future_to_index[f]
+                                for f in not_done
+                                if f in future_to_index
+                                and future_to_index[f] in started_indices
+                            }
+                            for f in not_done:
+                                pending_index = future_to_index.get(f)
+                                if (
+                                    pending_index is not None
+                                    and pending_index not in started_indices
+                                    and results[pending_index] is None
+                                ):
+                                    pending_name = parsed_calls[pending_index][1]
+                                    results[pending_index] = (
+                                        pending_name,
+                                        parsed_calls[pending_index][2],
+                                        f"[Tool execution cancelled — {pending_name} was not started "
+                                        "because the whole-turn wall-clock budget was reached]",
+                                        0.0,
+                                        True,
+                                        True,
+                                        parsed_calls[pending_index][3],
+                                    )
                         _still_running = [
                             parsed_calls[i][1]
                             for i in timed_out_indices
@@ -868,12 +1004,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         blocked = False
         is_error = True
         progress_function_name = name
-        # A worker can finish and write results[i] in the window between the
-        # deadline snapshot (timed_out_indices, taken from not_done) and this
-        # loop. Prefer that real result over a fabricated timeout message — the
-        # tool genuinely succeeded, just slightly late.
+        deadline_timed_out = i in timed_out_indices
         effect_disposition = None
-        if i in timed_out_indices and r is None:
+        if deadline_timed_out:
             suffix = f"{timeout_s:.1f}s" if timeout_s is not None else "the configured timeout"
             function_result = f"Error executing tool '{name}': timed out after {suffix}"
             effect_disposition = "unknown"
@@ -1004,7 +1137,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         # Every completion surface is downstream of the canonical append. If
         # the UI bridge or process dies while projecting one of these events,
         # resume can reconstruct the tool result that was already visible.
-        if not blocked and agent.tool_progress_callback:
+        if not blocked and not deadline_timed_out and agent.tool_progress_callback:
             try:
                 agent.tool_progress_callback(
                     "tool.completed", progress_function_name, None, None,
@@ -1029,7 +1162,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 response_preview = _preview_str[:agent.log_prefix_chars] + "..." if len(_preview_str) > agent.log_prefix_chars else _preview_str
                 print(f"  ✅ Tool {i+1} completed in {tool_duration:.2f}s - {response_preview}")
 
-        if not blocked and agent.tool_complete_callback:
+        if not blocked and not deadline_timed_out and agent.tool_complete_callback:
             try:
                 display_args = _redact_tool_args_for_display(name, args) or args
                 agent.tool_complete_callback(
@@ -1086,6 +1219,18 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     _tool_budget = _budget_for_agent(agent)
     for i, tool_call in enumerate(assistant_message.tool_calls, 1):
         if getattr(agent, "_incremental_persistence_failed", False):
+            return
+        if _turn_deadline_remaining(agent) == 0:
+            agent._wall_clock_expired = True
+            for skipped_tc in assistant_message.tool_calls[i - 1:]:
+                skipped_name = skipped_tc.function.name
+                messages.append(make_tool_result_message(
+                    skipped_name,
+                    f"[Tool execution cancelled — {skipped_name} was skipped because "
+                    "the whole-turn wall-clock budget was reached]",
+                    skipped_tc.id,
+                    effect_disposition="none",
+                ))
             return
         # SAFETY: check interrupt BEFORE starting each tool.
         # If the user sent "stop" during a previous tool's execution,
@@ -1175,6 +1320,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             function_args=function_args,
             effective_task_id=effective_task_id,
             tool_call_id=getattr(tool_call, "id", "") or "",
+        )
+        function_args = _apply_tool_transport_deadline(
+            agent, function_name, function_args
         )
 
         # Check plugin hooks for a block directive before executing.
@@ -1279,6 +1427,15 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     )
             except Exception:
                 pass  # never block tool execution
+
+        if not _execution_blocked:
+            mark_started = getattr(messages, "mark_tool_started", None)
+            if mark_started is not None:
+                dispatch_allowed = bool(mark_started(tool_call.id))
+            else:
+                dispatch_allowed = _turn_deadline_remaining(agent) != 0
+            if not dispatch_allowed:
+                return
 
         tool_start_time = time.time()
 
@@ -1630,6 +1787,12 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
             tool_duration = time.time() - tool_start_time
 
+        if _turn_deadline_remaining(agent) == 0:
+            # The public deadline wrapper has already published a deterministic
+            # timeout row. Fence every late in-process mutation/projection here;
+            # the tool's external side effects, if any, remain unknowable.
+            return
+
         if isinstance(function_result, str):
             result_preview = function_result if agent.verbose_logging else (
                 function_result[:200] if len(function_result) > 200 else function_result
@@ -1743,7 +1906,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             except Exception as cb_err:
                 logging.debug(f"Tool progress callback error: {cb_err}")
 
-        if not _execution_blocked and agent.tool_complete_callback:
+        if (
+            not _execution_blocked
+            and _turn_deadline_remaining(agent) != 0
+            and agent.tool_complete_callback
+        ):
             try:
                 display_args = (
                     _redact_tool_args_for_display(function_name, function_args)
@@ -1824,6 +1991,149 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         agent._apply_pending_steer_to_tool_results(messages, num_tools_seq)
 
 
+_execute_tool_calls_sequential_inline = execute_tool_calls_sequential
+
+
+class _DeadlinePrivateMessages(list):
+    """Private sequential transcript whose late flushes can be fenced."""
+
+    def __init__(
+        self,
+        messages: list,
+        deadline_fence: threading.Event,
+        deadline: float,
+    ) -> None:
+        super().__init__(messages)
+        self._deadline_fence = deadline_fence
+        self._deadline = deadline
+        self._deadline_lock = threading.Lock()
+        self._started_tool_call_ids: set[str] = set()
+
+    def append(self, item: Any) -> None:
+        with self._deadline_lock:
+            if not self._deadline_fence.is_set():
+                super().append(item)
+
+    def mark_tool_started(self, tool_call_id: str) -> bool:
+        with self._deadline_lock:
+            if self._deadline_fence.is_set() or time.monotonic() >= self._deadline:
+                return False
+            self._started_tool_call_ids.add(tool_call_id)
+            return True
+
+
+def _execute_tool_calls_sequential_bounded(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
+    """Run sequential tools behind the whole-turn deadline boundary.
+
+    Python cannot safely kill an arbitrary in-process plugin/MCP thread.  When
+    a tool ignores cooperative interruption, return at the turn deadline and
+    fence its late transcript output by executing against a private message
+    list.  External side effects already performed by that tool cannot be
+    rolled back; callers receive ``effect_disposition=unknown`` accordingly.
+    """
+    remaining = _turn_deadline_remaining(agent)
+    if remaining is None:
+        return _execute_tool_calls_sequential_inline(
+            agent, assistant_message, messages, effective_task_id,
+            api_call_count, finalize=finalize,
+        )
+    if remaining <= 0:
+        agent._wall_clock_expired = True
+        for tc in assistant_message.tool_calls:
+            messages.append(make_tool_result_message(
+                tc.function.name,
+                "[Tool execution cancelled — the whole-turn wall-clock budget was reached]",
+                tc.id,
+                effect_disposition="none",
+            ))
+        return
+
+    initial_message_count = len(messages)
+    deadline_fence = threading.Event()
+    private_messages = _DeadlinePrivateMessages(
+        messages,
+        deadline_fence,
+        agent._turn_deadline_monotonic,
+    )
+    outcome: dict[str, Any] = {}
+    finished = threading.Event()
+
+    def _run() -> None:
+        try:
+            _execute_tool_calls_sequential_inline(
+                agent, assistant_message, private_messages, effective_task_id,
+                api_call_count, finalize=finalize,
+            )
+        except BaseException as exc:
+            outcome["error"] = exc
+        finally:
+            outcome["finished_at"] = time.monotonic()
+            finished.set()
+
+    worker = threading.Thread(
+        target=propagate_context_to_thread(_run),
+        name="hermes-sequential-tool-deadline",
+        daemon=True,
+    )
+    worker.start()
+    wait_remaining = max(
+        0.0, agent._turn_deadline_monotonic - time.monotonic()
+    )
+    if finished.wait(timeout=wait_remaining) and (
+        outcome.get("finished_at", float("inf")) < agent._turn_deadline_monotonic
+    ):
+        if "error" in outcome:
+            raise outcome["error"]
+        messages[:] = private_messages
+        return
+
+    agent._wall_clock_expired = True
+    # Fence the private worker before taking its completed-prefix snapshot.
+    # Any flush that was delayed until after this point becomes a no-op, so it
+    # cannot overwrite the canonical timeout rows persisted below.
+    with private_messages._deadline_lock:
+        deadline_fence.set()
+        completed_prefix = list(private_messages[initial_message_count:])
+        started_tool_call_ids = set(private_messages._started_tool_call_ids)
+    worker_tid = worker.ident
+    if worker_tid is not None:
+        try:
+            _ra()._set_interrupt(True, worker_tid)
+        except Exception:
+            pass
+    completed_count = min(
+        len(completed_prefix), len(assistant_message.tool_calls)
+    )
+    published_messages = list(messages)
+    published_messages.extend(completed_prefix[:completed_count])
+    for tc in assistant_message.tool_calls[completed_count:]:
+        in_flight = tc.id in started_tool_call_ids
+        if in_flight:
+            content = (
+                f"Error executing tool '{tc.function.name}': whole-turn wall-clock "
+                "budget reached; the in-process tool could not be forcibly cancelled"
+            )
+            disposition = "unknown"
+        else:
+            content = (
+                f"[Tool execution cancelled — {tc.function.name} was not started "
+                "because the whole-turn wall-clock budget was reached]"
+            )
+            disposition = "none"
+        published_messages.append(make_tool_result_message(
+            tc.function.name,
+            content,
+            tc.id,
+            effect_disposition=disposition,
+        ))
+    messages[:] = published_messages
+    _flush_session_db_after_tool_progress(
+        agent,
+        messages,
+        stage="whole-turn sequential tool deadline",
+    )
+
+
 
 
 def execute_tool_calls_segmented(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, segments=None) -> None:
@@ -1884,6 +2194,11 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
             config=_tool_budget,
         )
         agent._apply_pending_steer_to_tool_results(messages, total_tools)
+
+
+execute_tool_calls_sequential = functools.wraps(_execute_tool_calls_sequential_inline)(
+    _execute_tool_calls_sequential_bounded
+)
 
 
 __all__ = [

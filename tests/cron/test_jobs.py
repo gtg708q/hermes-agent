@@ -1,6 +1,8 @@
 """Tests for cron/jobs.py — schedule parsing, job CRUD, and due-job detection."""
 
+import os
 import threading
+import time
 import pytest
 from datetime import datetime, timedelta, timezone
 
@@ -1809,6 +1811,101 @@ class TestCronOutputRetention:
             "hermes_cli.config.load_config", lambda: {"cron": {"output_retention": "oops"}}
         )
         assert jobs._cron_output_keep() == jobs._CRON_OUTPUT_DEFAULT_KEEP
+
+    def test_gc_orphaned_output_removes_only_stale_unknown_jobs(self, tmp_cron_dir):
+        from cron.jobs import gc_orphaned_output, get_cron_output_dir, save_jobs
+
+        output = get_cron_output_dir()
+        save_jobs([{"id": "live", "name": "live"}])
+        for name in ("live", "fresh-orphan", "stale-orphan"):
+            d = output / name
+            d.mkdir(parents=True)
+            (d / "run.md").write_text("output")
+        stale = output / "stale-orphan"
+        old = time.time() - 10 * 86400
+        os.utime(stale, (old, old))
+
+        assert gc_orphaned_output(retention_days=7) == 1
+        assert (output / "live").exists()
+        assert (output / "fresh-orphan").exists()
+        assert not stale.exists()
+
+    def test_gc_orphaned_output_fails_closed_on_corrupt_jobs_store(self, tmp_cron_dir):
+        from cron import jobs
+
+        output = jobs.get_cron_output_dir()
+        orphan = output / "must-survive"
+        orphan.mkdir(parents=True)
+        old = time.time() - 10 * 86400
+        os.utime(orphan, (old, old))
+        jobs._current_cron_store().jobs_file.write_text("{broken", encoding="utf-8")
+
+        assert jobs.gc_orphaned_output(retention_days=0, interval_seconds=3600) == 0
+        assert orphan.exists()
+        assert not (output / ".orphan-gc").exists()
+
+    @pytest.mark.skipif(
+        os.name == "nt", reason="Creating symlinks requires elevated privileges on Windows"
+    )
+    def test_gc_orphaned_output_never_follows_symlink(self, tmp_cron_dir, tmp_path):
+        from cron.jobs import gc_orphaned_output, get_cron_output_dir, save_jobs
+
+        save_jobs([])
+        target = tmp_path / "outside-cron"
+        target.mkdir()
+        (target / "keep.txt").write_text("keep", encoding="utf-8")
+        link = get_cron_output_dir() / "stale-link"
+        link.symlink_to(target, target_is_directory=True)
+
+        assert gc_orphaned_output(retention_days=0, interval_seconds=0) == 0
+        assert link.is_symlink()
+        assert (target / "keep.txt").read_text(encoding="utf-8") == "keep"
+
+    def test_gc_orphaned_output_advances_cadence_only_after_safe_scan(self, tmp_cron_dir):
+        from cron.jobs import gc_orphaned_output, get_cron_output_dir, save_jobs
+
+        save_jobs([])
+        output = get_cron_output_dir()
+        first = output / "first"
+        first.mkdir()
+        old = time.time() - 10 * 86400
+        os.utime(first, (old, old))
+
+        assert gc_orphaned_output(retention_days=0, interval_seconds=3600) == 1
+        marker = output / ".orphan-gc"
+        marker_mtime = marker.stat().st_mtime
+
+        second = output / "second"
+        second.mkdir()
+        os.utime(second, (old, old))
+        assert gc_orphaned_output(retention_days=0, interval_seconds=3600) == 0
+        assert second.exists()
+        assert marker.stat().st_mtime == marker_mtime
+
+    def test_gc_orphaned_output_eventually_scans_past_live_directories(self, tmp_cron_dir):
+        from cron.jobs import gc_orphaned_output, get_cron_output_dir, save_jobs
+
+        live_ids = [f"a-live-{index:03d}" for index in range(8)]
+        save_jobs([{"id": job_id, "name": job_id} for job_id in live_ids])
+        output = get_cron_output_dir()
+        for job_id in live_ids:
+            (output / job_id).mkdir()
+        old = time.time() - 10 * 86400
+        orphans = [output / f"z-orphan-{index:03d}" for index in range(3)]
+        for orphan in orphans:
+            orphan.mkdir()
+            os.utime(orphan, (old, old))
+
+        removed = [
+            gc_orphaned_output(
+                retention_days=0, interval_seconds=0, max_directories=1
+            )
+            for _ in range(3)
+        ]
+
+        assert removed == [1, 1, 1]
+        assert all((output / job_id).is_dir() for job_id in live_ids)
+        assert all(not orphan.exists() for orphan in orphans)
 
 
 # =========================================================================

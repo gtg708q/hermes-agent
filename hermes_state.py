@@ -18,6 +18,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -9648,6 +9649,7 @@ class SessionDB:
         started_before: Optional[float] = None,
         started_after: Optional[float] = None,
         source: Optional[str] = None,
+        exclude_sources: Optional[List[str]] = None,
         title_like: Optional[str] = None,
         end_reason: Optional[str] = None,
         cwd_prefix: Optional[str] = None,
@@ -9714,6 +9716,12 @@ class SessionDB:
         if source:
             clauses.append("s.source = ?")
             params.append(source)
+        if exclude_sources:
+            normalized_sources = [str(value) for value in exclude_sources if str(value)]
+            if normalized_sources:
+                placeholders = ",".join("?" for _ in normalized_sources)
+                clauses.append(f"COALESCE(s.source, '') NOT IN ({placeholders})")
+                params.extend(normalized_sources)
         if title_like:
             clauses.append("LOWER(COALESCE(s.title, '')) LIKE ?")
             params.append(f"%{title_like.lower()}%")
@@ -10680,6 +10688,7 @@ class SessionDB:
     def maybe_auto_prune_and_vacuum(
         self,
         retention_days: int = 90,
+        retention_by_source: Optional[Dict[str, float]] = None,
         min_interval_hours: int = 24,
         vacuum: bool = True,
         sessions_dir: Optional[Path] = None,
@@ -10705,20 +10714,52 @@ class SessionDB:
         """
         result: Dict[str, Any] = {"skipped": False, "pruned": 0, "vacuumed": False}
         try:
+            parsed_retention_days = float(retention_days)
+            parsed_interval_hours = float(min_interval_hours)
+            if (
+                not math.isfinite(parsed_retention_days)
+                or parsed_retention_days < 0
+                or parsed_retention_days > 3650
+                or not math.isfinite(parsed_interval_hours)
+                or parsed_interval_hours < 0
+                or parsed_interval_hours > 8760
+            ):
+                raise ValueError("invalid auto-prune retention or interval")
+
             # Skip if another process/call did maintenance recently.
             last_raw = self.get_meta("last_auto_prune")
             now = time.time()
             if last_raw:
                 try:
                     last_ts = float(last_raw)
-                    if now - last_ts < min_interval_hours * 3600:
+                    if now - last_ts < parsed_interval_hours * 3600:
                         result["skipped"] = True
                         return result
                 except (TypeError, ValueError):
                     pass  # corrupt meta; treat as no prior run
 
-            pruned = self.prune_sessions(
-                older_than_days=retention_days,
+            source_retention: Dict[str, float] = {}
+            configured_sources = (
+                retention_by_source if isinstance(retention_by_source, dict) else {}
+            )
+            for source, days in configured_sources.items():
+                try:
+                    parsed_days = float(days)
+                except (TypeError, ValueError):
+                    continue
+                if source and math.isfinite(parsed_days) and 0 <= parsed_days <= 3650:
+                    source_retention[str(source)] = parsed_days
+
+            pruned = 0
+            for source, days in source_retention.items():
+                pruned += self.prune_sessions(
+                    older_than_days=days,
+                    source=source,
+                    sessions_dir=sessions_dir,
+                )
+            pruned += self.prune_sessions(
+                older_than_days=parsed_retention_days,
+                exclude_sources=list(source_retention),
                 sessions_dir=sessions_dir,
             )
             result["pruned"] = pruned
@@ -10738,9 +10779,9 @@ class SessionDB:
 
             if pruned > 0:
                 logger.info(
-                    "state.db auto-maintenance: pruned %d session(s) inactive for %d days%s",
+                    "state.db auto-maintenance: pruned %d session(s) inactive for %g days%s",
                     pruned,
-                    retention_days,
+                    parsed_retention_days,
                     " + VACUUM" if result["vacuumed"] else "",
                 )
         except Exception as exc:

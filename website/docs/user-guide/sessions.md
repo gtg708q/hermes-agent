@@ -700,13 +700,39 @@ Default is **off** — session history is valuable for `session_search` recall, 
 sessions:
   auto_prune: true          # opt in — default is false
   retention_days: 90        # keep ended sessions active within this window
+  retention_by_source:      # optional high-volume source overrides
+    cron: 14
   vacuum_after_prune: true  # reclaim disk space after a pruning sweep
   min_interval_hours: 24    # don't re-run the sweep more often than this
+  request_dumps:
+    max_files: 20           # global cap under ~/.hermes/sessions
+    max_bytes: 1000000      # compact a single oversized dump
+    ttl_days: 7             # remove older request diagnostics
+    deduplicate_seconds: 3600
 ```
 
 Active sessions are never auto-pruned, regardless of age. Ended sessions are
 aged from their latest message, so a long-lived conversation used recently is
 not deleted merely because it began before the retention window.
+
+Request diagnostics always persist the `Authorization` header as `[REDACTED]`
+(never a masked key prefix or suffix). Repeated failures with the same provider
+failure shape are deduplicated during `deduplicate_seconds`; TTL and count caps
+are enforced whenever a new dump is considered. This specifically prevents a
+known quota wall from creating one near-identical dump per retry/worker.
+
+Provider credential pools provide the corresponding request-side circuit
+breaker: a 401/402/429 marks the failed credential unavailable in the
+profile-scoped auth store. Provider `reset_at`, `resets_at`, `retry_after`,
+`Retry-After`, and `x-ratelimit-reset` values are normalized and take precedence
+over the fallback cooldown, so cron/gateway workers skip the exhausted
+credential until its advertised reset instead of probing it every tick.
+
+The compact/contentless FTS layout is intentionally not changed by retention
+settings. Existing databases migrate only through the explicit, disk-preflighted
+`hermes sessions optimize-storage` path; automatic startup migration remains
+deferred because rebuilding a multi-gigabyte FTS index can temporarily require
+another full database copy and block writers.
 
 ### Manual Cleanup
 

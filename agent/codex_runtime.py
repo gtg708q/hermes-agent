@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
 from types import SimpleNamespace
@@ -692,9 +693,31 @@ def run_codex_app_server_turn(
     # return reaches us. Do NOT append again — that would duplicate.
 
     try:
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        _raw_deadline = getattr(agent, "_turn_deadline_monotonic", None)
+        _deadline = _raw_deadline if isinstance(_raw_deadline, (int, float)) and math.isfinite(_raw_deadline) else None
+        _remaining = (
+            max(0.0, _deadline - time.monotonic())
+            if _deadline is not None
+            else 600.0
+        )
+        if _deadline is not None and _remaining <= 0:
+            from agent.errors import TurnWallClockExceeded
+
+            raise TurnWallClockExceeded("wall_clock_budget_reached")
+        turn = agent._codex_session.run_turn(
+            user_input=user_message,
+            turn_timeout=max(0.01, _remaining),
+            notification_poll_timeout=min(0.25, max(0.01, _remaining)),
+            deadline_monotonic=_deadline,
+        )
     except Exception as exc:
-        logger.exception("codex app-server turn failed")
+        from agent.errors import TurnWallClockExceeded
+
+        _wall_clock_stopped = isinstance(exc, TurnWallClockExceeded)
+        if _wall_clock_stopped:
+            logger.info("codex app-server turn stopped by whole-turn deadline")
+        else:
+            logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn
         # respawns from scratch instead of reusing a dead client.
         try:
@@ -714,8 +737,13 @@ def run_codex_app_server_turn(
             agent.clear_interrupt()
         return {
             "final_response": (
-                f"Codex app-server turn failed: {exc}. "
-                f"Fall back to default runtime with `/codex-runtime auto`."
+                "Stopped this run because the configured whole-turn wall-clock "
+                "budget was reached (wall_clock_budget_reached)."
+                if _wall_clock_stopped
+                else (
+                    f"Codex app-server turn failed: {exc}. "
+                    f"Fall back to default runtime with `/codex-runtime auto`."
+                )
             ),
             "messages": messages,
             "api_calls": 0,
@@ -727,7 +755,7 @@ def run_codex_app_server_turn(
                 if _interrupt_message
                 else {}
             ),
-            "error": str(exc),
+            "error": "wall_clock_budget_reached" if _wall_clock_stopped else str(exc),
         }
 
     # This runtime bypasses the normal conversation-loop finalizer. Mirror its

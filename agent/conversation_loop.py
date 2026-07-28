@@ -16,6 +16,7 @@ resolved through :func:`_ra` so those patches keep working.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -1050,6 +1051,63 @@ def _notify_context_engine_turn_complete(
         )
 
 
+def _loop_guard_reason(agent: Any, messages: List[Dict[str, Any]], started_at: float) -> Optional[str]:
+    """Return a configured hard-stop reason for a stuck tool loop."""
+    wall_clock = max(0.0, float(getattr(agent, "max_wall_clock_seconds", 0) or 0))
+    if wall_clock and time.monotonic() - started_at >= wall_clock:
+        return "wall_clock_budget_reached"
+
+    error_limit = max(0, int(getattr(agent, "repeated_tool_error_limit", 0) or 0))
+    if error_limit:
+        error_signatures: List[str] = []
+        for message in reversed(messages):
+            if not isinstance(message, dict):
+                continue
+            if message.get("role") == "user":
+                break
+            if message.get("role") != "tool":
+                continue
+            content = str(message.get("content") or "")
+            lowered = content.lower()
+            if not any(marker in lowered for marker in ("error", "failed", "traceback", "exception", '"exit_code": 1')):
+                break
+            error_signatures.append(hashlib.sha256(content.encode("utf-8")).hexdigest())
+            if len(error_signatures) >= error_limit:
+                if len(set(error_signatures[:error_limit])) == 1:
+                    return "repeated_tool_error_limit_reached"
+                break
+
+    no_progress_limit = max(0, int(getattr(agent, "no_progress_tool_limit", 0) or 0))
+    if no_progress_limit:
+        call_signatures: List[str] = []
+        for message in reversed(messages):
+            if not isinstance(message, dict):
+                continue
+            if message.get("role") == "user":
+                break
+            if message.get("role") != "assistant" or not message.get("tool_calls"):
+                continue
+            calls = message.get("tool_calls") or []
+            normalized_calls = []
+            for call in calls:
+                if not isinstance(call, dict):
+                    normalized_calls.append(str(call))
+                    continue
+                raw_function = call.get("function")
+                function = raw_function if isinstance(raw_function, dict) else {}
+                normalized_calls.append({
+                    "name": function.get("name") or call.get("name"),
+                    "arguments": function.get("arguments") or call.get("arguments"),
+                })
+            normalized = json.dumps(normalized_calls, sort_keys=True, default=str)
+            call_signatures.append(hashlib.sha256(normalized.encode("utf-8")).hexdigest())
+            if len(call_signatures) >= no_progress_limit:
+                if len(set(call_signatures[:no_progress_limit])) == 1:
+                    return "no_progress_tool_limit_reached"
+                break
+    return None
+
+
 def run_conversation(
     agent,
     user_message: Any,
@@ -1082,6 +1140,16 @@ def run_conversation(
     Returns:
         Dict: Complete conversation result with final response and message history
     """
+    # Start the whole-turn clock at the public turn entry, before decoding,
+    # prompt construction, compression, plugins, persistence, or prefetch.
+    _turn_started_at = time.monotonic()
+    _wall_clock_limit = max(
+        0.0, float(getattr(agent, "max_wall_clock_seconds", 0) or 0)
+    )
+    agent._turn_deadline_monotonic = (
+        _turn_started_at + _wall_clock_limit if _wall_clock_limit else None
+    )
+
     if moa_config is None:
         try:
             from hermes_cli.moa_config import decode_moa_turn
@@ -1142,6 +1210,23 @@ def run_conversation(
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
+    if _loop_guard_reason(agent, messages, _turn_started_at) == "wall_clock_budget_reached":
+        stopped = (
+            "Stopped this run because the configured whole-turn wall-clock "
+            "budget was reached (wall_clock_budget_reached)."
+        )
+        agent._persist_session(messages, conversation_history)
+        return {
+            "final_response": stopped,
+            "messages": messages,
+            "api_calls": 0,
+            "completed": False,
+            "partial": True,
+            "interrupted": False,
+            "error": "wall_clock_budget_reached",
+            "agent_persisted": True,
+        }
+
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
     agent._delivered_interim_texts = set()
@@ -1184,7 +1269,6 @@ def run_conversation(
     # retain that ephemeral output and rebase it onto the compacted transcript
     # on the next loop iteration. This prevents a second advisor fan-out.
     pending_moa_prepared_request = None
-
     # Per-turn tally of consecutive successful credential-pool token refreshes,
     # keyed by (provider, pool-entry-id). A persistent upstream 401 lets
     # ``try_refresh_current()`` "succeed" forever on a single-entry OAuth pool,
@@ -1214,6 +1298,14 @@ def run_conversation(
         )
 
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+        _guard_reason = _loop_guard_reason(agent, messages, _turn_started_at)
+        if _guard_reason:
+            _turn_exit_reason = _guard_reason
+            final_response = (
+                "Stopped this run because a configured worker safety limit was reached "
+                f"({_guard_reason}). Review the latest tool output before continuing."
+            )
+            break
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
             _apply_active_turn_redirect(agent, messages, _redirect_text)
@@ -3237,6 +3329,20 @@ def run_conversation(
                 break
 
             except Exception as api_error:
+                from agent.errors import TurnWallClockExceeded
+
+                if isinstance(api_error, TurnWallClockExceeded):
+                    if thinking_spinner:
+                        thinking_spinner.stop("")
+                        thinking_spinner = None
+                    if agent.thinking_callback:
+                        agent.thinking_callback("")
+                    _turn_exit_reason = "wall_clock_budget_reached"
+                    final_response = (
+                        "Stopped this run because the configured whole-turn wall-clock "
+                        "budget was reached (wall_clock_budget_reached)."
+                    )
+                    break
                 # Stop spinner silently — retry status is buffered and
                 # only flushed when every retry+fallback is exhausted.
                 if thinking_spinner:

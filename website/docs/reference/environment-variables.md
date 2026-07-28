@@ -734,6 +734,9 @@ Advanced per-platform knobs for throttling the outbound message batcher. Most us
 | Variable | Description |
 |----------|-------------|
 | `HERMES_MAX_ITERATIONS` | Max tool-calling iterations per conversation (default: 500) |
+| `HERMES_AGENT_MAX_WALL_CLOCK_SECONDS` | Optional hard wall-clock budget per conversation in seconds (`0` disables; default `0`). |
+| `HERMES_AGENT_REPEATED_TOOL_ERROR_LIMIT` | Stop after this many identical consecutive tool-error results (`0` disables; default `0`). |
+| `HERMES_AGENT_NO_PROGRESS_TOOL_LIMIT` | Stop after this many repeated identical tool-call batches, ignoring provider call IDs (`0` disables; default `0`). |
 | `HERMES_INFERENCE_MODEL` | Override model name at process level (takes priority over `config.yaml` for the session). Also settable via `-m`/`--model` flag. |
 | `HERMES_YOLO_MODE` | Set to `1` to bypass dangerous-command approval prompts. Equivalent to `--yolo`. |
 | `HERMES_ACCEPT_HOOKS` | Auto-approve any unseen shell hooks declared in `config.yaml` without a TTY prompt. Equivalent to `--accept-hooks` or `hooks_auto_accept: true`. |

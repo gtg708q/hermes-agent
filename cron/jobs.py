@@ -11,6 +11,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 import json
 import logging
+import math
 import shutil
 import tempfile
 import threading
@@ -2329,6 +2330,90 @@ def _prune_job_output(job_output_dir: Path, keep: int) -> int:
         except OSError as exc:
             logger.debug("Failed to prune cron output %s: %s", stale.name, exc)
     return deleted
+
+
+def gc_orphaned_output(
+    *,
+    retention_days: Optional[float] = None,
+    interval_seconds: Optional[float] = None,
+    max_directories: Optional[int] = None,
+) -> int:
+    """Delete stale output directories whose cron job no longer exists.
+
+    This repairs leftovers from crashes and manual ``jobs.json`` edits. Fresh
+    orphans retain a grace period, symlinks are never followed, and both cadence
+    and per-pass directory work are bounded.
+    """
+    ensure_dirs()
+    cfg = {}
+    try:
+        from hermes_cli.config import load_config
+        cfg = ((load_config() or {}).get("cron") or {})
+    except Exception:
+        cfg = {}
+    if retention_days is None:
+        retention_days = cfg.get("output_orphan_retention_days", 7)
+    if interval_seconds is None:
+        interval_seconds = cfg.get("output_gc_interval_seconds", 3600)
+    if max_directories is None:
+        max_directories = cfg.get("output_gc_max_directories", 500)
+    retention_value: Any = retention_days
+    interval_value: Any = interval_seconds
+    max_directories_value: Any = max_directories
+    try:
+        retention_days = float(retention_value)
+        interval_seconds = float(interval_value)
+        max_directories = int(max_directories_value)
+    except (TypeError, ValueError):
+        return 0
+    if (
+        not math.isfinite(retention_days)
+        or retention_days < 0
+        or not math.isfinite(interval_seconds)
+        or interval_seconds < 0
+        or max_directories < 1
+        or max_directories > 10_000
+    ):
+        return 0
+
+    output_dir = get_cron_output_dir()
+    marker = output_dir / ".orphan-gc"
+    now = time.time()
+    try:
+        if marker.is_symlink():
+            return 0
+        if interval_seconds and marker.is_file() and now - marker.stat().st_mtime < interval_seconds:
+            return 0
+        # Resolve the authoritative live set before advancing cadence. A corrupt
+        # jobs store must neither delete every output directory nor suppress a
+        # repaired retry for the full GC interval.
+        live_ids = {str(job.get("id")) for job in load_jobs() if job.get("id")}
+        candidates = []
+        # Apply the per-pass budget to actual orphan candidates, not every
+        # directory. Otherwise a stable prefix of live jobs can permanently
+        # starve stale entries later in the directory enumeration.
+        for path in sorted(output_dir.iterdir(), key=lambda item: item.name):
+            if path.name == marker.name or path.name in live_ids:
+                continue
+            candidates.append(path)
+            if len(candidates) >= max_directories:
+                break
+        marker.touch(exist_ok=True)
+    except (OSError, ValueError, TypeError, RuntimeError):
+        return 0
+    cutoff = now - retention_days * 86400
+    removed = 0
+    for path in candidates:
+        try:
+            if path.name in live_ids or not path.is_dir() or path.is_symlink():
+                continue
+            if path.stat().st_mtime > cutoff:
+                continue
+            shutil.rmtree(path)
+            removed += 1
+        except OSError as exc:
+            logger.debug("Failed to prune orphaned cron output %s: %s", path, exc)
+    return removed
 
 
 def save_job_output(job_id: str, output: str):

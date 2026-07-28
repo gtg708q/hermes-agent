@@ -306,6 +306,24 @@ Note: The agent cannot see this message, and therefore cannot respond to it.
 
 To deliver the raw agent output without the wrapper, set `cron.wrap_response` to `false`:
 
+Cron run artifacts are bounded independently of chat delivery. Hermes keeps the
+newest 50 output files per job and removes orphaned job-output directories after
+a seven-day grace period on scheduler ticks. Both are configurable:
+
+```yaml
+cron:
+  output_retention: 50
+  output_orphan_retention_days: 7
+  output_gc_interval_seconds: 3600  # at most one orphan-GC pass per hour
+  output_gc_max_directories: 500    # bound scheduler work per pass
+```
+
+Set `output_orphan_retention_days` to a negative value to disable orphan GC.
+
+Orphan GC is profile-safe: it only compares directories under the active
+profile's `cron/output` store with that profile's `jobs.json`, and never follows
+symlinks.
+
 ```yaml
 # ~/.hermes/config.yaml
 cron:
