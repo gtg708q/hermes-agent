@@ -63,6 +63,37 @@ def _turn_deadline_join_timeout(agent, maximum: float = 0.3) -> float:
         raise TurnWallClockExceeded("wall_clock_budget_reached")
     return min(maximum, remaining)
 
+
+def _cap_request_timeout_to_deadline(timeout: Any, remaining: float) -> Any:
+    """Return the stricter of a provider timeout and the turn deadline."""
+    if timeout is None:
+        return remaining
+    if isinstance(timeout, (int, float)):
+        return min(float(timeout), remaining)
+    # OpenAI/httpx callers may pass a structured Timeout. Preserve each stricter
+    # phase while replacing unbounded phases with the finite turn budget.
+    if all(hasattr(timeout, name) for name in ("connect", "read", "write", "pool")):
+        import httpx
+
+        def _phase(name: str) -> float:
+            value = getattr(timeout, name)
+            if value is None:
+                return remaining
+            try:
+                return min(float(value), remaining)
+            except (TypeError, ValueError):
+                return remaining
+
+        return httpx.Timeout(
+            connect=_phase("connect"),
+            read=_phase("read"),
+            write=_phase("write"),
+            pool=_phase("pool"),
+        )
+    # Unknown SDK-specific timeout objects cannot be ordered reliably. Fall back
+    # to the finite deadline rather than allowing transport work past the turn.
+    return remaining
+
 # When the fallback chain is fully exhausted on a non-rate-limit failure
 # (e.g. every provider returns a non-retryable client error like HTTP 400),
 # arm a short cooldown so the NEXT turn's restore_primary_runtime stays gated
@@ -600,7 +631,9 @@ def interruptible_api_call(agent, api_kwargs: dict):
         # bound the transport itself rather than claiming thread cancellation.
         if agent.api_mode != "bedrock_converse":
             api_kwargs = dict(api_kwargs)
-            api_kwargs["timeout"] = remaining
+            api_kwargs["timeout"] = _cap_request_timeout_to_deadline(
+                api_kwargs.get("timeout"), remaining
+            )
 
     # Cron and other non-interactive, nested-pool contexts must not spawn the
     # interrupt worker — it wedges before the socket opens on the 2nd+ call

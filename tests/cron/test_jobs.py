@@ -1907,6 +1907,23 @@ class TestCronOutputRetention:
         assert all((output / job_id).is_dir() for job_id in live_ids)
         assert all(not orphan.exists() for orphan in orphans)
 
+    def test_gc_orphaned_output_fresh_prefix_does_not_starve_stale_entries(self, tmp_cron_dir):
+        from cron.jobs import gc_orphaned_output, get_cron_output_dir, save_jobs
+
+        save_jobs([])
+        output = get_cron_output_dir()
+        for index in range(5):
+            (output / f"a-fresh-{index:03d}").mkdir()
+        stale = output / "z-stale"
+        stale.mkdir()
+        old = time.time() - 10 * 86400
+        os.utime(stale, (old, old))
+
+        assert gc_orphaned_output(
+            retention_days=7, interval_seconds=0, max_directories=1
+        ) == 1
+        assert not stale.exists()
+
 
 # =========================================================================
 # claim_dispatch — pre-run one-shot crash safety (issue #38758)

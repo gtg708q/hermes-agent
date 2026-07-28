@@ -7,6 +7,7 @@ import uuid
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from agent.errors import TurnWallClockExceeded
 from run_agent import AIAgent
 
 
@@ -114,6 +115,70 @@ def test_default_sequential_path_warns_repeated_exact_failure_without_blocking_e
     assert agent._tool_guardrail_halt_decision is None
 
 
+def test_repeated_tool_error_limit_is_an_explicit_failed_turn():
+    agent = _make_agent(
+        "web_search",
+        config={"agent": {"repeated_tool_error_limit": 2}},
+    )
+    tool_call_1 = _mock_tool_call("web_search", '{"query":"same"}', "c-error-1")
+    tool_call_2 = _mock_tool_call("web_search", '{"query":"same"}', "c-error-2")
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(content="", finish_reason="tool_calls", tool_calls=[tool_call_1]),
+        _mock_response(content="", finish_reason="tool_calls", tool_calls=[tool_call_2]),
+    ]
+
+    with patch(
+        "run_agent.handle_function_call",
+        return_value=json.dumps({"success": False, "error": "same failure"}),
+    ):
+        result = agent.run_conversation("keep trying")
+
+    assert result["turn_exit_reason"] == "repeated_tool_error_limit_reached"
+    assert result["completed"] is False
+    assert result["failed"] is True
+    assert result["api_calls"] == 2
+
+
+def test_api_deadline_is_an_explicit_failed_turn():
+    agent = _make_agent(config={"agent": {"max_wall_clock_seconds": 30}})
+
+    with patch(
+        "hermes_cli.middleware.run_llm_execution_middleware",
+        side_effect=TurnWallClockExceeded("wall_clock_budget_reached"),
+    ):
+        result = agent.run_conversation("wait for the provider")
+
+    assert result["turn_exit_reason"] == "wall_clock_budget_reached"
+    assert result["completed"] is False
+    assert result["failed"] is True
+
+
+def test_preflight_deadline_closes_and_persists_the_assistant_turn(monkeypatch):
+    agent = _make_agent(config={"agent": {"max_wall_clock_seconds": 0.5}})
+    persisted = []
+    agent._persist_session = lambda messages, history: persisted.append(
+        [dict(message) for message in messages]
+    )
+    monotonic_values = iter([0.0])
+
+    def elapsed_after_turn_start():
+        return next(monotonic_values, 1.0)
+
+    monkeypatch.setattr("agent.conversation_loop.time.monotonic", elapsed_after_turn_start)
+
+    result = agent.run_conversation("do not replay me")
+
+    assert result["turn_exit_reason"] == "wall_clock_budget_reached"
+    assert result["completed"] is False
+    assert result["failed"] is True
+    assert result["messages"][-1] == {
+        "role": "assistant",
+        "content": result["final_response"],
+    }
+    assert persisted[-1][-1] == result["messages"][-1]
+    agent.client.chat.completions.create.assert_not_called()
+
+
 def test_sequential_blocking_tool_returns_at_whole_turn_deadline_without_late_output():
     agent = _make_agent("web_search")
     release = threading.Event()
@@ -144,6 +209,42 @@ def test_sequential_blocking_tool_returns_at_whole_turn_deadline_without_late_ou
     assert "wall-clock budget" in messages[0]["content"]
     assert "late-result-must-not-land" not in str(messages)
     assert "tool.completed" not in completed
+
+
+def test_sequential_deadline_worker_receives_interrupt_and_clears_targeted_bit():
+    from tools.interrupt import _interrupted_threads, _lock, is_interrupted
+
+    agent = _make_agent("web_search")
+    started = threading.Event()
+    agent._turn_deadline_monotonic = time.monotonic() + 2.0
+    tc = _mock_tool_call("web_search", '{"query":"interruptible"}', "c-interrupt")
+    messages = []
+
+    def _cooperative_call(*_args, **_kwargs):
+        started.set()
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline and not is_interrupted():
+            time.sleep(0.01)
+        return "interrupted" if is_interrupted() else "missed-interrupt"
+
+    def _interrupt():
+        assert started.wait(timeout=1)
+        agent.interrupt("hard stop")
+
+    interrupter = threading.Thread(target=_interrupt)
+    interrupter.start()
+    began = time.monotonic()
+    with patch("run_agent.handle_function_call", side_effect=_cooperative_call):
+        agent._execute_tool_calls_sequential(
+            SimpleNamespace(content="", tool_calls=[tc]), messages, "task-1"
+        )
+    elapsed = time.monotonic() - began
+    interrupter.join(timeout=1)
+
+    assert elapsed < 0.5
+    assert agent._tool_worker_threads == set()
+    with _lock:
+        assert _interrupted_threads == set()
 
 
 def test_sequential_deadline_preserves_and_persists_completed_prefix_in_order():

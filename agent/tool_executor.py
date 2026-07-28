@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import functools
+import hashlib
 import json
 from pathlib import Path
 import logging
@@ -1006,6 +1007,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         progress_function_name = name
         deadline_timed_out = i in timed_out_indices
         effect_disposition = None
+        _execution_signature = None
         if deadline_timed_out:
             suffix = f"{timeout_s:.1f}s" if timeout_s is not None else "the configured timeout"
             function_result = f"Error executing tool '{name}': timed out after {suffix}"
@@ -1060,6 +1062,9 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             if blocked:
                 effect_disposition = "none"
 
+            _execution_signature = hashlib.sha256(
+                _multimodal_text_summary(function_result).encode("utf-8")
+            ).hexdigest()
             if not blocked:
                 function_result = agent._append_guardrail_observation(
                     function_name,
@@ -1124,6 +1129,20 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             _tool_content,
             tc.id,
             effect_disposition=effect_disposition,
+            execution_status=(
+                "timeout"
+                if deadline_timed_out
+                else "blocked"
+                if blocked
+                else "cancelled"
+                if r is None and agent._interrupt_requested
+                else "error"
+                if is_error
+                else "success"
+            ),
+            execution_signature=(
+                _execution_signature if r is not None else None
+            ),
         )
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
@@ -1266,6 +1285,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     function_name,
                     malformed_args_result,
                     tool_call.id,
+                    execution_status="error",
                 )
             )
             if not _flush_session_db_after_tool_progress(
@@ -1806,6 +1826,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # Log tool errors to the persistent error log so [error] tags
         # in the UI always have a corresponding detailed entry on disk.
         _is_error_result, _ = _detect_tool_failure(function_name, function_result)
+        _execution_signature = hashlib.sha256(
+            _multimodal_text_summary(function_result).encode("utf-8")
+        ).hexdigest()
         # The agent-runtime tools above (todo, session_search, memory,
         # context-engine, memory-manager, clarify, delegate_task) are
         # dispatched inline — they never reach handle_function_call, so the
@@ -1884,7 +1907,19 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # Unwrap _multimodal dicts to an OpenAI-style content list
         # (see parallel path for rationale). String results pass through.
         _tool_content = agent._tool_result_content_for_active_model(function_name, function_result)
-        tool_message = make_tool_result_message(function_name, _tool_content, tool_call.id)
+        tool_message = make_tool_result_message(
+            function_name,
+            _tool_content,
+            tool_call.id,
+            execution_status=(
+                "blocked"
+                if _execution_blocked
+                else "error"
+                if _is_error_result
+                else "success"
+            ),
+            execution_signature=_execution_signature,
+        )
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
         if not _flush_session_db_after_tool_progress(
@@ -2059,6 +2094,14 @@ def _execute_tool_calls_sequential_bounded(agent, assistant_message, messages: l
     finished = threading.Event()
 
     def _run() -> None:
+        worker_tid = threading.get_ident()
+        with agent._tool_worker_threads_lock:
+            agent._tool_worker_threads.add(worker_tid)
+        if agent._interrupt_requested:
+            try:
+                _ra()._set_interrupt(True, worker_tid)
+            except Exception:
+                pass
         try:
             _execute_tool_calls_sequential_inline(
                 agent, assistant_message, private_messages, effective_task_id,
@@ -2067,6 +2110,12 @@ def _execute_tool_calls_sequential_bounded(agent, assistant_message, messages: l
         except BaseException as exc:
             outcome["error"] = exc
         finally:
+            with agent._tool_worker_threads_lock:
+                agent._tool_worker_threads.discard(worker_tid)
+            try:
+                _ra()._set_interrupt(False, worker_tid)
+            except Exception:
+                pass
             outcome["finished_at"] = time.monotonic()
             finished.set()
 

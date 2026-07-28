@@ -30,13 +30,43 @@ def test_loop_guard_stops_repeated_identical_tool_errors():
                     "function": {"name": "terminal", "arguments": "{}"},
                 }],
             },
-            {"role": "tool", "content": "ERROR: same deterministic failure"},
+            {
+                "role": "tool",
+                "content": "same deterministic failure",
+                "_tool_execution_status": "error",
+            },
         ])
 
     assert (
         _loop_guard_reason(agent, messages, 0)
         == "repeated_tool_error_limit_reached"
     )
+
+
+def test_loop_guard_does_not_treat_successful_error_text_as_failure():
+    agent = SimpleNamespace(
+        max_wall_clock_seconds=0,
+        repeated_tool_error_limit=2,
+        no_progress_tool_limit=0,
+    )
+    messages = []
+    for index in range(2):
+        messages.extend([
+            {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": f"call-{index}",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }],
+            },
+            {
+                "role": "tool",
+                "content": "ERROR: this is log-file content, not tool failure",
+                "_tool_execution_status": "success",
+            },
+        ])
+
+    assert _loop_guard_reason(agent, messages, 0) is None
 
 
 def test_loop_guard_stops_repeated_tool_calls_with_new_provider_ids():

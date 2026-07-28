@@ -580,10 +580,11 @@ def init_agent(
     except Exception:
         _agent_guard_cfg = {}
 
-    def _bounded_setting(key: str, name: str, maximum: float, *, integer: bool = False):
-        raw = os.getenv(name)
-        # config.yaml is canonical; a non-empty env value is an explicit override.
-        value = raw if raw is not None and raw.strip() else _agent_guard_cfg.get(key, 0)
+    def _bounded_setting(key: str, maximum: float, *, integer: bool = False):
+        # Behavioral guardrails are canonical config.yaml settings. Unlike
+        # credentials and process plumbing, they intentionally have no public
+        # environment-variable override.
+        value = _agent_guard_cfg.get(key, 0)
         try:
             parsed = float(value)
         except (TypeError, ValueError):
@@ -594,13 +595,13 @@ def init_agent(
         return int(bounded) if integer else bounded
 
     agent.max_wall_clock_seconds = _bounded_setting(
-        "max_wall_clock_seconds", "HERMES_AGENT_MAX_WALL_CLOCK_SECONDS", 7 * 24 * 3600
+        "max_wall_clock_seconds", 7 * 24 * 3600
     )
     agent.repeated_tool_error_limit = _bounded_setting(
-        "repeated_tool_error_limit", "HERMES_AGENT_REPEATED_TOOL_ERROR_LIMIT", 1000, integer=True
+        "repeated_tool_error_limit", 1000, integer=True
     )
     agent.no_progress_tool_limit = _bounded_setting(
-        "no_progress_tool_limit", "HERMES_AGENT_NO_PROGRESS_TOOL_LIMIT", 1000, integer=True
+        "no_progress_tool_limit", 1000, integer=True
     )
     # Shared iteration budget — parent creates, children inherit.
     # Consumed by every LLM turn across parent + all subagents.

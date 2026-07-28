@@ -2379,6 +2379,7 @@ def gc_orphaned_output(
     output_dir = get_cron_output_dir()
     marker = output_dir / ".orphan-gc"
     now = time.time()
+    cutoff = now - retention_days * 86400
     try:
         if marker.is_symlink():
             return 0
@@ -2389,11 +2390,19 @@ def gc_orphaned_output(
         # repaired retry for the full GC interval.
         live_ids = {str(job.get("id")) for job in load_jobs() if job.get("id")}
         candidates = []
-        # Apply the per-pass budget to actual orphan candidates, not every
-        # directory. Otherwise a stable prefix of live jobs can permanently
-        # starve stale entries later in the directory enumeration.
+        # Apply the per-pass budget only after filtering for stale orphans.
+        # Capping the alphabetic orphan list first lets a stable prefix of fresh
+        # directories permanently starve stale entries later in the scan.
         for path in sorted(output_dir.iterdir(), key=lambda item: item.name):
             if path.name == marker.name or path.name in live_ids:
+                continue
+            try:
+                if path.is_symlink() or not path.is_dir():
+                    continue
+                if path.stat().st_mtime > cutoff:
+                    continue
+            except OSError as exc:
+                logger.debug("Failed to inspect orphaned cron output %s: %s", path, exc)
                 continue
             candidates.append(path)
             if len(candidates) >= max_directories:
@@ -2401,7 +2410,6 @@ def gc_orphaned_output(
         marker.touch(exist_ok=True)
     except (OSError, ValueError, TypeError, RuntimeError):
         return 0
-    cutoff = now - retention_days * 86400
     removed = 0
     for path in candidates:
         try:

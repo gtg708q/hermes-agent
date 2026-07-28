@@ -2933,8 +2933,9 @@ class AIAgent:
         # Signal all tools to abort any in-flight operations immediately.
         # Scope the interrupt to this agent's execution thread so other
         # agents running in the same process (gateway) are not affected.
-        if self._execution_thread_id is not None:
-            _set_interrupt(True, self._execution_thread_id)
+        execution_thread_id = getattr(self, "_execution_thread_id", None)
+        if isinstance(execution_thread_id, int):
+            _set_interrupt(True, execution_thread_id)
             self._interrupt_thread_signal_pending = False
         else:
             # The interrupt arrived before run_conversation() finished
@@ -2996,8 +2997,9 @@ class AIAgent:
             if not preserve_redirect:
                 self._pending_redirect = None
         self._interrupt_thread_signal_pending = False
-        if self._execution_thread_id is not None:
-            _set_interrupt(False, self._execution_thread_id)
+        execution_thread_id = getattr(self, "_execution_thread_id", None)
+        if isinstance(execution_thread_id, int):
+            _set_interrupt(False, execution_thread_id)
         # Also clear any concurrent-tool worker thread bits.  Tracked
         # workers normally clear their own bit on exit, but an explicit
         # clear here guarantees no stale interrupt can survive a turn

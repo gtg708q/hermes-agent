@@ -10,6 +10,7 @@ Covers:
 
 import asyncio
 import hashlib
+import json
 import threading
 import time
 import uuid
@@ -24,6 +25,7 @@ from gateway.platforms.api_server import (
     APIServerAdapter,
     ResponseStore,
     _approval_event_choices,
+    _derive_idempotent_run_id,
     cors_middleware,
     security_headers_middleware,
 )
@@ -138,6 +140,16 @@ def auth_adapter():
 
 
 class TestStartRun:
+    def test_idempotent_run_id_scopes_key_by_canonical_profile(self):
+        key = "same-client-key"
+
+        unprefixed = _derive_idempotent_run_id(key, None)
+        explicit_default = _derive_idempotent_run_id(key, "default")
+        secondary = _derive_idempotent_run_id(key, "research")
+
+        assert unprefixed == explicit_default
+        assert secondary != unprefixed
+
     @pytest.mark.asyncio
     async def test_start_requires_nonempty_bounded_idempotency_key(self, adapter):
         app = _create_runs_app(adapter)
@@ -164,7 +176,7 @@ class TestStartRun:
     @pytest.mark.asyncio
     async def test_idempotency_key_derives_exact_run_id_and_replay_returns_status(self, adapter):
         key = "sc15:conversation:42:turn:7"
-        expected = "run_" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+        expected = _derive_idempotent_run_id(key, None)
         app = _create_runs_app(adapter)
         release = threading.Event()
         started = threading.Event()
@@ -267,6 +279,161 @@ class TestStartRun:
         assert replay.status == 200
         assert replay_payload["status"] in {"queued", "running"}
 
+    @pytest.mark.parametrize("stale_status", ["queued", "running"])
+    def test_durable_claim_reclaims_only_after_owner_lease_expires(
+        self, tmp_path, stale_status
+    ):
+        db_path = tmp_path / "response-store.db"
+        first = ResponseStore(db_path=str(db_path))
+        initial = {"run_id": "run_lease", "status": stale_status}
+
+        assert first.claim_run(
+            "run_lease",
+            "fingerprint",
+            initial,
+            owner_id="owner-a",
+            lease_seconds=30,
+            now=100,
+        )[0] is True
+        first.close()
+
+        restarted = ResponseStore(db_path=str(db_path))
+        still_owned = restarted.claim_run(
+            "run_lease",
+            "fingerprint",
+            initial,
+            owner_id="owner-b",
+            lease_seconds=30,
+            now=129,
+        )
+        reclaimed = restarted.claim_run(
+            "run_lease",
+            "fingerprint",
+            initial,
+            owner_id="owner-b",
+            lease_seconds=30,
+            now=131,
+        )
+
+        assert still_owned[0] is False
+        assert still_owned[1] is False
+        assert reclaimed[0] is True
+        assert reclaimed[1] is False
+        restarted.close()
+
+    def test_reclaimed_claim_fences_stale_owner_status_writes(self, tmp_path):
+        store = ResponseStore(db_path=str(tmp_path / "response-store.db"))
+        initial = {"run_id": "run_fenced", "status": "queued"}
+        store.claim_run(
+            "run_fenced",
+            "fingerprint",
+            initial,
+            owner_id="owner-a",
+            lease_seconds=30,
+            now=100,
+        )
+        assert store.claim_run(
+            "run_fenced",
+            "fingerprint",
+            initial,
+            owner_id="owner-b",
+            lease_seconds=30,
+            now=131,
+        )[0] is True
+
+        assert store.put_run_status(
+            "run_fenced",
+            {**initial, "status": "completed", "output": "stale"},
+            owner_id="owner-a",
+            lease_seconds=30,
+            now=132,
+        ) is False
+        assert store.get_run_status("run_fenced")["status"] == "queued"
+        store.close()
+
+    def test_heartbeat_keeps_active_owner_from_being_reclaimed(self, tmp_path):
+        store = ResponseStore(db_path=str(tmp_path / "response-store.db"))
+        initial = {"run_id": "run_heartbeat", "status": "running"}
+        store.claim_run(
+            "run_heartbeat",
+            "fingerprint",
+            initial,
+            owner_id="owner-a",
+            lease_seconds=30,
+            now=100,
+        )
+        assert store.renew_run_lease(
+            "run_heartbeat", "owner-a", 30, now=125
+        ) is True
+
+        owned, conflict, existing = store.claim_run(
+            "run_heartbeat",
+            "fingerprint",
+            initial,
+            owner_id="owner-b",
+            lease_seconds=30,
+            now=131,
+        )
+
+        assert owned is False
+        assert conflict is False
+        assert existing["status"] == "running"
+        store.close()
+
+    @pytest.mark.asyncio
+    async def test_stale_queued_claim_is_restarted_and_executes(self, tmp_path):
+        key = "replay-after-owner-crash"
+        body = {"input": "hello"}
+        run_id = _derive_idempotent_run_id(key, None)
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                {
+                    "body": body,
+                    "gateway_session_key": None,
+                    "profile": "default",
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        store = ResponseStore(db_path=str(tmp_path / "response-store.db"))
+        store.claim_run(
+            run_id,
+            fingerprint,
+            {"run_id": run_id, "status": "queued"},
+            owner_id="crashed-owner",
+            lease_seconds=30,
+            now=time.time() - 31,
+        )
+        adapter = _make_adapter()
+        adapter._response_store.close()
+        adapter._response_store = store
+        app = _create_runs_app(adapter)
+
+        with patch.object(adapter, "_create_agent") as create_agent:
+            agent = MagicMock()
+            agent.run_conversation.return_value = {"final_response": "recovered"}
+            agent.session_prompt_tokens = 0
+            agent.session_completion_tokens = 0
+            agent.session_total_tokens = 0
+            create_agent.return_value = agent
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(
+                    "/v1/runs", json=body, headers=_idempotency_headers(key)
+                )
+                payload = await response.json()
+                for _ in range(20):
+                    if create_agent.called:
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert response.status == 202
+        assert payload["run_id"] == run_id
+        create_agent.assert_called_once()
+        store.close()
+
     @pytest.mark.asyncio
     async def test_concurrent_same_key_launches_exactly_one_run(self, adapter):
         key = "same-key-after-client-response-loss"
@@ -294,7 +461,7 @@ class TestStartRun:
                 ])
                 bodies = [await response.json() for response in responses]
                 assert {body["run_id"] for body in bodies} == {
-                    "run_" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+                    _derive_idempotent_run_id(key, None)
                 }
                 assert sum(response.status == 202 for response in responses) == 1
                 assert sum(response.status == 200 for response in responses) == 7

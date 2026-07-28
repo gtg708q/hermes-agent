@@ -946,8 +946,8 @@ DEFAULT_CONFIG = {
     "max_live_sessions": 16,
     "agent": {
         "max_turns": 500,
-        # Whole-turn safety guards. 0 disables. Environment variables with the
-        # corresponding HERMES_AGENT_* names explicitly override these values.
+        # Whole-turn safety guards. 0 disables. These behavioral settings are
+        # configured here rather than through public environment overrides.
         "max_wall_clock_seconds": 0,
         "repeated_tool_error_limit": 0,
         "no_progress_tool_limit": 0,

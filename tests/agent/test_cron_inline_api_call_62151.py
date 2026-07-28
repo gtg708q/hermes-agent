@@ -15,6 +15,7 @@ the shared dispatch closes the per-request client.
 """
 
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -94,6 +95,45 @@ def test_interruptible_api_call_routes_cron_inline_no_worker_thread():
 
     assert resp.id == "first"
     assert ran_on["tid"] == caller_tid  # no daemon worker thread
+
+
+def test_turn_deadline_does_not_raise_stricter_existing_request_timeout():
+    agent = _make_agent()
+    agent._turn_deadline_monotonic = time.monotonic() + 30
+    fake_client = MagicMock()
+    fake_client.chat.completions.create.return_value = SimpleNamespace(id="bounded")
+    agent._create_request_openai_client.return_value = fake_client
+
+    resp = interruptible_api_call(
+        agent,
+        {"model": "m", "messages": [], "timeout": 3.0},
+    )
+
+    assert resp.id == "bounded"
+    request_kwargs = fake_client.chat.completions.create.call_args.kwargs
+    assert request_kwargs["timeout"] == 3.0
+
+
+def test_turn_deadline_caps_each_structured_request_timeout_phase():
+    import httpx
+
+    agent = _make_agent()
+    agent._turn_deadline_monotonic = time.monotonic() + 1.0
+    fake_client = MagicMock()
+    fake_client.chat.completions.create.return_value = SimpleNamespace(id="bounded")
+    agent._create_request_openai_client.return_value = fake_client
+    configured = httpx.Timeout(connect=0.1, read=20, write=None, pool=0.2)
+
+    interruptible_api_call(
+        agent,
+        {"model": "m", "messages": [], "timeout": configured},
+    )
+
+    effective = fake_client.chat.completions.create.call_args.kwargs["timeout"]
+    assert effective.connect == 0.1
+    assert 0 < effective.read <= 1.0
+    assert 0 < effective.write <= 1.0
+    assert effective.pool == 0.2
 
 
 def test_direct_api_call_interrupt_aborts_active_client_and_raises():

@@ -96,14 +96,20 @@ def test_worker_guard_config_propagates_to_all_agent_surfaces(monkeypatch, platf
     assert agent.no_progress_tool_limit == 9
 
 
-def test_worker_guard_environment_values_explicitly_override_config(monkeypatch):
+def test_worker_guard_environment_values_do_not_override_config(monkeypatch):
     _patch_agent_bootstrap(monkeypatch)
     from hermes_cli import config as config_mod
 
     cfg = copy.deepcopy(config_mod.DEFAULT_CONFIG)
-    cfg["agent"]["max_wall_clock_seconds"] = 123
+    cfg["agent"].update({
+        "max_wall_clock_seconds": 123,
+        "repeated_tool_error_limit": 7,
+        "no_progress_tool_limit": 9,
+    })
     monkeypatch.setattr(config_mod, "load_config", lambda: cfg)
     monkeypatch.setenv("HERMES_AGENT_MAX_WALL_CLOCK_SECONDS", "17")
+    monkeypatch.setenv("HERMES_AGENT_REPEATED_TOOL_ERROR_LIMIT", "2")
+    monkeypatch.setenv("HERMES_AGENT_NO_PROGRESS_TOOL_LIMIT", "3")
 
     agent = run_agent.AIAgent(
         model="gpt-4o",
@@ -115,7 +121,9 @@ def test_worker_guard_environment_values_explicitly_override_config(monkeypatch)
         skip_memory=True,
     )
 
-    assert agent.max_wall_clock_seconds == 17
+    assert agent.max_wall_clock_seconds == 123
+    assert agent.repeated_tool_error_limit == 7
+    assert agent.no_progress_tool_limit == 9
 
 
 def _build_copilot_agent(monkeypatch, *, model="gpt-5.4"):

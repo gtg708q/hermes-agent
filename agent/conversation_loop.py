@@ -1067,11 +1067,17 @@ def _loop_guard_reason(agent: Any, messages: List[Dict[str, Any]], started_at: f
                 break
             if message.get("role") != "tool":
                 continue
-            content = str(message.get("content") or "")
-            lowered = content.lower()
-            if not any(marker in lowered for marker in ("error", "failed", "traceback", "exception", '"exit_code": 1')):
+            if message.get("_tool_execution_status") not in {
+                "error",
+                "timeout",
+                "blocked",
+            }:
                 break
-            error_signatures.append(hashlib.sha256(content.encode("utf-8")).hexdigest())
+            signature = message.get("_tool_execution_signature")
+            if not isinstance(signature, str) or not signature:
+                content = str(message.get("content") or "")
+                signature = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            error_signatures.append(signature)
             if len(error_signatures) >= error_limit:
                 if len(set(error_signatures[:error_limit])) == 1:
                     return "repeated_tool_error_limit_reached"
@@ -1210,23 +1216,6 @@ def run_conversation(
     _plugin_user_context = _ctx.plugin_user_context
     _ext_prefetch_cache = _ctx.ext_prefetch_cache
 
-    if _loop_guard_reason(agent, messages, _turn_started_at) == "wall_clock_budget_reached":
-        stopped = (
-            "Stopped this run because the configured whole-turn wall-clock "
-            "budget was reached (wall_clock_budget_reached)."
-        )
-        agent._persist_session(messages, conversation_history)
-        return {
-            "final_response": stopped,
-            "messages": messages,
-            "api_calls": 0,
-            "completed": False,
-            "partial": True,
-            "interrupted": False,
-            "error": "wall_clock_budget_reached",
-            "agent_persisted": True,
-        }
-
     # Commentary deduplication spans all provider continuations and tool calls
     # within one user turn, but must not suppress the same phrase next turn.
     agent._delivered_interim_texts = set()
@@ -1283,12 +1272,23 @@ def run_conversation(
     # stale prior turn's usage.
     agent._last_turn_usage = None
 
+    # Turn setup itself can consume the absolute deadline. Carry that stop
+    # through normal finalization so the delivered closure is appended and
+    # persisted as an assistant row instead of leaving replayable user input.
+    if _loop_guard_reason(agent, messages, _turn_started_at) == "wall_clock_budget_reached":
+        final_response = (
+            "Stopped this run because the configured whole-turn wall-clock "
+            "budget was reached (wall_clock_budget_reached)."
+        )
+        failed = True
+        _turn_exit_reason = "wall_clock_budget_reached"
+
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
     # all run inside Codex). Default Hermes path is bypassed entirely.
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
-    if agent.api_mode == "codex_app_server":
+    if final_response is None and agent.api_mode == "codex_app_server":
         return agent._run_codex_app_server_turn(
             user_message=user_message,
             original_user_message=original_user_message,
@@ -1297,7 +1297,10 @@ def run_conversation(
             should_review_memory=_should_review_memory,
         )
 
-    while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+    while final_response is None and (
+        (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0)
+        or agent._budget_grace_call
+    ):
         _guard_reason = _loop_guard_reason(agent, messages, _turn_started_at)
         if _guard_reason:
             _turn_exit_reason = _guard_reason
@@ -1305,6 +1308,7 @@ def run_conversation(
                 "Stopped this run because a configured worker safety limit was reached "
                 f"({_guard_reason}). Review the latest tool output before continuing."
             )
+            failed = True
             break
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
@@ -3342,6 +3346,7 @@ def run_conversation(
                         "Stopped this run because the configured whole-turn wall-clock "
                         "budget was reached (wall_clock_budget_reached)."
                     )
+                    failed = True
                     break
                 # Stop spinner silently — retry status is buffered and
                 # only flushed when every retry+fallback is exhausted.
@@ -5391,6 +5396,11 @@ def run_conversation(
             _boost_cap = max(32768, _requested_cap or 0)
             agent._ephemeral_max_output_tokens = min(_boost, _boost_cap)
             continue
+
+        # A retry-phase safety exit already supplied a final closure. Leave the
+        # outer loop without rewriting it as a generic exhausted-retries error.
+        if final_response is not None:
+            break
 
         # Guard: if all retries exhausted without a successful response
         # (e.g. repeated context-length errors that exhausted retry_count),

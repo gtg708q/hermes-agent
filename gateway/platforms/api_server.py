@@ -689,9 +689,21 @@ class ResponseStore:
                 request_fingerprint TEXT NOT NULL,
                 status_json TEXT NOT NULL,
                 updated_at REAL NOT NULL,
-                terminal_at REAL
+                terminal_at REAL,
+                owner_id TEXT,
+                lease_expires_at REAL
             )"""
         )
+        # Migrate stores created before durable claims had leased owners.
+        run_columns = {
+            row[1] for row in self._conn.execute("PRAGMA table_info(run_idempotency)")
+        }
+        if "owner_id" not in run_columns:
+            self._conn.execute("ALTER TABLE run_idempotency ADD COLUMN owner_id TEXT")
+        if "lease_expires_at" not in run_columns:
+            self._conn.execute(
+                "ALTER TABLE run_idempotency ADD COLUMN lease_expires_at REAL"
+            )
         self._conn.execute(
             """CREATE INDEX IF NOT EXISTS idx_run_idempotency_terminal_at
                ON run_idempotency(terminal_at)"""
@@ -808,27 +820,80 @@ class ResponseStore:
         self._conn.commit()
 
     def claim_run(
-        self, run_id: str, request_fingerprint: str, status: Dict[str, Any]
+        self,
+        run_id: str,
+        request_fingerprint: str,
+        status: Dict[str, Any],
+        *,
+        owner_id: Optional[str] = None,
+        lease_seconds: float = 0,
+        now: Optional[float] = None,
     ) -> tuple[bool, bool, Dict[str, Any]]:
-        """Cross-process CAS for idempotent run ownership."""
+        """Cross-process CAS for idempotent run ownership.
+
+        A non-terminal claim can be taken over only after its owner's lease
+        expires.  This lets a restarted gateway recover work abandoned by a
+        crashed process while retries continue to replay a genuinely active
+        owner's status.  ``owner_id=None`` preserves the legacy insert/replay
+        behavior for callers that do not execute runs.
+        """
         encoded = json.dumps(status, default=str, sort_keys=True)
-        now = time.time()
+        now = time.time() if now is None else float(now)
+        lease_expires_at = now + max(0.0, float(lease_seconds))
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 cursor = self._conn.execute(
                     """INSERT OR IGNORE INTO run_idempotency
-                       (run_id, request_fingerprint, status_json, updated_at, terminal_at)
-                       VALUES (?, ?, ?, ?, NULL)""",
-                    (run_id, request_fingerprint, encoded, now),
+                       (run_id, request_fingerprint, status_json, updated_at,
+                        terminal_at, owner_id, lease_expires_at)
+                       VALUES (?, ?, ?, ?, NULL, ?, ?)""",
+                    (
+                        run_id,
+                        request_fingerprint,
+                        encoded,
+                        now,
+                        owner_id,
+                        lease_expires_at if owner_id is not None else None,
+                    ),
                 )
                 if cursor.rowcount == 1:
                     self._conn.commit()
                     return True, False, status
                 row = self._conn.execute(
-                    "SELECT request_fingerprint, status_json FROM run_idempotency WHERE run_id = ?",
+                    """SELECT request_fingerprint, status_json, terminal_at,
+                              owner_id, lease_expires_at
+                       FROM run_idempotency WHERE run_id = ?""",
                     (run_id,),
                 ).fetchone()
+                if (
+                    row is not None
+                    and owner_id is not None
+                    and hmac.compare_digest(str(row[0]), request_fingerprint)
+                    and row[2] is None
+                    and (row[3] is None or row[4] is None or float(row[4]) <= now)
+                ):
+                    cursor = self._conn.execute(
+                        """UPDATE run_idempotency
+                           SET status_json = ?, updated_at = ?, terminal_at = NULL,
+                               owner_id = ?, lease_expires_at = ?
+                           WHERE run_id = ? AND request_fingerprint = ?
+                             AND terminal_at IS NULL
+                             AND (owner_id IS NULL OR lease_expires_at IS NULL
+                                  OR lease_expires_at <= ?)""",
+                        (
+                            encoded,
+                            now,
+                            owner_id,
+                            lease_expires_at,
+                            run_id,
+                            request_fingerprint,
+                            now,
+                        ),
+                    )
+                    if cursor.rowcount == 1:
+                        self._conn.commit()
+                        return True, False, status
                 self._conn.commit()
             except BaseException:
                 self._conn.rollback()
@@ -842,23 +907,65 @@ class ResponseStore:
             existing = {}
         return False, conflict, existing
 
-    def put_run_status(self, run_id: str, status: Dict[str, Any]) -> None:
+    def put_run_status(
+        self,
+        run_id: str,
+        status: Dict[str, Any],
+        *,
+        owner_id: Optional[str] = None,
+        lease_seconds: float = 0,
+        now: Optional[float] = None,
+    ) -> bool:
         encoded = json.dumps(status, default=str, sort_keys=True)
-        now = time.time()
+        now = time.time() if now is None else float(now)
         terminal_at = (
             now
             if status.get("status") in {"completed", "failed", "cancelled"}
             else None
         )
+        lease_expires_at = now + max(0.0, float(lease_seconds))
         with self._lock:
-            self._conn.execute(
+            owner_clause = "" if owner_id is None else " AND owner_id = ?"
+            params: list[Any] = [
+                encoded,
+                now,
+                terminal_at,
+                terminal_at,
+                lease_expires_at,
+                run_id,
+            ]
+            if owner_id is not None:
+                params.append(owner_id)
+            cursor = self._conn.execute(
                 """UPDATE run_idempotency
                    SET status_json = ?, updated_at = ?,
-                       terminal_at = CASE WHEN ? IS NULL THEN terminal_at ELSE ? END
-                   WHERE run_id = ?""",
-                (encoded, now, terminal_at, terminal_at, run_id),
+                       terminal_at = CASE WHEN ? IS NULL THEN terminal_at ELSE ? END,
+                       lease_expires_at = ?
+                   WHERE run_id = ?""" + owner_clause,
+                params,
             )
             self._conn.commit()
+            return cursor.rowcount == 1
+
+    def renew_run_lease(
+        self,
+        run_id: str,
+        owner_id: str,
+        lease_seconds: float,
+        *,
+        now: Optional[float] = None,
+    ) -> bool:
+        """Extend a live claim if this process still owns it."""
+        now = time.time() if now is None else float(now)
+        with self._lock:
+            cursor = self._conn.execute(
+                """UPDATE run_idempotency
+                   SET updated_at = ?, lease_expires_at = ?
+                   WHERE run_id = ? AND owner_id = ? AND terminal_at IS NULL""",
+                (now, now + max(0.0, float(lease_seconds)), run_id, owner_id),
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
 
     def get_run_status(self, run_id: str) -> Optional[Dict[str, Any]]:
         with self._lock:
@@ -1190,6 +1297,25 @@ def _make_request_fingerprint(body: Dict[str, Any], keys: List[str]) -> str:
     return sha256(repr(subset).encode("utf-8")).hexdigest()
 
 
+def _canonical_run_profile(profile: Optional[str]) -> str:
+    """Return the profile namespace used by durable run idempotency.
+
+    The unprefixed multiplex route selects the default profile, so it must be
+    identical to ``/p/default``.  Named prefixes remain distinct namespaces.
+    """
+    return profile or "default"
+
+
+def _derive_idempotent_run_id(idempotency_key: str, profile: Optional[str]) -> str:
+    """Hash an opaque client key together with its canonical profile scope."""
+    seed = json.dumps(
+        [_canonical_run_profile(profile), idempotency_key],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return "run_" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32]
+
+
 def _derive_chat_session_id(
     system_prompt: Optional[str],
     first_user_message: str,
@@ -1341,6 +1467,9 @@ class APIServerAdapter(BasePlatformAdapter):
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
         self._response_store = ResponseStore()
+        # A unique fencing token for durable /v1/runs claims.  Status writes
+        # from an old process are ignored after a stale lease is reclaimed.
+        self._run_owner_id = uuid.uuid4().hex
         # Active run streams: run_id -> asyncio.Queue of SSE event dicts
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
         # Creation timestamps for orphaned-run TTL sweep
@@ -6024,6 +6153,8 @@ class APIServerAdapter(BasePlatformAdapter):
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
     # Keep terminal replay long enough for at least five hourly client retries.
     _RUN_STATUS_TTL = 6 * 3600
+    _RUN_OWNER_LEASE_SECONDS = 30.0
+    _RUN_OWNER_HEARTBEAT_SECONDS = 10.0
 
     def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
         """Update pollable run status without exposing private agent objects."""
@@ -6039,7 +6170,12 @@ class APIServerAdapter(BasePlatformAdapter):
         current.update(fields)
         self._run_statuses[run_id] = current
         try:
-            self._response_store.put_run_status(run_id, current)
+            self._response_store.put_run_status(
+                run_id,
+                current,
+                owner_id=self._run_owner_id,
+                lease_seconds=self._RUN_OWNER_LEASE_SECONDS,
+            )
         except Exception:
             logger.exception("Failed to persist durable run status for %s", run_id)
         return current
@@ -6163,9 +6299,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 ),
                 status=400,
             )
-        run_id = "run_" + hashlib.sha256(
-            idempotency_key.encode("utf-8")
-        ).hexdigest()[:32]
+        request_profile = _api_request_profile.get()
+        canonical_profile = _canonical_run_profile(request_profile)
+        run_id = _derive_idempotent_run_id(idempotency_key, request_profile)
 
         # Durable ownership is claimed only after the request body has been
         # parsed and validated, so malformed requests cannot reserve a key.
@@ -6256,7 +6392,7 @@ class APIServerAdapter(BasePlatformAdapter):
         fingerprint_payload = {
             "body": body,
             "gateway_session_key": gateway_session_key,
-            "profile": _api_request_profile.get(),
+            "profile": canonical_profile,
         }
         request_fingerprint = hashlib.sha256(
             json.dumps(
@@ -6269,7 +6405,11 @@ class APIServerAdapter(BasePlatformAdapter):
         ).hexdigest()
         try:
             owned, conflict, durable_status = self._response_store.claim_run(
-                run_id, request_fingerprint, initial_status
+                run_id,
+                request_fingerprint,
+                initial_status,
+                owner_id=self._run_owner_id,
+                lease_seconds=self._RUN_OWNER_LEASE_SECONDS,
             )
         except Exception as exc:
             logger.exception("Failed to claim durable run ownership for %s", run_id)
@@ -6357,10 +6497,30 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Background task outlives the HTTP response (and thus the middleware
         # profile scope). Capture now and re-enter inside the task/executor.
-        request_profile = _api_request_profile.get()
-
         async def _run_and_close():
+            lease_heartbeat: Optional[asyncio.Task[Any]] = None
+
+            async def _renew_owner_lease() -> None:
+                while True:
+                    await asyncio.sleep(self._RUN_OWNER_HEARTBEAT_SECONDS)
+                    try:
+                        renewed = await asyncio.to_thread(
+                            self._response_store.renew_run_lease,
+                            run_id,
+                            self._run_owner_id,
+                            self._RUN_OWNER_LEASE_SECONDS,
+                        )
+                    except Exception:
+                        # A transient store failure must not tear down the run
+                        # or bypass the main task's cleanup. Retry on the next
+                        # heartbeat; claimers still require the lease to age out.
+                        logger.exception("Failed to renew run-owner lease for %s", run_id)
+                        continue
+                    if not renewed:
+                        return
+
             try:
+                lease_heartbeat = asyncio.get_running_loop().create_task(_renew_owner_lease())
                 self._set_run_status(run_id, "running")
                 if run_id in self._stopping_run_ids:
                     _put_event_if_active({
@@ -6578,6 +6738,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
             finally:
+                if lease_heartbeat is not None:
+                    lease_heartbeat.cancel()
+                    try:
+                        await lease_heartbeat
+                    except asyncio.CancelledError:
+                        pass
                 # If the asyncio wrapper is cancelled (for example via
                 # /stop), the executor thread can still be blocked waiting
                 # on an approval Event.  Unregistering here releases those
