@@ -1807,10 +1807,17 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
             tool_duration = time.time() - tool_start_time
 
-        if _turn_deadline_remaining(agent) == 0:
+        private_deadline_fence = getattr(messages, "_deadline_fence", None)
+        private_deadline = getattr(messages, "_deadline", None)
+        if (
+            (private_deadline_fence is not None and private_deadline_fence.is_set())
+            or (isinstance(private_deadline, (int, float)) and time.monotonic() >= private_deadline)
+            or _turn_deadline_remaining(agent) == 0
+        ):
             # The public deadline wrapper has already published a deterministic
-            # timeout row. Fence every late in-process mutation/projection here;
-            # the tool's external side effects, if any, remain unknowable.
+            # timeout row. Fence every late in-process mutation/projection here
+            # against the worker's captured deadline/fence, not a reused cached
+            # agent's later turn deadline.
             return
 
         if isinstance(function_result, str):
