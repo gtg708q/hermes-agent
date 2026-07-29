@@ -692,6 +692,7 @@ def run_codex_app_server_turn(
     # standard run_conversation() flow (line ~11823) before the early
     # return reaches us. Do NOT append again — that would duplicate.
 
+    _deadline = None
     try:
         _raw_deadline = getattr(agent, "_turn_deadline_monotonic", None)
         _deadline = _raw_deadline if isinstance(_raw_deadline, (int, float)) and math.isfinite(_raw_deadline) else None
@@ -719,9 +720,15 @@ def run_codex_app_server_turn(
         else:
             logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn
-        # respawns from scratch instead of reusing a dead client.
+        # respawns from scratch instead of reusing a dead client. Cleanup is
+        # itself capped by the remaining whole-turn budget.
         try:
-            agent._codex_session.close()
+            cleanup_timeout = (
+                max(0.0, _deadline - time.monotonic())
+                if _wall_clock_stopped and _deadline is not None
+                else 3.0
+            )
+            agent._codex_session.close(timeout=cleanup_timeout)
         except Exception:
             pass
         agent._codex_session = None

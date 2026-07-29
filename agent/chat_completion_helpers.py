@@ -2433,6 +2433,20 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         result = {"response": None, "error": None}
         first_delta_fired = {"done": False}
         deltas_were_sent = {"yes": False}
+        # Fence callbacks to this specific provider attempt. Cached gateway
+        # agents replace their mutable turn deadline on the next request, so a
+        # late worker must not consult agent state that now belongs to a newer
+        # turn.
+        _bedrock_origin_deadline = getattr(agent, "_turn_deadline_monotonic", None)
+        _bedrock_callback_fence = threading.Event()
+
+        def _bedrock_callback_allowed() -> bool:
+            if _bedrock_callback_fence.is_set():
+                return False
+            return not (
+                isinstance(_bedrock_origin_deadline, (int, float))
+                and time.monotonic() >= _bedrock_origin_deadline
+            )
         # Wire-level liveness for the boto3 converse_stream worker: the worker
         # thread blocks inside ``for event in event_stream`` with NO read
         # timeout, so a provider that opens the stream then stops yielding
@@ -2510,20 +2524,20 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 claim_stream_writer(agent)
 
                 def _on_text(text):
-                    if _turn_deadline_remaining(agent) == 0:
+                    if not _bedrock_callback_allowed():
                         return
                     _fire_first()
                     agent._fire_stream_delta(text)
                     deltas_were_sent["yes"] = True
 
                 def _on_tool(name):
-                    if _turn_deadline_remaining(agent) == 0:
+                    if not _bedrock_callback_allowed():
                         return
                     _fire_first()
                     agent._fire_tool_gen_started(name)
 
                 def _on_reasoning(text):
-                    if _turn_deadline_remaining(agent) == 0:
+                    if not _bedrock_callback_allowed():
                         return
                     _fire_first()
                     agent._fire_reasoning_delta(text)
@@ -2542,8 +2556,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         t = threading.Thread(target=_bedrock_call, daemon=True)
         t.start()
         while t.is_alive():
-            t.join(timeout=_turn_deadline_join_timeout(agent))
+            try:
+                t.join(timeout=_turn_deadline_join_timeout(agent))
+            except BaseException:
+                _bedrock_callback_fence.set()
+                raise
             if agent._interrupt_requested:
+                _bedrock_callback_fence.set()
                 raise InterruptedError("Agent interrupted during Bedrock API call")
             # Liveness watchdog: no Bedrock event for longer than the stale
             # timeout means the stream has wedged (open socket, keep-alives but
@@ -2595,6 +2614,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     f"stream so the retry/fallback path can recover."
                 )
                 break
+        _bedrock_callback_fence.set()
         # Worker exited before the poll loop observed the interrupt flag. The
         # Bedrock stream callback breaks out and returns a PARTIAL response
         # without raising on interrupt (see bedrock_adapter.py

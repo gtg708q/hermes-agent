@@ -7,6 +7,7 @@ deadline timeouts. These tests pin all of that without spawning real codex.
 
 from __future__ import annotations
 
+import threading
 import time
 from unittest.mock import patch
 from typing import Any, Optional
@@ -204,6 +205,36 @@ class TestLifecycle:
 # ---- turn loop ----
 
 class TestRunTurn:
+    def test_whole_turn_deadline_does_not_wait_for_interrupt_rpc(self):
+        client = FakeClient()
+        session = make_session(client)
+        interrupt_started = threading.Event()
+        release_interrupt = threading.Event()
+
+        def _blocking_interrupt(_turn_id):
+            interrupt_started.set()
+            release_interrupt.wait(timeout=2)
+
+        session._issue_interrupt = _blocking_interrupt
+        timer = threading.Timer(0.6, release_interrupt.set)
+        timer.start()
+        began = time.monotonic()
+        try:
+            with pytest.raises(Exception, match="wall_clock_budget_reached"):
+                session.run_turn(
+                    "hi",
+                    turn_timeout=10,
+                    notification_poll_timeout=0.01,
+                    deadline_monotonic=time.monotonic() + 0.05,
+                )
+            elapsed = time.monotonic() - began
+        finally:
+            release_interrupt.set()
+            timer.cancel()
+
+        assert elapsed < 0.3
+        assert not interrupt_started.is_set()
+
     def test_simple_text_turn_returns_final_message(self):
         client = FakeClient()
         client.queue_notification("turn/started", threadId="t", turn={"id": "tu1"})

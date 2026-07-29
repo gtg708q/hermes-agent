@@ -128,6 +128,10 @@ def test_bedrock_deadline_fences_worker_callbacks_after_bounded_return():
                 {"__bedrock_region__": "us-east-1", "__bedrock_converse__": True},
             )
         elapsed = time.monotonic() - started
+        # A cached gateway agent immediately begins another turn and replaces
+        # its mutable deadline. The abandoned worker still belongs to the old
+        # turn and must remain fenced.
+        agent._turn_deadline_monotonic = time.monotonic() + 30
         release.set()
         time.sleep(0.1)
 

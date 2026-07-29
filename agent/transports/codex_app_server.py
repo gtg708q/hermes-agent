@@ -187,6 +187,7 @@ class CodexAppServerClient:
         if self._closed:
             return
         self._closed = True
+        timeout = max(0.0, timeout)
         try:
             if self._proc.stdin and not self._proc.stdin.closed:
                 self._proc.stdin.close()
@@ -198,7 +199,8 @@ class CodexAppServerClient:
         except subprocess.TimeoutExpired:
             try:
                 self._proc.kill()
-                self._proc.wait(timeout=1.0)
+                if timeout > 0:
+                    self._proc.wait(timeout=min(1.0, timeout))
             except Exception:
                 pass
 

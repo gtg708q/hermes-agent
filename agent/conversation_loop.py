@@ -1085,32 +1085,75 @@ def _loop_guard_reason(agent: Any, messages: List[Dict[str, Any]], started_at: f
 
     no_progress_limit = max(0, int(getattr(agent, "no_progress_tool_limit", 0) or 0))
     if no_progress_limit:
-        call_signatures: List[str] = []
-        for message in reversed(messages):
-            if not isinstance(message, dict):
-                continue
-            if message.get("role") == "user":
+        # A repeated request is not itself evidence of a stuck loop. Polling
+        # tools deliberately issue the same call while their result changes.
+        # Hash each assistant batch together with its paired tool results so the
+        # guard only fires when both the request and observed state repeat.
+        turn_start = 0
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            if isinstance(message, dict) and message.get("role") == "user":
+                turn_start = index + 1
                 break
-            if message.get("role") != "assistant" or not message.get("tool_calls"):
+
+        call_signatures: List[str] = []
+        index = turn_start
+        while index < len(messages):
+            message = messages[index]
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                index += 1
                 continue
             calls = message.get("tool_calls") or []
+            if not calls:
+                index += 1
+                continue
+
+            tool_results: List[Dict[str, Any]] = []
+            result_index = index + 1
+            while result_index < len(messages):
+                result = messages[result_index]
+                if not isinstance(result, dict) or result.get("role") != "tool":
+                    break
+                tool_results.append(result)
+                result_index += 1
+            results_by_id = {
+                result.get("tool_call_id"): result
+                for result in tool_results
+                if result.get("tool_call_id")
+            }
+
             normalized_calls = []
-            for call in calls:
+            for call_index, call in enumerate(calls):
                 if not isinstance(call, dict):
                     normalized_calls.append(str(call))
                     continue
                 raw_function = call.get("function")
                 function = raw_function if isinstance(raw_function, dict) else {}
+                result = results_by_id.get(call.get("id"))
+                if result is None and call_index < len(tool_results):
+                    result = tool_results[call_index]
                 normalized_calls.append({
                     "name": function.get("name") or call.get("name"),
                     "arguments": function.get("arguments") or call.get("arguments"),
+                    "result": (
+                        {
+                            "content": result.get("content"),
+                            "status": result.get("_tool_execution_status"),
+                            "effect_disposition": result.get("effect_disposition"),
+                        }
+                        if result is not None
+                        else None
+                    ),
                 })
             normalized = json.dumps(normalized_calls, sort_keys=True, default=str)
             call_signatures.append(hashlib.sha256(normalized.encode("utf-8")).hexdigest())
-            if len(call_signatures) >= no_progress_limit:
-                if len(set(call_signatures[:no_progress_limit])) == 1:
-                    return "no_progress_tool_limit_reached"
-                break
+            index = max(index + 1, result_index)
+
+        if (
+            len(call_signatures) >= no_progress_limit
+            and len(set(call_signatures[-no_progress_limit:])) == 1
+        ):
+            return "no_progress_tool_limit_reached"
     return None
 
 

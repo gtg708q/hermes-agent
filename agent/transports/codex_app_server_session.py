@@ -383,7 +383,7 @@ class CodexAppServerSession:
         )
         return self._thread_id
 
-    def close(self) -> None:
+    def close(self, timeout: float = 3.0) -> None:
         if self._closed:
             return
         self._closed = True
@@ -391,7 +391,13 @@ class CodexAppServerSession:
             self._active_turn_id = None
         if self._client is not None:
             try:
-                self._client.close()
+                self._client.close(timeout=max(0.0, timeout))
+            except TypeError:
+                # Compatibility for injected/older clients without the timeout
+                # parameter. Never call an unbounded fallback after a hard
+                # deadline has already expired.
+                if timeout > 0:
+                    self._client.close()
             except Exception:  # pragma: no cover - best-effort cleanup
                 pass
             self._client = None
@@ -805,8 +811,11 @@ class CodexAppServerSession:
         if not turn_complete and not result.interrupted:
             # tell the caller to retire the session — a turn that never
             # finished is a strong sign codex is wedged in a way the next
-            # turn shouldn't inherit.
-            self._issue_interrupt(result.turn_id)
+            # turn shouldn't inherit. A whole-turn deadline is a hard return
+            # boundary, so skip the blocking interrupt RPC in that case; the
+            # caller retires the subprocess immediately.
+            if not wall_clock_expired:
+                self._issue_interrupt(result.turn_id)
             result.interrupted = True
             if not result.error:
                 result.error = self._format_error_with_stderr(

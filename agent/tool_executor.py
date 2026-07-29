@@ -189,13 +189,11 @@ def _flush_session_db_after_tool_progress(
             )
             return False
 
-    if deadline_lock is not None:
-        with deadline_lock:
-            if deadline_fence is not None and deadline_fence.is_set():
-                # The public thread already persisted the fully paired timeout
-                # transcript. Never overwrite it with a stale private prefix.
-                return True
-            return _persist()
+    if deadline_fence is not None and deadline_fence.is_set():
+        # The public thread already fenced this private transcript. Do not wait
+        # on a lock held by an in-flight filesystem/SQLite write: persistence is
+        # exactly the blocking operation the whole-turn deadline must bound.
+        return True
     return _persist()
 
 
@@ -391,7 +389,7 @@ def _run_agent_tool_execution_middleware(
     return result, observed_args
 
 
-def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
+def _execute_tool_calls_concurrent_inline(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
     """Execute multiple tool calls concurrently using a thread pool.
 
     Results are collected in the original tool-call order and appended to
@@ -714,6 +712,22 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 if deadline_fence.is_set() or (
                     deadline is not None and time.monotonic() >= deadline
                 ):
+                    result = (
+                        f"[Tool execution cancelled — {function_name} was not started "
+                        "because the whole-turn wall-clock budget was reached]"
+                    )
+                    results[index] = (
+                        function_name,
+                        function_args,
+                        result,
+                        0.0,
+                        True,
+                        True,
+                        middleware_trace,
+                    )
+                    return
+                mark_started = getattr(messages, "mark_tool_started", None)
+                if mark_started is not None and not mark_started(tool_call.id):
                     result = (
                         f"[Tool execution cancelled — {function_name} was not started "
                         "because the whole-turn wall-clock budget was reached]"
@@ -2064,6 +2078,164 @@ class _DeadlinePrivateMessages(list):
             return True
 
 
+def execute_tool_calls_concurrent(
+    agent,
+    assistant_message,
+    messages: list,
+    effective_task_id: str,
+    api_call_count: int = 0,
+    *,
+    finalize: bool = True,
+) -> None:
+    """Bound the complete concurrent path, including extension preflight."""
+    remaining = _turn_deadline_remaining(agent)
+    if remaining is None:
+        return _execute_tool_calls_concurrent_inline(
+            agent,
+            assistant_message,
+            messages,
+            effective_task_id,
+            api_call_count,
+            finalize=finalize,
+        )
+    if remaining <= 0:
+        agent._wall_clock_expired = True
+        for tool_call in assistant_message.tool_calls:
+            messages.append(make_tool_result_message(
+                tool_call.function.name,
+                "[Tool execution cancelled — the whole-turn wall-clock budget was reached]",
+                tool_call.id,
+                effect_disposition="none",
+            ))
+        return
+
+    initial_message_count = len(messages)
+    deadline_fence = threading.Event()
+    private_messages = _DeadlinePrivateMessages(
+        messages,
+        deadline_fence,
+        agent._turn_deadline_monotonic,
+    )
+    outcome: dict[str, Any] = {}
+    finished = threading.Event()
+
+    def _run() -> None:
+        worker_tid = threading.get_ident()
+        with agent._tool_worker_threads_lock:
+            agent._tool_worker_threads.add(worker_tid)
+        if agent._interrupt_requested:
+            try:
+                _ra()._set_interrupt(True, worker_tid)
+            except Exception:
+                pass
+        try:
+            _execute_tool_calls_concurrent_inline(
+                agent,
+                assistant_message,
+                private_messages,
+                effective_task_id,
+                api_call_count,
+                finalize=finalize,
+            )
+        except BaseException as exc:
+            outcome["error"] = exc
+        finally:
+            with agent._tool_worker_threads_lock:
+                agent._tool_worker_threads.discard(worker_tid)
+            try:
+                _ra()._set_interrupt(False, worker_tid)
+            except Exception:
+                pass
+            outcome["finished_at"] = time.monotonic()
+            finished.set()
+
+    worker = threading.Thread(
+        target=propagate_context_to_thread(_run),
+        name="hermes-concurrent-tool-deadline",
+        daemon=True,
+    )
+    worker.start()
+
+    stopped_by_interrupt = False
+    while not finished.is_set():
+        if agent._interrupt_requested:
+            stopped_by_interrupt = True
+            worker_tid = worker.ident
+            if worker_tid is not None:
+                try:
+                    _ra()._set_interrupt(True, worker_tid)
+                except Exception:
+                    pass
+            finished.wait(timeout=0.1)
+            break
+        remaining = max(0.0, agent._turn_deadline_monotonic - time.monotonic())
+        if remaining <= 0:
+            break
+        finished.wait(timeout=min(0.05, remaining))
+
+    if finished.is_set() and (
+        outcome.get("finished_at", float("inf")) < agent._turn_deadline_monotonic
+    ):
+        if "error" in outcome:
+            raise outcome["error"]
+        messages[:] = private_messages
+        return
+
+    if not stopped_by_interrupt:
+        agent._wall_clock_expired = True
+    deadline_fence.set()
+    completed_prefix = list(private_messages[initial_message_count:])
+    started_tool_call_ids = set(private_messages._started_tool_call_ids)
+    worker_tid = worker.ident
+    if worker_tid is not None:
+        try:
+            _ra()._set_interrupt(True, worker_tid)
+        except Exception:
+            pass
+
+    completed_by_id = {
+        message.get("tool_call_id"): message
+        for message in completed_prefix
+        if isinstance(message, dict) and message.get("tool_call_id")
+    }
+    published_messages = list(messages)
+    for tool_call in assistant_message.tool_calls:
+        completed = completed_by_id.get(tool_call.id)
+        if completed is not None:
+            published_messages.append(completed)
+            continue
+        in_flight = tool_call.id in started_tool_call_ids
+        if in_flight:
+            reason = (
+                "user interrupt requested"
+                if stopped_by_interrupt
+                else "whole-turn wall-clock budget reached"
+            )
+            content = (
+                f"Error executing tool '{tool_call.function.name}': timed out; {reason}; "
+                "the in-process tool could not be forcibly cancelled"
+            )
+            disposition = "unknown"
+        else:
+            reason = (
+                "a user interrupt was requested"
+                if stopped_by_interrupt
+                else "the whole-turn wall-clock budget was reached"
+            )
+            content = (
+                f"[Tool execution cancelled — {tool_call.function.name} was not started "
+                f"because {reason}]"
+            )
+            disposition = "none"
+        published_messages.append(make_tool_result_message(
+            tool_call.function.name,
+            content,
+            tool_call.id,
+            effect_disposition=disposition,
+        ))
+    messages[:] = published_messages
+
+
 def _execute_tool_calls_sequential_bounded(agent, assistant_message, messages: list, effective_task_id: str, api_call_count: int = 0, *, finalize: bool = True) -> None:
     """Run sequential tools behind the whole-turn deadline boundary.
 
@@ -2132,10 +2304,26 @@ def _execute_tool_calls_sequential_bounded(agent, assistant_message, messages: l
         daemon=True,
     )
     worker.start()
-    wait_remaining = max(
-        0.0, agent._turn_deadline_monotonic - time.monotonic()
-    )
-    if finished.wait(timeout=wait_remaining) and (
+    stopped_by_interrupt = False
+    while not finished.is_set():
+        if agent._interrupt_requested:
+            stopped_by_interrupt = True
+            worker_tid = worker.ident
+            if worker_tid is not None:
+                try:
+                    _ra()._set_interrupt(True, worker_tid)
+                except Exception:
+                    pass
+            finished.wait(timeout=0.1)
+            break
+        wait_remaining = max(
+            0.0, agent._turn_deadline_monotonic - time.monotonic()
+        )
+        if wait_remaining <= 0:
+            break
+        finished.wait(timeout=min(0.05, wait_remaining))
+
+    if finished.is_set() and (
         outcome.get("finished_at", float("inf")) < agent._turn_deadline_monotonic
     ):
         if "error" in outcome:
@@ -2143,14 +2331,14 @@ def _execute_tool_calls_sequential_bounded(agent, assistant_message, messages: l
         messages[:] = private_messages
         return
 
-    agent._wall_clock_expired = True
-    # Fence the private worker before taking its completed-prefix snapshot.
-    # Any flush that was delayed until after this point becomes a no-op, so it
-    # cannot overwrite the canonical timeout rows persisted below.
-    with private_messages._deadline_lock:
-        deadline_fence.set()
-        completed_prefix = list(private_messages[initial_message_count:])
-        started_tool_call_ids = set(private_messages._started_tool_call_ids)
+    if not stopped_by_interrupt:
+        agent._wall_clock_expired = True
+    # Fence the private worker before taking its completed-prefix snapshot. The
+    # transition itself must not wait on a persistence call that the deadline is
+    # meant to bound.
+    deadline_fence.set()
+    completed_prefix = list(private_messages[initial_message_count:])
+    started_tool_call_ids = set(private_messages._started_tool_call_ids)
     worker_tid = worker.ident
     if worker_tid is not None:
         try:
@@ -2165,15 +2353,26 @@ def _execute_tool_calls_sequential_bounded(agent, assistant_message, messages: l
     for tc in assistant_message.tool_calls[completed_count:]:
         in_flight = tc.id in started_tool_call_ids
         if in_flight:
-            content = (
-                f"Error executing tool '{tc.function.name}': whole-turn wall-clock "
-                "budget reached; the in-process tool could not be forcibly cancelled"
-            )
+            if stopped_by_interrupt:
+                content = (
+                    f"Error executing tool '{tc.function.name}': user interrupt requested; "
+                    "the in-process tool could not be forcibly cancelled"
+                )
+            else:
+                content = (
+                    f"Error executing tool '{tc.function.name}': timed out; whole-turn "
+                    "wall-clock budget reached; the in-process tool could not be forcibly "
+                    "cancelled"
+                )
             disposition = "unknown"
         else:
+            reason = (
+                "because a user interrupt was requested"
+                if stopped_by_interrupt
+                else "because the whole-turn wall-clock budget was reached"
+            )
             content = (
-                f"[Tool execution cancelled — {tc.function.name} was not started "
-                "because the whole-turn wall-clock budget was reached]"
+                f"[Tool execution cancelled — {tc.function.name} was not started {reason}]"
             )
             disposition = "none"
         published_messages.append(make_tool_result_message(
@@ -2183,11 +2382,20 @@ def _execute_tool_calls_sequential_bounded(agent, assistant_message, messages: l
             effect_disposition=disposition,
         ))
     messages[:] = published_messages
-    _flush_session_db_after_tool_progress(
-        agent,
-        messages,
-        stage="whole-turn sequential tool deadline",
-    )
+    # Preserve crash-resilience persistence without making the public deadline
+    # wait on SQLite/filesystem I/O. Persisted markers are shared with this
+    # shallow snapshot, so only the synthesized timeout rows remain to append
+    # after any older in-flight flush releases.
+    persistence_snapshot = list(messages)
+    threading.Thread(
+        target=lambda: _flush_session_db_after_tool_progress(
+            agent,
+            persistence_snapshot,
+            stage="whole-turn sequential tool deadline",
+        ),
+        name="hermes-deadline-persistence",
+        daemon=True,
+    ).start()
 
 
 

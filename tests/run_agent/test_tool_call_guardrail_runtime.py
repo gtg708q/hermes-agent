@@ -247,6 +247,84 @@ def test_sequential_deadline_worker_receives_interrupt_and_clears_targeted_bit()
         assert _interrupted_threads == set()
 
 
+def test_sequential_deadline_hard_stop_does_not_wait_for_noncooperative_tool():
+    from tools.interrupt import _interrupted_threads, _lock
+
+    agent = _make_agent("web_search")
+    started = threading.Event()
+    release = threading.Event()
+    worker_exited = threading.Event()
+    agent._turn_deadline_monotonic = time.monotonic() + 2.0
+    tc = _mock_tool_call("web_search", '{"query":"noncooperative"}', "c-stop")
+    messages = []
+
+    def _blocking_call(*_args, **_kwargs):
+        started.set()
+        release.wait(timeout=3)
+        worker_exited.set()
+        return "late-result"
+
+    def _interrupt():
+        assert started.wait(timeout=1)
+        agent.interrupt("hard stop")
+
+    interrupter = threading.Thread(target=_interrupt)
+    interrupter.start()
+    began = time.monotonic()
+    try:
+        with patch("run_agent.handle_function_call", side_effect=_blocking_call):
+            agent._execute_tool_calls_sequential(
+                SimpleNamespace(content="", tool_calls=[tc]), messages, "task-1"
+            )
+        elapsed = time.monotonic() - began
+        assert elapsed < 0.5
+        assert messages[0]["effect_disposition"] == "unknown"
+        assert "interrupt" in messages[0]["content"].lower()
+    finally:
+        release.set()
+        interrupter.join(timeout=1)
+        assert worker_exited.wait(timeout=1)
+
+    deadline = time.monotonic() + 1
+    while agent._tool_worker_threads and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert agent._tool_worker_threads == set()
+    with _lock:
+        assert _interrupted_threads == set()
+
+
+def test_sequential_deadline_fence_does_not_wait_for_blocked_persistence():
+    agent = _make_agent("web_search")
+    persistence_started = threading.Event()
+    release_persistence = threading.Event()
+    agent._turn_deadline_monotonic = time.monotonic() + 0.05
+    tc = _mock_tool_call("web_search", '{"query":"fast"}', "c-persist")
+    messages = []
+
+    def _blocking_flush(_messages):
+        persistence_started.set()
+        release_persistence.wait(timeout=2)
+        return True
+
+    agent._flush_messages_to_session_db = _blocking_flush
+    timer = threading.Timer(0.6, release_persistence.set)
+    timer.start()
+    began = time.monotonic()
+    try:
+        with patch("run_agent.handle_function_call", return_value="fast-result"):
+            agent._execute_tool_calls_sequential(
+                SimpleNamespace(content="", tool_calls=[tc]), messages, "task-1"
+            )
+        elapsed = time.monotonic() - began
+    finally:
+        release_persistence.set()
+        timer.cancel()
+
+    assert persistence_started.is_set()
+    assert elapsed < 0.3
+    assert agent._wall_clock_expired is True
+
+
 def test_sequential_deadline_preserves_and_persists_completed_prefix_in_order():
     agent = _make_agent("web_search")
     release = threading.Event()
@@ -281,6 +359,9 @@ def test_sequential_deadline_preserves_and_persists_completed_prefix_in_order():
         assert "effect_disposition" not in messages[0]
         assert messages[1]["effect_disposition"] == "unknown"
         assert messages[2]["effect_disposition"] == "none"
+        persist_deadline = time.monotonic() + 1
+        while (not persisted or persisted[-1] != messages) and time.monotonic() < persist_deadline:
+            time.sleep(0.01)
         assert persisted[-1] == messages
     finally:
         release.set()
@@ -386,6 +467,51 @@ def test_concurrent_tool_start_callback_cannot_submit_after_deadline():
     assert len(messages) == 1
     assert messages[0]["effect_disposition"] == "none"
     assert "was not started" in messages[0]["content"]
+
+
+def test_concurrent_preflight_middleware_is_bounded_by_turn_deadline():
+    agent = _make_agent("web_search")
+    entered = threading.Event()
+    release = threading.Event()
+    agent._turn_deadline_monotonic = time.monotonic() + 0.05
+    calls = [
+        _mock_tool_call("web_search", '{"query":"one"}', "c-preflight-one"),
+        _mock_tool_call("web_search", '{"query":"two"}', "c-preflight-two"),
+    ]
+    messages = []
+
+    def _blocking_middleware(_agent, **kwargs):
+        entered.set()
+        release.wait(timeout=2)
+        return kwargs["function_args"], []
+
+    timer = threading.Timer(0.6, release.set)
+    timer.start()
+    began = time.monotonic()
+    try:
+        with (
+            patch(
+                "agent.tool_executor._apply_tool_request_middleware_for_agent",
+                side_effect=_blocking_middleware,
+            ),
+            patch.object(agent, "_invoke_tool", return_value="must-not-run") as invoke,
+        ):
+            agent._execute_tool_calls_concurrent(
+                SimpleNamespace(content="", tool_calls=calls), messages, "task-1"
+            )
+        elapsed = time.monotonic() - began
+    finally:
+        release.set()
+        timer.cancel()
+
+    assert entered.is_set()
+    assert elapsed < 0.3
+    invoke.assert_not_called()
+    assert [message["tool_call_id"] for message in messages] == [
+        "c-preflight-one",
+        "c-preflight-two",
+    ]
+    assert all(message["effect_disposition"] == "none" for message in messages)
 
 
 def test_concurrent_result_finishing_during_deadline_fence_stays_unknown():

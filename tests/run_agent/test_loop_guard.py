@@ -69,7 +69,7 @@ def test_loop_guard_does_not_treat_successful_error_text_as_failure():
     assert _loop_guard_reason(agent, messages, 0) is None
 
 
-def test_loop_guard_stops_repeated_tool_calls_with_new_provider_ids():
+def test_loop_guard_allows_repeated_poll_calls_when_results_change():
     agent = SimpleNamespace(
         max_wall_clock_seconds=0,
         repeated_tool_error_limit=0,
@@ -89,6 +89,36 @@ def test_loop_guard_stops_repeated_tool_calls_with_new_provider_ids():
                 }],
             },
             {"role": "tool", "content": f"attempt {index}"},
+        ])
+
+    assert _loop_guard_reason(agent, messages, 0) is None
+
+
+def test_loop_guard_stops_repeated_tool_calls_when_results_do_not_change():
+    agent = SimpleNamespace(
+        max_wall_clock_seconds=0,
+        repeated_tool_error_limit=0,
+        no_progress_tool_limit=3,
+    )
+    messages = []
+    for index in range(3):
+        messages.extend([
+            {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": f"call-{index}",
+                    "function": {
+                        "name": "process",
+                        "arguments": '{"action":"poll","session_id":"build"}',
+                    },
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": f"call-{index}",
+                "content": "still running; no new output",
+                "_tool_execution_status": "success",
+            },
         ])
 
     assert _loop_guard_reason(agent, messages, 0) == "no_progress_tool_limit_reached"
