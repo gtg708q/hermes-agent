@@ -24,6 +24,7 @@ from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
     ResponseStore,
+    _api_request_profile,
     _approval_event_choices,
     _derive_idempotent_run_id,
     cors_middleware,
@@ -89,6 +90,23 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     return app
 
 
+def _create_profiled_runs_app(adapter: APIServerAdapter) -> web.Application:
+    """Create a minimal multiplex app that drives the real profile context."""
+    @web.middleware
+    async def _profile_context(request, handler):
+        token = _api_request_profile.set(request.match_info["profile"])
+        try:
+            return await handler(request)
+        finally:
+            _api_request_profile.reset(token)
+
+    app = web.Application(middlewares=[_profile_context])
+    app["api_server_adapter"] = adapter
+    app.router.add_post("/p/{profile}/v1/runs", adapter._handle_runs)
+    app.router.add_get("/p/{profile}/v1/runs/{run_id}", adapter._handle_get_run)
+    return app
+
+
 def _idempotency_headers(key: str | None = None) -> dict[str, str]:
     return {"Idempotency-Key": key if key is not None else uuid.uuid4().hex}
 
@@ -151,27 +169,34 @@ class TestStartRun:
         assert secondary != unprefixed
 
     @pytest.mark.asyncio
-    async def test_start_requires_nonempty_bounded_idempotency_key(self, adapter):
+    async def test_start_preserves_headerless_contract_and_validates_supplied_key(self, adapter):
         app = _create_runs_app(adapter)
-        async with TestClient(TestServer(app)) as cli:
-            missing = await cli.post(
-                "/v1/runs", json={"input": "hello"}, headers={}
-            )
-            empty = await cli.post(
-                "/v1/runs",
-                json={"input": "hello"},
-                headers={"Idempotency-Key": ""},
-            )
-            oversized = await cli.post(
-                "/v1/runs",
-                json={"input": "hello"},
-                headers={"Idempotency-Key": "x" * 256},
-            )
+        with patch.object(adapter, "_create_agent") as create_agent:
+            agent = MagicMock()
+            agent.run_conversation.return_value = {"final_response": "done"}
+            agent.session_prompt_tokens = 0
+            agent.session_completion_tokens = 0
+            agent.session_total_tokens = 0
+            create_agent.return_value = agent
+            async with TestClient(TestServer(app)) as cli:
+                missing = await cli.post(
+                    "/v1/runs", json={"input": "hello"}, headers={}
+                )
+                empty = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello"},
+                    headers={"Idempotency-Key": ""},
+                )
+                oversized = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello"},
+                    headers={"Idempotency-Key": "x" * 256},
+                )
 
-        assert missing.status == 400
+        assert missing.status == 202
         assert empty.status == 400
         assert oversized.status == 400
-        assert adapter._run_statuses == {}
+        assert len(adapter._run_statuses) == 1
 
     @pytest.mark.asyncio
     async def test_idempotency_key_derives_exact_run_id_and_replay_returns_status(self, adapter):
@@ -537,6 +562,72 @@ class TestStartRun:
         assert remaining == 1
         store.close()
 
+    def test_one_sweep_drains_more_than_one_expired_sql_batch(self, tmp_path):
+        store = ResponseStore(db_path=str(tmp_path / "catch-up-response-store.db"))
+        now = time.time()
+        for index in range(250):
+            run_id = f"run_backlog_{index}"
+            status = {"run_id": run_id, "status": "queued"}
+            store.claim_run(run_id, f"fingerprint-{index}", status)
+            store.put_run_status(run_id, {**status, "status": "completed"})
+        with store._lock:
+            store._conn.execute(
+                "UPDATE run_idempotency SET terminal_at = ?", (now - 100,)
+            )
+            store._conn.commit()
+
+        restarted = _make_adapter()
+        restarted._response_store.close()
+        restarted._response_store = store
+        restarted._sweep_orphaned_runs_once(now=now + restarted._RUN_STATUS_TTL)
+
+        with store._lock:
+            remaining = store._conn.execute(
+                "SELECT COUNT(*) FROM run_idempotency"
+            ).fetchone()[0]
+        assert remaining == 0
+        store.close()
+
+    @pytest.mark.asyncio
+    async def test_terminal_status_write_retries_before_run_releases_ownership(
+        self, adapter
+    ):
+        app = _create_runs_app(adapter)
+        original_put = adapter._response_store.put_run_status
+        terminal_attempts = 0
+        durable = None
+
+        def _flaky_put(run_id, status, **kwargs):
+            nonlocal terminal_attempts
+            if status.get("status") == "completed":
+                terminal_attempts += 1
+                if terminal_attempts == 1:
+                    raise OSError("transient terminal write failure")
+            return original_put(run_id, status, **kwargs)
+
+        with (
+            patch.object(adapter._response_store, "put_run_status", side_effect=_flaky_put),
+            patch.object(adapter, "_create_agent") as create_agent,
+        ):
+            agent = MagicMock()
+            agent.run_conversation.return_value = {"final_response": "done"}
+            agent.session_prompt_tokens = 0
+            agent.session_completion_tokens = 0
+            agent.session_total_tokens = 0
+            create_agent.return_value = agent
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await response.json())["run_id"]
+                for _ in range(50):
+                    durable = adapter._response_store.get_run_status(run_id)
+                    if durable and durable.get("status") == "completed":
+                        break
+                    await asyncio.sleep(0.02)
+
+        assert terminal_attempts >= 2
+        assert durable is not None
+        assert durable["status"] == "completed"
+
     @pytest.mark.asyncio
     async def test_start_returns_202(self, adapter):
         app = _create_runs_app(adapter)
@@ -746,6 +837,53 @@ class TestStartRun:
 
 
 class TestRunStatus:
+    @pytest.mark.asyncio
+    async def test_durable_status_is_not_visible_across_profiles(self, adapter):
+        app = _create_profiled_runs_app(adapter)
+        owner_response = None
+        owner_payload = {}
+        with patch.object(adapter, "_create_agent") as create_agent:
+            agent = MagicMock()
+            agent.run_conversation.return_value = {"final_response": "private-b-output"}
+            agent.session_prompt_tokens = 0
+            agent.session_completion_tokens = 0
+            agent.session_total_tokens = 0
+            create_agent.return_value = agent
+            async with TestClient(TestServer(app)) as cli:
+                started = await cli.post(
+                    "/p/profile-b/v1/runs",
+                    json={"input": "hello"},
+                    headers=_idempotency_headers("profile-private-run"),
+                )
+                run_id = (await started.json())["run_id"]
+                for _ in range(50):
+                    owner_response = await cli.get(
+                        f"/p/profile-b/v1/runs/{run_id}"
+                    )
+                    owner_payload = await owner_response.json()
+                    if owner_payload.get("status") == "completed":
+                        break
+                    await asyncio.sleep(0.02)
+
+                # Simulate a gateway restart: force both requests through the
+                # adapter-wide durable fallback rather than the in-memory map.
+                adapter._run_statuses.clear()
+                adapter._run_profiles.clear()
+                foreign_response = await cli.get(
+                    f"/p/profile-a/v1/runs/{run_id}"
+                )
+                foreign_payload = await foreign_response.json()
+                owner_response = await cli.get(
+                    f"/p/profile-b/v1/runs/{run_id}"
+                )
+                owner_payload = await owner_response.json()
+
+        assert owner_response is not None
+        assert owner_response.status == 200
+        assert owner_payload["output"] == "private-b-output"
+        assert foreign_response.status == 404
+        assert "private-b-output" not in json.dumps(foreign_payload)
+
     @pytest.mark.asyncio
     async def test_status_completed_run_includes_output_and_usage(self, adapter):
         app = _create_runs_app(adapter)

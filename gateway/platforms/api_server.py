@@ -670,45 +670,65 @@ class ResponseStore:
         # hermes_state._WAL_INCOMPAT_MARKERS).
         from hermes_state import apply_wal_with_fallback
         apply_wal_with_fallback(self._conn, db_label="response_store.db")
-        self._conn.execute(
-            """CREATE TABLE IF NOT EXISTS responses (
-                response_id TEXT PRIMARY KEY,
-                data TEXT NOT NULL,
-                accessed_at REAL NOT NULL
-            )"""
-        )
-        self._conn.execute(
-            """CREATE TABLE IF NOT EXISTS conversations (
-                name TEXT PRIMARY KEY,
-                response_id TEXT NOT NULL
-            )"""
-        )
-        self._conn.execute(
-            """CREATE TABLE IF NOT EXISTS run_idempotency (
-                run_id TEXT PRIMARY KEY,
-                request_fingerprint TEXT NOT NULL,
-                status_json TEXT NOT NULL,
-                updated_at REAL NOT NULL,
-                terminal_at REAL,
-                owner_id TEXT,
-                lease_expires_at REAL
-            )"""
-        )
-        # Migrate stores created before durable claims had leased owners.
-        run_columns = {
-            row[1] for row in self._conn.execute("PRAGMA table_info(run_idempotency)")
-        }
-        if "owner_id" not in run_columns:
-            self._conn.execute("ALTER TABLE run_idempotency ADD COLUMN owner_id TEXT")
-        if "lease_expires_at" not in run_columns:
-            self._conn.execute(
-                "ALTER TABLE run_idempotency ADD COLUMN lease_expires_at REAL"
-            )
-        self._conn.execute(
-            """CREATE INDEX IF NOT EXISTS idx_run_idempotency_terminal_at
-               ON run_idempotency(terminal_at)"""
-        )
-        self._conn.commit()
+        # Serialize the schema read/ALTER sequence across gateway processes.
+        # Without the write transaction, two first-openers can both observe a
+        # missing column and the loser aborts startup with "duplicate column".
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute(
+                    """CREATE TABLE IF NOT EXISTS responses (
+                        response_id TEXT PRIMARY KEY,
+                        data TEXT NOT NULL,
+                        accessed_at REAL NOT NULL
+                    )"""
+                )
+                self._conn.execute(
+                    """CREATE TABLE IF NOT EXISTS conversations (
+                        name TEXT PRIMARY KEY,
+                        response_id TEXT NOT NULL
+                    )"""
+                )
+                self._conn.execute(
+                    """CREATE TABLE IF NOT EXISTS run_idempotency (
+                        run_id TEXT PRIMARY KEY,
+                        request_fingerprint TEXT NOT NULL,
+                        status_json TEXT NOT NULL,
+                        updated_at REAL NOT NULL,
+                        terminal_at REAL,
+                        owner_id TEXT,
+                        lease_expires_at REAL,
+                        profile TEXT NOT NULL DEFAULT 'default'
+                    )"""
+                )
+                # Migrate stores created before leased owners/profile scoping.
+                run_columns = {
+                    row[1]
+                    for row in self._conn.execute(
+                        "PRAGMA table_info(run_idempotency)"
+                    )
+                }
+                if "owner_id" not in run_columns:
+                    self._conn.execute(
+                        "ALTER TABLE run_idempotency ADD COLUMN owner_id TEXT"
+                    )
+                if "lease_expires_at" not in run_columns:
+                    self._conn.execute(
+                        "ALTER TABLE run_idempotency ADD COLUMN lease_expires_at REAL"
+                    )
+                if "profile" not in run_columns:
+                    self._conn.execute(
+                        """ALTER TABLE run_idempotency
+                           ADD COLUMN profile TEXT NOT NULL DEFAULT 'default'"""
+                    )
+                self._conn.execute(
+                    """CREATE INDEX IF NOT EXISTS idx_run_idempotency_terminal_at
+                       ON run_idempotency(terminal_at)"""
+                )
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
         # response_store.db contains conversation history (tool payloads,
         # prompts, results). Tighten to owner-only after creation so other
         # local users on a shared box can't read it. Run once at __init__
@@ -737,87 +757,92 @@ class ResponseStore:
 
     def get(self, response_id: str) -> Optional[Dict[str, Any]]:
         """Retrieve a stored response by ID (updates access time for LRU)."""
-        row = self._conn.execute(
-            "SELECT data FROM responses WHERE response_id = ?", (response_id,)
-        ).fetchone()
-        if row is None:
-            return None
-        self._conn.execute(
-            "UPDATE responses SET accessed_at = ? WHERE response_id = ?",
-            (time.time(), response_id),
-        )
-        self._conn.commit()
-        try:
-            return json.loads(row[0])
-        except (json.JSONDecodeError, TypeError):
-            logger.warning(
-                "Corrupted JSON in response store for id=%s, evicting entry",
-                response_id,
-            )
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT data FROM responses WHERE response_id = ?", (response_id,)
+            ).fetchone()
+            if row is None:
+                return None
             self._conn.execute(
-                "DELETE FROM responses WHERE response_id = ?",
-                (response_id,),
+                "UPDATE responses SET accessed_at = ? WHERE response_id = ?",
+                (time.time(), response_id),
             )
             self._conn.commit()
-            return None
+            try:
+                return json.loads(row[0])
+            except (json.JSONDecodeError, TypeError):
+                logger.warning(
+                    "Corrupted JSON in response store for id=%s, evicting entry",
+                    response_id,
+                )
+                self._conn.execute(
+                    "DELETE FROM responses WHERE response_id = ?",
+                    (response_id,),
+                )
+                self._conn.commit()
+                return None
 
     def put(self, response_id: str, data: Dict[str, Any]) -> None:
         """Store a response, evicting the oldest if at capacity."""
-        self._conn.execute(
-            "INSERT OR REPLACE INTO responses (response_id, data, accessed_at) VALUES (?, ?, ?)",
-            (response_id, json.dumps(data, default=str), time.time()),
-        )
-        # Evict oldest entries beyond max_size
-        count = self._conn.execute("SELECT COUNT(*) FROM responses").fetchone()[0]
-        if count > self._max_size:
-            # Collect IDs that will be evicted
-            evict_ids = [
-                row[0]
-                for row in self._conn.execute(
-                    "SELECT response_id FROM responses ORDER BY accessed_at ASC LIMIT ?",
-                    (count - self._max_size,),
-                ).fetchall()
-            ]
-            if evict_ids:
-                placeholders = ",".join("?" for _ in evict_ids)
-                # Clear conversation mappings pointing to evicted responses
-                self._conn.execute(
-                    f"DELETE FROM conversations WHERE response_id IN ({placeholders})",
-                    evict_ids,
-                )
-                # Delete evicted responses
-                self._conn.execute(
-                    f"DELETE FROM responses WHERE response_id IN ({placeholders})",
-                    evict_ids,
-                )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO responses (response_id, data, accessed_at) VALUES (?, ?, ?)",
+                (response_id, json.dumps(data, default=str), time.time()),
+            )
+            # Evict oldest entries beyond max_size
+            count = self._conn.execute("SELECT COUNT(*) FROM responses").fetchone()[0]
+            if count > self._max_size:
+                # Collect IDs that will be evicted
+                evict_ids = [
+                    row[0]
+                    for row in self._conn.execute(
+                        "SELECT response_id FROM responses ORDER BY accessed_at ASC LIMIT ?",
+                        (count - self._max_size,),
+                    ).fetchall()
+                ]
+                if evict_ids:
+                    placeholders = ",".join("?" for _ in evict_ids)
+                    # Clear conversation mappings pointing to evicted responses
+                    self._conn.execute(
+                        f"DELETE FROM conversations WHERE response_id IN ({placeholders})",
+                        evict_ids,
+                    )
+                    # Delete evicted responses
+                    self._conn.execute(
+                        f"DELETE FROM responses WHERE response_id IN ({placeholders})",
+                        evict_ids,
+                    )
+            self._conn.commit()
 
     def delete(self, response_id: str) -> bool:
         """Remove a response from the store. Returns True if found and deleted."""
-        # Clear conversation mappings pointing to this response
-        self._conn.execute(
-            "DELETE FROM conversations WHERE response_id = ?", (response_id,)
-        )
-        cursor = self._conn.execute(
-            "DELETE FROM responses WHERE response_id = ?", (response_id,)
-        )
-        self._conn.commit()
-        return cursor.rowcount > 0
+        with self._lock:
+            # Clear conversation mappings pointing to this response
+            self._conn.execute(
+                "DELETE FROM conversations WHERE response_id = ?", (response_id,)
+            )
+            cursor = self._conn.execute(
+                "DELETE FROM responses WHERE response_id = ?", (response_id,)
+            )
+            self._conn.commit()
+            return cursor.rowcount > 0
 
     def get_conversation(self, name: str) -> Optional[str]:
         """Get the latest response_id for a conversation name."""
-        row = self._conn.execute(
-            "SELECT response_id FROM conversations WHERE name = ?", (name,)
-        ).fetchone()
-        return row[0] if row else None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT response_id FROM conversations WHERE name = ?", (name,)
+            ).fetchone()
+            return row[0] if row else None
 
     def set_conversation(self, name: str, response_id: str) -> None:
         """Map a conversation name to its latest response_id."""
-        self._conn.execute(
-            "INSERT OR REPLACE INTO conversations (name, response_id) VALUES (?, ?)",
-            (name, response_id),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO conversations (name, response_id) VALUES (?, ?)",
+                (name, response_id),
+            )
+            self._conn.commit()
 
     def claim_run(
         self,
@@ -825,6 +850,7 @@ class ResponseStore:
         request_fingerprint: str,
         status: Dict[str, Any],
         *,
+        profile: str = "default",
         owner_id: Optional[str] = None,
         lease_seconds: float = 0,
         now: Optional[float] = None,
@@ -846,8 +872,8 @@ class ResponseStore:
                 cursor = self._conn.execute(
                     """INSERT OR IGNORE INTO run_idempotency
                        (run_id, request_fingerprint, status_json, updated_at,
-                        terminal_at, owner_id, lease_expires_at)
-                       VALUES (?, ?, ?, ?, NULL, ?, ?)""",
+                        terminal_at, owner_id, lease_expires_at, profile)
+                       VALUES (?, ?, ?, ?, NULL, ?, ?, ?)""",
                     (
                         run_id,
                         request_fingerprint,
@@ -855,6 +881,7 @@ class ResponseStore:
                         now,
                         owner_id,
                         lease_expires_at if owner_id is not None else None,
+                        profile,
                     ),
                 )
                 if cursor.rowcount == 1:
@@ -862,7 +889,7 @@ class ResponseStore:
                     return True, False, status
                 row = self._conn.execute(
                     """SELECT request_fingerprint, status_json, terminal_at,
-                              owner_id, lease_expires_at
+                              owner_id, lease_expires_at, profile
                        FROM run_idempotency WHERE run_id = ?""",
                     (run_id,),
                 ).fetchone()
@@ -870,6 +897,7 @@ class ResponseStore:
                     row is not None
                     and owner_id is not None
                     and hmac.compare_digest(str(row[0]), request_fingerprint)
+                    and hmac.compare_digest(str(row[5]), profile)
                     and row[2] is None
                     and (row[3] is None or row[4] is None or float(row[4]) <= now)
                 ):
@@ -877,7 +905,7 @@ class ResponseStore:
                         """UPDATE run_idempotency
                            SET status_json = ?, updated_at = ?, terminal_at = NULL,
                                owner_id = ?, lease_expires_at = ?
-                           WHERE run_id = ? AND request_fingerprint = ?
+                           WHERE run_id = ? AND request_fingerprint = ? AND profile = ?
                              AND terminal_at IS NULL
                              AND (owner_id IS NULL OR lease_expires_at IS NULL
                                   OR lease_expires_at <= ?)""",
@@ -888,6 +916,7 @@ class ResponseStore:
                             lease_expires_at,
                             run_id,
                             request_fingerprint,
+                            profile,
                             now,
                         ),
                     )
@@ -900,7 +929,10 @@ class ResponseStore:
                 raise
         if row is None:  # pragma: no cover - defensive against external DB surgery
             return False, True, {}
-        conflict = not hmac.compare_digest(str(row[0]), request_fingerprint)
+        conflict = not (
+            hmac.compare_digest(str(row[0]), request_fingerprint)
+            and hmac.compare_digest(str(row[5]), profile)
+        )
         try:
             existing = json.loads(row[1])
         except (json.JSONDecodeError, TypeError):
@@ -967,10 +999,16 @@ class ResponseStore:
             self._conn.commit()
             return cursor.rowcount == 1
 
-    def get_run_status(self, run_id: str) -> Optional[Dict[str, Any]]:
+    def get_run_status(
+        self, run_id: str, *, profile: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
         with self._lock:
+            profile_clause = "" if profile is None else " AND profile = ?"
+            params: tuple[Any, ...] = (run_id,) if profile is None else (run_id, profile)
             row = self._conn.execute(
-                "SELECT status_json FROM run_idempotency WHERE run_id = ?", (run_id,)
+                "SELECT status_json FROM run_idempotency WHERE run_id = ?"
+                + profile_clause,
+                params,
             ).fetchone()
         if row is None:
             return None
@@ -1007,14 +1045,16 @@ class ResponseStore:
 
     def close(self) -> None:
         """Close the database connection."""
-        try:
-            self._conn.close()
-        except Exception:
-            pass
+        with self._lock:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
 
     def __len__(self) -> int:
-        row = self._conn.execute("SELECT COUNT(*) FROM responses").fetchone()
-        return row[0] if row else 0
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) FROM responses").fetchone()
+            return row[0] if row else 0
 
 
 # ---------------------------------------------------------------------------
@@ -1483,6 +1523,9 @@ class APIServerAdapter(BasePlatformAdapter):
         self._stopping_run_ids: set[str] = set()
         # Pollable run status for dashboards and external control-plane UIs.
         self._run_statuses: Dict[str, Dict[str, Any]] = {}
+        # Profile namespace for every in-memory run. Durable fallbacks carry
+        # the same owner column so a known run_id cannot cross profile islands.
+        self._run_profiles: Dict[str, str] = {}
         # Active approval session key for each run_id.  The approval core
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
@@ -6153,10 +6196,19 @@ class APIServerAdapter(BasePlatformAdapter):
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
     # Keep terminal replay long enough for at least five hourly client retries.
     _RUN_STATUS_TTL = 6 * 3600
+    _RUN_STATUS_GC_BATCH = 100
     _RUN_OWNER_LEASE_SECONDS = 30.0
     _RUN_OWNER_HEARTBEAT_SECONDS = 10.0
+    _RUN_TERMINAL_WRITE_RETRY_SECONDS = 0.1
 
-    def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
+    def _set_run_status(
+        self,
+        run_id: str,
+        status: str,
+        *,
+        _require_persisted: bool = False,
+        **fields: Any,
+    ) -> Dict[str, Any]:
         """Update pollable run status without exposing private agent objects."""
         now = time.time()
         current = self._run_statuses.get(run_id, {})
@@ -6170,15 +6222,52 @@ class APIServerAdapter(BasePlatformAdapter):
         current.update(fields)
         self._run_statuses[run_id] = current
         try:
-            self._response_store.put_run_status(
+            persisted = self._response_store.put_run_status(
                 run_id,
                 current,
                 owner_id=self._run_owner_id,
                 lease_seconds=self._RUN_OWNER_LEASE_SECONDS,
             )
+            if _require_persisted and not persisted:
+                raise RuntimeError("durable run ownership was lost")
         except Exception:
             logger.exception("Failed to persist durable run status for %s", run_id)
+            if _require_persisted:
+                raise
         return current
+
+    async def _set_terminal_run_status(
+        self, run_id: str, status: str, **fields: Any
+    ) -> Dict[str, Any]:
+        """Persist terminal state before allowing the owner lease to stop.
+
+        A completed executor must remain fenced if SQLite is temporarily
+        unavailable; otherwise lease expiry lets a retry execute side effects a
+        second time. Keep retrying while the heartbeat remains alive, and renew
+        explicitly for terminal writes performed outside the background task.
+        """
+        while True:
+            try:
+                return self._set_run_status(
+                    run_id,
+                    status,
+                    _require_persisted=True,
+                    **fields,
+                )
+            except Exception:
+                try:
+                    await asyncio.to_thread(
+                        self._response_store.renew_run_lease,
+                        run_id,
+                        self._run_owner_id,
+                        self._RUN_OWNER_LEASE_SECONDS,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to retain run-owner lease after terminal write failure for %s",
+                        run_id,
+                    )
+                await asyncio.sleep(self._RUN_TERMINAL_WRITE_RETRY_SECONDS)
 
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
@@ -6286,15 +6375,19 @@ class APIServerAdapter(BasePlatformAdapter):
         # value received (no case-folding or whitespace normalization) so every
         # process derives the same opaque run ID without retaining the raw key.
         idempotency_key = request.headers.get("Idempotency-Key")
-        if (
-            idempotency_key is None
-            or not idempotency_key
+        if idempotency_key is None:
+            # Backward compatibility: the Runs API predates durable
+            # idempotency and documented this header as optional. Headerless
+            # calls retain one-shot UUID identity; supplied keys gain replay.
+            idempotency_key = uuid.uuid4().hex
+        elif (
+            not idempotency_key
             or len(idempotency_key) > 255
             or any(ord(char) < 0x21 or ord(char) > 0x7E for char in idempotency_key)
         ):
             return web.json_response(
                 _openai_error(
-                    "Idempotency-Key is required and must contain 1-255 visible ASCII characters.",
+                    "Idempotency-Key, when supplied, must contain 1-255 visible ASCII characters.",
                     code="invalid_idempotency_key",
                 ),
                 status=400,
@@ -6408,6 +6501,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 run_id,
                 request_fingerprint,
                 initial_status,
+                profile=canonical_profile,
                 owner_id=self._run_owner_id,
                 lease_seconds=self._RUN_OWNER_LEASE_SECONDS,
             )
@@ -6436,12 +6530,14 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         if not owned:
             self._run_statuses[run_id] = durable_status
+            self._run_profiles[run_id] = canonical_profile
             return web.json_response(durable_status, headers=response_headers)
 
         # Only the durable CAS winner consumes an execution slot.
+        self._run_profiles[run_id] = canonical_profile
         limited = self._concurrency_limited_response()
         if limited is not None:
-            self._set_run_status(
+            await self._set_terminal_run_status(
                 run_id,
                 "failed",
                 error="Run concurrency limit reached before dispatch; retry with a new Idempotency-Key.",
@@ -6528,7 +6624,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "run_id": run_id,
                         "timestamp": time.time(),
                     })
-                    self._set_run_status(
+                    await self._set_terminal_run_status(
                         run_id,
                         "cancelled",
                         last_event="run.cancelled",
@@ -6642,7 +6738,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "run_id": run_id,
                         "timestamp": time.time(),
                     })
-                    self._set_run_status(
+                    await self._set_terminal_run_status(
                         run_id,
                         "cancelled",
                         last_event="run.cancelled",
@@ -6658,7 +6754,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "timestamp": time.time(),
                         "error": error_msg,
                     })
-                    self._set_run_status(
+                    await self._set_terminal_run_status(
                         run_id,
                         "failed",
                         error=error_msg,
@@ -6673,7 +6769,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "output": final_response,
                         "usage": usage,
                     })
-                    self._set_run_status(
+                    await self._set_terminal_run_status(
                         run_id,
                         "completed",
                         output=final_response,
@@ -6681,7 +6777,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         last_event="run.completed",
                     )
             except asyncio.CancelledError:
-                self._set_run_status(
+                await self._set_terminal_run_status(
                     run_id,
                     "cancelled",
                     last_event="run.cancelled",
@@ -6705,7 +6801,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 # except-Exception branch below.
                 logger.warning("Provider authentication failed for run=%s: %s", run_id, exc)
                 error_msg = f"⚠️ Provider authentication failed: {exc}"
-                self._set_run_status(
+                await self._set_terminal_run_status(
                     run_id,
                     "failed",
                     error=error_msg,
@@ -6722,7 +6818,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     pass
             except Exception as exc:
                 logger.exception("[api_server] run %s failed", run_id)
-                self._set_run_status(
+                await self._set_terminal_run_status(
                     run_id,
                     "failed",
                     error=_redact_api_error_text(exc),
@@ -6791,11 +6887,23 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         run_id = request.match_info["run_id"]
+        request_profile = _canonical_run_profile(_api_request_profile.get())
+        known_profile = self._run_profiles.get(run_id)
+        if known_profile is not None and not hmac.compare_digest(
+            known_profile, request_profile
+        ):
+            return web.json_response(
+                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                status=404,
+            )
         status = self._run_statuses.get(run_id)
         if status is None:
-            status = self._response_store.get_run_status(run_id)
+            status = self._response_store.get_run_status(
+                run_id, profile=request_profile
+            )
             if status is not None:
                 self._run_statuses[run_id] = status
+                self._run_profiles[run_id] = request_profile
         if status is None:
             return web.json_response(
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),
@@ -6810,6 +6918,16 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         run_id = request.match_info["run_id"]
+
+        known_profile = self._run_profiles.get(run_id)
+        request_profile = _canonical_run_profile(_api_request_profile.get())
+        if known_profile is not None and not hmac.compare_digest(
+            known_profile, request_profile
+        ):
+            return web.json_response(
+                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                status=404,
+            )
 
         # Allow subscribing slightly before the run is registered (race condition window)
         for _ in range(20):
@@ -6862,6 +6980,15 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         run_id = request.match_info["run_id"]
+        known_profile = self._run_profiles.get(run_id)
+        request_profile = _canonical_run_profile(_api_request_profile.get())
+        if known_profile is not None and not hmac.compare_digest(
+            known_profile, request_profile
+        ):
+            return web.json_response(
+                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                status=404,
+            )
         status = self._run_statuses.get(run_id)
         if status is None:
             return web.json_response(
@@ -6950,6 +7077,15 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         run_id = request.match_info["run_id"]
+        known_profile = self._run_profiles.get(run_id)
+        request_profile = _canonical_run_profile(_api_request_profile.get())
+        if known_profile is not None and not hmac.compare_digest(
+            known_profile, request_profile
+        ):
+            return web.json_response(
+                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                status=404,
+            )
         agent = self._active_run_agents.get(run_id)
         task = self._active_run_tasks.get(run_id)
 
@@ -7014,10 +7150,15 @@ class APIServerAdapter(BasePlatformAdapter):
         ]
         for run_id in stale_statuses:
             self._run_statuses.pop(run_id, None)
+            self._run_profiles.pop(run_id, None)
         try:
-            self._response_store.delete_expired_terminal_runs(
-                now - self._RUN_STATUS_TTL
-            )
+            cutoff = now - self._RUN_STATUS_TTL
+            while True:
+                deleted = self._response_store.delete_expired_terminal_runs(
+                    cutoff, limit=self._RUN_STATUS_GC_BATCH
+                )
+                if deleted < self._RUN_STATUS_GC_BATCH:
+                    break
         except Exception:
             logger.exception("Failed to sweep expired durable run statuses")
 

@@ -15,8 +15,10 @@ Tests cover:
 import asyncio
 import json
 import os
+import sqlite3
 import stat
 import sys
+import threading
 import time
 import types
 import uuid
@@ -89,6 +91,94 @@ class TestRedactApiErrorText:
 
 
 class TestResponseStore:
+    def test_all_shared_connection_users_hold_store_lock(self, tmp_path):
+        store = ResponseStore(max_size=10, db_path=str(tmp_path / "locked.db"))
+        real_conn = store._conn
+
+        class GuardedConnection:
+            def __getattr__(self, name):
+                attribute = getattr(real_conn, name)
+                if name not in {"execute", "commit", "rollback", "close"}:
+                    return attribute
+
+                def _guarded(*args, **kwargs):
+                    assert getattr(store._lock, "_is_owned")(), (
+                        f"{name} used without ResponseStore lock"
+                    )
+                    return attribute(*args, **kwargs)
+
+                return _guarded
+
+        setattr(store, "_conn", GuardedConnection())
+        store.put("resp_1", {"output": "hello"})
+        assert store.get("resp_1") == {"output": "hello"}
+        store.set_conversation("chat", "resp_1")
+        assert store.get_conversation("chat") == "resp_1"
+        assert len(store) == 1
+        assert store.delete("resp_1") is True
+        store.close()
+
+    def test_concurrent_legacy_schema_upgrade_is_serialized(self, tmp_path, monkeypatch):
+        db_path = tmp_path / "legacy-upgrade.db"
+        conn = sqlite3.connect(db_path)
+        conn.execute(
+            """CREATE TABLE run_idempotency (
+                run_id TEXT PRIMARY KEY,
+                request_fingerprint TEXT NOT NULL,
+                status_json TEXT NOT NULL,
+                updated_at REAL NOT NULL,
+                terminal_at REAL
+            )"""
+        )
+        conn.commit()
+        conn.close()
+
+        original_connect = sqlite3.connect
+        pragma_barrier = threading.Barrier(2)
+
+        class CoordinatedConnection(sqlite3.Connection):
+            def execute(self, sql, parameters=(), /):
+                cursor = super().execute(sql, parameters)
+                if sql.strip().upper().startswith("PRAGMA TABLE_INFO(RUN_IDEMPOTENCY)"):
+                    try:
+                        pragma_barrier.wait(timeout=0.2)
+                    except threading.BrokenBarrierError:
+                        pass
+                return cursor
+
+        def _connect(*args, **kwargs):
+            return original_connect(*args, factory=CoordinatedConnection, **kwargs)
+
+        monkeypatch.setattr(sqlite3, "connect", _connect)
+        stores = []
+        errors = []
+
+        def _open_store():
+            try:
+                stores.append(ResponseStore(db_path=str(db_path)))
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=_open_store) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        try:
+            assert all(not thread.is_alive() for thread in threads)
+            assert errors == []
+            columns = {
+                row[1]
+                for row in stores[0]._conn.execute(
+                    "PRAGMA table_info(run_idempotency)"
+                )
+            }
+            assert {"owner_id", "lease_expires_at", "profile"} <= columns
+        finally:
+            for store in stores:
+                store.close()
+
     def test_put_and_get(self):
         store = ResponseStore(max_size=10)
         store.put("resp_1", {"output": "hello"})
