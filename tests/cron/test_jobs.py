@@ -1941,6 +1941,75 @@ class TestCronOutputRetention:
         assert sum(removed) == 6
         assert not stale.exists()
 
+    def test_gc_orphaned_output_reuses_bounded_scandir_until_rotation_closes(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        from cron import jobs
+
+        jobs.save_jobs([])
+        output = jobs.get_cron_output_dir()
+        directory_names = {f"entry-{index:04d}" for index in range(60)}
+        for name in directory_names:
+            (output / name).mkdir()
+        marker = output / ".orphan-gc.json"
+        marker.write_text('{"cursor": 999999, "first_seen": {}}', encoding="utf-8")
+
+        real_scandir = os.scandir
+        scans = []
+        yielded_names = set()
+        yielded_count = 0
+
+        class CountingScandir:
+            def __init__(self, path):
+                self._entries = real_scandir(path)
+                self.next_calls = 0
+                self.closed = False
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                nonlocal yielded_count
+                self.next_calls += 1
+                entry = next(self._entries)
+                yielded_count += 1
+                yielded_names.add(entry.name)
+                return entry
+
+            def close(self):
+                self.closed = True
+                self._entries.close()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                self.close()
+
+        def counting_scandir(path):
+            scan = CountingScandir(path)
+            scans.append(scan)
+            return scan
+
+        monkeypatch.setattr(jobs.os, "scandir", counting_scandir)
+        for _ in range(100):
+            calls_before = scans[-1].next_calls if scans else 0
+            jobs.gc_orphaned_output(
+                retention_days=30,
+                interval_seconds=0,
+                max_directories=4,
+            )
+            assert scans[-1].next_calls - calls_before <= 4
+            if directory_names <= yielded_names and scans[-1].closed:
+                break
+        else:
+            pytest.fail("output GC did not finish one bounded directory rotation")
+
+        assert len(scans) == 1
+        assert scans[0].closed is True
+        assert scans[0].next_calls == yielded_count + 1
+        assert "cursor" not in json.loads(marker.read_text(encoding="utf-8"))
+
 
 # =========================================================================
 # claim_dispatch — pre-run one-shot crash safety (issue #38758)

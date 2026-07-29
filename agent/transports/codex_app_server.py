@@ -149,6 +149,8 @@ class CodexAppServerClient:
         self._stderr_lock = threading.Lock()
         self._closed = False
         self._initialized = False
+        self._reaper_lock = threading.Lock()
+        self._reaper_thread: Optional[threading.Thread] = None
 
         self._reader = threading.Thread(target=self._read_stdout, daemon=True)
         self._reader.start()
@@ -156,6 +158,30 @@ class CodexAppServerClient:
         self._stderr_reader.start()
 
     # ---------- lifecycle ----------
+
+    def _reap_after_kill(self) -> None:
+        """Wait without a caller deadline after close has killed the child."""
+        try:
+            self._proc.wait()
+        except Exception:
+            pass
+        finally:
+            with self._reaper_lock:
+                if self._reaper_thread is threading.current_thread():
+                    self._reaper_thread = None
+
+    def _start_reaper(self) -> None:
+        """Arrange exactly one daemon wait for a killed, not-yet-reaped child."""
+        with self._reaper_lock:
+            if self._reaper_thread is not None:
+                return
+            reaper = threading.Thread(
+                target=self._reap_after_kill,
+                name=f"codex-app-server-reaper-{self._proc.pid}",
+                daemon=True,
+            )
+            self._reaper_thread = reaper
+            reaper.start()
 
     def initialize(
         self,
@@ -199,10 +225,19 @@ class CodexAppServerClient:
         except subprocess.TimeoutExpired:
             try:
                 self._proc.kill()
+                reaped = False
                 if timeout > 0:
-                    self._proc.wait(timeout=min(1.0, timeout))
+                    try:
+                        self._proc.wait(timeout=min(1.0, timeout))
+                        reaped = True
+                    except subprocess.TimeoutExpired:
+                        pass
+                if not reaped:
+                    self._start_reaper()
             except Exception:
-                pass
+                # Even if kill races with process exit, wait() is still needed
+                # on POSIX to collect the status and avoid a zombie.
+                self._start_reaper()
 
     def __enter__(self) -> "CodexAppServerClient":
         return self

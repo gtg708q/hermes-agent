@@ -1312,16 +1312,15 @@ def _admit_api_agent_request(handler):
                     )
                     if claim_metadata is not None:
                         durable_status = claim_metadata["status"]
-                        lease_expires_at = claim_metadata["lease_expires_at"]
-                        reclaimable_queued = (
+                        # Any non-terminal queued row may become reclaimable
+                        # before the awaited body parse completes. Reserve
+                        # execution capacity for the whole parse window rather
+                        # than sampling lease expiry only once here. Running,
+                        # waiting, stopping, and terminal rows are replay-only.
+                        durable_replay = not (
                             claim_metadata["terminal_at"] is None
                             and durable_status.get("status") == "queued"
-                            and (
-                                lease_expires_at is None
-                                or float(lease_expires_at) <= time.time()
-                            )
                         )
-                        durable_replay = not reclaimable_queued
                 except Exception as exc:
                     logger.exception(
                         "Failed to inspect durable run ownership for %s", run_id

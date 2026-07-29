@@ -5,6 +5,7 @@ Jobs are stored in ~/.hermes/cron/jobs.json
 Output is saved to ~/.hermes/cron/output/{job_id}/{timestamp}.md
 """
 
+import atexit
 import contextlib
 import copy
 from contextvars import ContextVar
@@ -90,6 +91,31 @@ TICKER_INTERVAL_SECONDS = 60
 # concurrent mark_job_run / advance_next_run calls can clobber each other.
 _jobs_file_lock = threading.RLock()
 _jobs_lock_state = threading.local()
+
+# Keep one live lazy output-directory traversal per profile store. Reopening a
+# scandir and skipping to a persisted numeric offset makes a full rotation
+# quadratic; retaining the iterator makes every tick pay only for entries it
+# actually advances. The lock also prevents two in-process tickers for the same
+# store from concurrently consuming an iterator.
+_output_gc_scan_lock = threading.RLock()
+_output_gc_scans: Dict[Path, Any] = {}
+
+
+def _close_output_gc_scan(output_dir: Optional[Path] = None) -> None:
+    """Close resumable output-GC iterators, either one store or all stores."""
+    with _output_gc_scan_lock:
+        if output_dir is None:
+            scans = list(_output_gc_scans.values())
+            _output_gc_scans.clear()
+        else:
+            scan = _output_gc_scans.pop(output_dir, None)
+            scans = [scan] if scan is not None else []
+        for scan in scans:
+            with contextlib.suppress(Exception):
+                scan.close()
+
+
+atexit.register(_close_output_gc_scan)
 
 # Upper bound on waiting for the cross-process .jobs.lock flock (#60703).
 # Every cron function in the process funnels through _jobs_lock(), and the
@@ -2392,27 +2418,33 @@ def gc_orphaned_output(
             state = json.loads(marker.read_text(encoding="utf-8")) if marker.is_file() else {}
         except (OSError, ValueError, TypeError):
             state = {}
-        cursor = max(0, int(state.get("cursor", 0) or 0))
         first_seen = {
             str(name): float(seen)
             for name, seen in (state.get("first_seen") or {}).items()
             if isinstance(name, str) and isinstance(seen, (int, float))
         }
 
-        # os.scandir is lazy: only the selected page receives stat/is_dir work.
-        # Persisting an offset rotates pages so a stable fresh prefix cannot
-        # starve stale entries later in a large output store.
+        # Resume the same lazy scandir across ticks. Every next() call, including
+        # skipped/non-directory entries and the exhaustion probe, consumes this
+        # tick's budget. Legacy persisted numeric cursors are intentionally
+        # ignored: after restart a fresh linear rotation is cheaper than replaying
+        # an ever-growing prefix on every page.
         page = []
-        reached_end = True
-        with os.scandir(output_dir) as entries:
-            for index, entry in enumerate(entries):
-                if index < cursor:
-                    continue
-                if len(page) >= max_directories:
-                    reached_end = False
-                    break
-                page.append(entry)
-        next_cursor = 0 if reached_end else cursor + len(page)
+        with _output_gc_scan_lock:
+            entries = _output_gc_scans.get(output_dir)
+            if entries is None:
+                entries = os.scandir(output_dir)
+                _output_gc_scans[output_dir] = entries
+            try:
+                for _ in range(max_directories):
+                    try:
+                        page.append(next(entries))
+                    except StopIteration:
+                        _close_output_gc_scan(output_dir)
+                        break
+            except BaseException:
+                _close_output_gc_scan(output_dir)
+                raise
 
         candidates = []
         for entry in page:
@@ -2432,7 +2464,7 @@ def gc_orphaned_output(
                 candidates.append(Path(entry.path))
 
         def _persist_gc_state() -> None:
-            state = {"cursor": next_cursor, "first_seen": first_seen}
+            state = {"first_seen": first_seen}
             fd, tmp_name = tempfile.mkstemp(
                 dir=str(output_dir), prefix=".orphan-gc-", suffix=".tmp"
             )
@@ -2449,6 +2481,7 @@ def gc_orphaned_output(
 
         _persist_gc_state()
     except (OSError, ValueError, TypeError, RuntimeError):
+        _close_output_gc_scan(output_dir)
         return 0
 
     removed = 0
