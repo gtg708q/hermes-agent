@@ -372,16 +372,21 @@ class TestStartRun:
         first.close()
         second.close()
 
-    def test_active_running_claim_is_replay_only_across_stores(self, tmp_path):
+    @pytest.mark.parametrize(
+        "active_status", ["running", "waiting_for_approval", "stopping"]
+    )
+    def test_active_post_start_claim_is_replay_only_across_stores(
+        self, tmp_path, active_status
+    ):
         db_path = tmp_path / "response-store.db"
         first = ResponseStore(db_path=str(db_path))
         second = ResponseStore(db_path=str(db_path))
-        running = {"run_id": "run_active", "status": "running"}
+        active = {"run_id": "run_active", "status": active_status}
 
         assert first.claim_run(
             "run_active",
             "fingerprint",
-            running,
+            active,
             owner_id="owner-a",
             lease_seconds=30,
             now=100,
@@ -390,7 +395,7 @@ class TestStartRun:
         owned, conflict, replay = second.claim_run(
             "run_active",
             "fingerprint",
-            {**running, "status": "queued"},
+            {**active, "status": "queued"},
             owner_id="owner-b",
             lease_seconds=30,
             now=129,
@@ -398,27 +403,30 @@ class TestStartRun:
 
         assert owned is False
         assert conflict is False
-        assert replay == running
+        assert replay == active
         first.close()
         second.close()
 
-    def test_expired_running_claim_fails_closed_and_fences_owner_across_stores(
-        self, tmp_path
+    @pytest.mark.parametrize(
+        "expired_status", ["running", "waiting_for_approval", "stopping"]
+    )
+    def test_expired_post_start_claim_fails_closed_fences_owner_and_is_gc_eligible(
+        self, tmp_path, expired_status
     ):
         db_path = tmp_path / "response-store.db"
         first = ResponseStore(db_path=str(db_path))
         second = ResponseStore(db_path=str(db_path))
-        running = {
+        active = {
             "object": "hermes.run",
             "run_id": "run_expired",
-            "status": "running",
+            "status": expired_status,
             "created_at": 90,
             "updated_at": 100,
         }
         assert first.claim_run(
             "run_expired",
             "fingerprint",
-            running,
+            active,
             owner_id="owner-a",
             lease_seconds=30,
             now=100,
@@ -427,7 +435,7 @@ class TestStartRun:
         owned, conflict, failed = second.claim_run(
             "run_expired",
             "fingerprint",
-            {**running, "status": "queued"},
+            {**active, "status": "queued"},
             owner_id="owner-b",
             lease_seconds=30,
             now=131,
@@ -447,12 +455,14 @@ class TestStartRun:
 
         assert first.put_run_status(
             "run_expired",
-            {**running, "status": "completed", "output": "stale"},
+            {**active, "status": "completed", "output": "stale"},
             owner_id="owner-a",
             lease_seconds=30,
             now=132,
         ) is False
         assert second.get_run_status("run_expired") == failed
+        assert second.delete_expired_terminal_runs(132) == 1
+        assert second.get_run_status("run_expired") is None
         first.close()
         second.close()
 
@@ -1174,6 +1184,98 @@ class TestStartRun:
         assert replay_body["run_id"] == _derive_idempotent_run_id(key, None)
         assert replay_body["status"] == "running"
         assert create_agent.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_slow_replay_parse_is_drain_visible_but_does_not_consume_capacity(
+        self, adapter
+    ):
+        adapter._max_concurrent_runs = 1
+        app = _create_runs_app(adapter)
+        replay_key = "slow-replay-reservation"
+        replay_body = {"input": "replay"}
+
+        with patch.object(adapter, "_create_agent") as create_agent:
+            agent = MagicMock()
+            agent.run_conversation.return_value = {"final_response": "done"}
+            agent.session_prompt_tokens = 0
+            agent.session_completion_tokens = 0
+            agent.session_total_tokens = 0
+            create_agent.return_value = agent
+
+            async with TestClient(TestServer(app)) as cli:
+                original = await cli.post(
+                    "/v1/runs",
+                    json=replay_body,
+                    headers=_idempotency_headers(replay_key),
+                )
+                original_run_id = (await original.json())["run_id"]
+                status = None
+                for _ in range(50):
+                    status = adapter._response_store.get_run_status(original_run_id)
+                    if status and status.get("status") == "completed":
+                        break
+                    await asyncio.sleep(0.02)
+                assert status is not None
+                assert status["status"] == "completed"
+
+                replay_parse_started = asyncio.Event()
+                release_replay_parse = asyncio.Event()
+                original_read = adapter._read_json_body
+
+                async def _slow_replay_read(request):
+                    if request.headers.get("Idempotency-Key") == replay_key:
+                        replay_parse_started.set()
+                        await release_replay_parse.wait()
+                    return await original_read(request)
+
+                with patch.object(
+                    adapter, "_read_json_body", side_effect=_slow_replay_read
+                ):
+                    replay_task = asyncio.create_task(
+                        cli.post(
+                            "/v1/runs",
+                            json=replay_body,
+                            headers=_idempotency_headers(replay_key),
+                        )
+                    )
+                    await asyncio.wait_for(replay_parse_started.wait(), timeout=1)
+                    assert adapter.active_agent_work_count() == 1
+
+                    new_response = await cli.post(
+                        "/v1/runs",
+                        json={"input": "new execution"},
+                        headers=_idempotency_headers("new-execution-during-replay"),
+                    )
+                    release_replay_parse.set()
+                    replay_response = await replay_task
+
+        assert new_response.status == 202
+        assert replay_response.status == 200
+        assert create_agent.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_replay_preflight_store_failure_returns_controlled_503(self, adapter):
+        adapter._max_concurrent_runs = 1
+        app = _create_runs_app(adapter)
+
+        with patch.object(
+            adapter._response_store,
+            "get_run_status",
+            side_effect=OSError("response store read failed"),
+        ), patch.object(adapter, "_read_json_body", new_callable=AsyncMock) as read_body:
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello"},
+                    headers=_idempotency_headers("lookup-io-failure"),
+                )
+                payload = await response.json()
+
+        assert response.status == 503
+        assert payload["error"]["code"] == "idempotency_store_unavailable"
+        assert "persist idempotent run ownership" in payload["error"]["message"].lower()
+        read_body.assert_not_awaited()
+        assert adapter.active_agent_work_count() == 0
 
     @pytest.mark.asyncio
     async def test_expired_running_owner_terminalizes_while_executor_stays_tracked(

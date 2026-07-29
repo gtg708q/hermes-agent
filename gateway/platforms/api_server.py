@@ -860,13 +860,13 @@ class ResponseStore:
         """Cross-process CAS for idempotent run ownership.
 
         A queued claim can be taken over only after its owner's lease expires.
-        Once an owner durably transitions to ``running``, expiry fails closed:
+        Once an owner durably transitions past ``queued``, expiry fails closed:
         Python executor threads cannot be forcibly stopped, so allowing a new
         process to run the same claim could duplicate external side effects.
-        The first observer atomically terminalizes an expired running claim as
-        failed and clears its owner, fencing any stale executor from publishing
-        a later result. This preserves safe queued recovery without leaking a
-        permanent running status.
+        The first observer atomically terminalizes an expired post-start claim
+        as failed and clears its owner, fencing any stale executor from
+        publishing a later result. This preserves safe queued recovery without
+        leaking a permanent nonterminal status.
         ``owner_id=None`` preserves the legacy insert/replay behavior for
         callers that do not execute runs.
         """
@@ -952,7 +952,8 @@ class ResponseStore:
                         return True, False, status
                 if (
                     matching_claim
-                    and existing_status.get("status") == "running"
+                    and existing_status.get("status")
+                    in {"running", "waiting_for_approval", "stopping"}
                     and lease_expired
                 ):
                     failed_status = {
@@ -960,8 +961,8 @@ class ResponseStore:
                         "status": "failed",
                         "updated_at": now,
                         "error": (
-                            "Run failed because its durable owner lease expired while "
-                            "execution was running; execution was not restarted to "
+                            "Run failed because its durable owner lease expired after "
+                            "execution started; execution was not restarted to "
                             "preserve at-most-once safety."
                         ),
                         "last_event": "run.failed",
@@ -1280,10 +1281,22 @@ def _admit_api_agent_request(handler):
             ):
                 request_profile = _api_request_profile.get()
                 run_id = _derive_idempotent_run_id(idempotency_key, request_profile)
-                durable_replay = self._response_store.get_run_status(
-                    run_id,
-                    profile=_canonical_run_profile(request_profile),
-                ) is not None
+                try:
+                    durable_replay = self._response_store.get_run_status(
+                        run_id,
+                        profile=_canonical_run_profile(request_profile),
+                    ) is not None
+                except Exception as exc:
+                    logger.exception(
+                        "Failed to inspect durable run ownership for %s", run_id
+                    )
+                    return web.json_response(
+                        _openai_error(
+                            f"Unable to persist idempotent run ownership: {exc}",
+                            code="idempotency_store_unavailable",
+                        ),
+                        status=503,
+                    )
 
         # Admission and reservation are deliberately adjacent with no await:
         # overlapping requests on this event loop therefore have exactly one
@@ -1292,15 +1305,21 @@ def _admit_api_agent_request(handler):
             limited = self._concurrency_limited_response()
             if limited is not None:
                 return limited
-        reservation = {"active": True}
+        reservation = {"active": True, "replay": durable_replay}
         token = _api_agent_request_reservation.set(reservation)
         self._pending_agent_requests += 1
+        if durable_replay:
+            self._pending_replay_requests += 1
         try:
             return await handler(self, request, *args, **kwargs)
         finally:
             if reservation["active"]:
                 reservation["active"] = False
                 self._pending_agent_requests = max(0, self._pending_agent_requests - 1)
+                if reservation["replay"]:
+                    self._pending_replay_requests = max(
+                        0, self._pending_replay_requests - 1
+                    )
             _api_agent_request_reservation.reset(token)
 
     return _wrapped
@@ -1655,6 +1674,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # Shutdown counts this reservation so the request cannot slip through
         # the drain between its first await and _run_agent()/task registration.
         self._pending_agent_requests: int = 0
+        # Idempotent replay parsing remains drain-visible above, but it cannot
+        # launch an executor and therefore must not consume execution capacity.
+        self._pending_replay_requests: int = 0
 
     def active_agent_work_count(self) -> int:
         """Return all live agent work owned by this API adapter.
@@ -1709,6 +1731,10 @@ class APIServerAdapter(BasePlatformAdapter):
         if reservation and reservation["active"]:
             reservation["active"] = False
             self._pending_agent_requests = max(0, self._pending_agent_requests - 1)
+            if reservation.get("replay"):
+                self._pending_replay_requests = max(
+                    0, self._pending_replay_requests - 1
+                )
 
     def _readiness_work_counts(self) -> tuple[int, int, int]:
         """Return bounded work counts from each subsystem's public state."""
@@ -6025,12 +6051,18 @@ class APIServerAdapter(BasePlatformAdapter):
         limit = self._max_concurrent_runs
         if limit <= 0:
             return None
-        inflight = self.active_agent_work_count()
+        inflight = self.active_agent_work_count() - int(
+            getattr(self, "_pending_replay_requests", 0)
+        )
         # The current request owns one reservation until it hands off to
         # _run_agent() or /v1/runs task registration. It must not consume its
         # own last available slot; other admitted requests remain counted.
         reservation = _api_agent_request_reservation.get()
-        if reservation and reservation["active"]:
+        if (
+            reservation
+            and reservation["active"]
+            and not reservation.get("replay", False)
+        ):
             inflight -= 1
         if inflight >= limit:
             return web.json_response(
