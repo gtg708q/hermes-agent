@@ -1537,7 +1537,7 @@ class TestStartRun:
         first._response_store = first_store
         second._response_store = second_store
         first._RUN_OWNER_LEASE_SECONDS = 0.05
-        first._RUN_OWNER_HEARTBEAT_SECONDS = 10.0
+        first._RUN_OWNER_HEARTBEAT_SECONDS = 0.01
         second._RUN_OWNER_LEASE_SECONDS = 0.05
         release = threading.Event()
         started = threading.Event()
@@ -1588,6 +1588,19 @@ class TestStartRun:
                 assert run_id in first._active_run_tasks
                 assert not first._active_run_tasks[run_id].done()
 
+                # Gateway A must evict only its stale owner generation when its
+                # heartbeat observes B's terminalization. Its next poll must
+                # reload authoritative durable failure, not stale local running.
+                for _ in range(100):
+                    if run_id not in first._run_statuses:
+                        break
+                    await asyncio.sleep(0.01)
+                polled = await first_cli.get(f"/v1/runs/{run_id}")
+                polled_body = await polled.json()
+                assert polled.status == 200
+                assert polled_body["status"] == "failed"
+                assert "owner lease expired" in polled_body["error"].lower()
+
                 release.set()
                 await asyncio.wait_for(first._active_run_tasks[run_id], timeout=1)
 
@@ -1597,6 +1610,19 @@ class TestStartRun:
         assert "output" not in durable
         first_store.close()
         second_store.close()
+
+    def test_lease_loss_does_not_evict_newer_local_owner_generation(self):
+        adapter = _make_adapter()
+        run_id = "run_generation_fence"
+        adapter._run_statuses[run_id] = {"run_id": run_id, "status": "queued"}
+        adapter._run_profiles[run_id] = "default"
+        adapter._run_owner_generations[run_id] = "new-generation"
+
+        assert adapter._evict_lost_run_owner_cache(run_id, "old-generation") is False
+        assert adapter._run_statuses[run_id]["status"] == "queued"
+        assert adapter._run_profiles[run_id] == "default"
+        assert adapter._run_owner_generations[run_id] == "new-generation"
+        adapter._response_store.close()
 
     @pytest.mark.asyncio
     async def test_real_lease_loss_tracks_noncooperative_executor_and_fences_terminal(

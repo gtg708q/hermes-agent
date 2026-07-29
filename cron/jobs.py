@@ -15,6 +15,7 @@ import json
 import logging
 import math
 import shutil
+import sqlite3
 import tempfile
 import threading
 import time
@@ -104,6 +105,11 @@ _output_gc_scan_lock = threading.RLock()
 _output_gc_scans: Dict[Path, Any] = {}
 
 
+def _use_linux_output_gc() -> bool:
+    """Return whether validated durable directory cookies are available."""
+    return sys.platform.startswith("linux")
+
+
 class _LinuxDirent(ctypes.Structure):
     _fields_ = [
         ("d_ino", ctypes.c_ulong),
@@ -175,28 +181,6 @@ class _LinuxDirectoryScan:
         if self._closedir(dirp) != 0:
             error = ctypes.get_errno()
             raise OSError(error, os.strerror(error))
-
-
-class _PortableDirectoryScan:
-    """Bounded in-process fallback where durable Linux cookies are unavailable."""
-
-    def __init__(self, path: Path, cookie: int = 0) -> None:
-        if cookie:
-            raise OSError("durable directory cookies are unsupported on this platform")
-        root_stat = os.stat(path, follow_symlinks=False)
-        self.root_dev = int(root_stat.st_dev)
-        self.root_ino = int(root_stat.st_ino)
-        self.cookie = 0
-        self._entries = os.scandir(path)
-
-    def next_record(self) -> Optional[str]:
-        try:
-            return next(self._entries).name
-        except StopIteration:
-            return None
-
-    def close(self) -> None:
-        self._entries.close()
 
 
 def _close_output_gc_scan(output_dir: Optional[Path] = None) -> None:
@@ -638,13 +622,156 @@ def _preserve_file_ownership(path: Path, before: Optional[os.stat_result]) -> No
         )
 
 
+def _portable_output_gc_db_path() -> Path:
+    return _current_cron_store().cron_dir / "output-gc.sqlite3"
+
+
+def _initialize_portable_output_gc_index(
+    *, bootstrap_complete_if_new: bool = False
+) -> sqlite3.Connection:
+    """Open the profile-local portable GC index and validate its output root."""
+    store = _current_cron_store()
+    db_path = _portable_output_gc_db_path()
+    database_was_missing = not db_path.exists()
+    conn = sqlite3.connect(str(db_path), timeout=5.0)
+    try:
+        conn.execute("PRAGMA journal_mode=DELETE")
+        conn.execute("PRAGMA synchronous=FULL")
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS metadata (
+                   key TEXT PRIMARY KEY,
+                   value TEXT NOT NULL
+               )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS directories (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   name TEXT NOT NULL UNIQUE,
+                   first_seen REAL,
+                   generation TEXT NOT NULL
+               )"""
+        )
+        root_stat = os.stat(store.output_dir, follow_symlinks=False)
+        if not stat.S_ISDIR(root_stat.st_mode):
+            raise NotADirectoryError(store.output_dir)
+        root_identity = f"{int(root_stat.st_dev)}:{int(root_stat.st_ino)}"
+        stored_identity_row = conn.execute(
+            "SELECT value FROM metadata WHERE key = 'root_identity'"
+        ).fetchone()
+        stored_identity = stored_identity_row[0] if stored_identity_row else None
+        if stored_identity is not None and stored_identity != root_identity:
+            # Never apply names observed under a replaced output root. An
+            # explicit bootstrap is required to bind and index the replacement.
+            conn.execute("DELETE FROM directories")
+            conn.execute(
+                "INSERT OR REPLACE INTO metadata(key, value) VALUES('bootstrap_complete', '0')"
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO metadata(key, value) VALUES('cursor', '0')"
+            )
+        conn.execute(
+            "INSERT OR REPLACE INTO metadata(key, value) VALUES('root_identity', ?)",
+            (root_identity,),
+        )
+        if database_was_missing:
+            conn.execute(
+                "INSERT OR REPLACE INTO metadata(key, value) VALUES('bootstrap_complete', ?)",
+                ("1" if bootstrap_complete_if_new else "0",),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO metadata(key, value) VALUES('cursor', '0')"
+            )
+        conn.commit()
+        _secure_file(db_path)
+        return conn
+    except BaseException:
+        conn.close()
+        raise
+
+
+def _portable_output_gc_enqueue(name: str) -> None:
+    """Durably index one exact managed output directory for portable GC."""
+    conn = _initialize_portable_output_gc_index()
+    try:
+        conn.execute(
+            """INSERT INTO directories(name, first_seen, generation)
+               VALUES (?, NULL, ?)
+               ON CONFLICT(name) DO UPDATE SET
+                   first_seen = NULL,
+                   generation = excluded.generation""",
+            (name, uuid.uuid4().hex),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def bootstrap_output_gc_index() -> Dict[str, Any]:
+    """Explicitly index legacy output directories for portable restart-safe GC.
+
+    This intentionally performs a complete root scan and therefore is never
+    called by the scheduler tick. Operators invoke it once via
+    ``hermes cron gc-bootstrap`` after upgrading an existing macOS/Windows
+    profile. A successful transaction is durable across process restarts.
+    """
+    ensure_dirs()
+    conn = _initialize_portable_output_gc_index()
+    try:
+        complete = conn.execute(
+            "SELECT value FROM metadata WHERE key = 'bootstrap_complete'"
+        ).fetchone()
+        if complete and complete[0] == "1":
+            return {"indexed": 0, "already_complete": True}
+
+        store = _current_cron_store()
+        indexed = 0
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute("DELETE FROM directories")
+            with os.scandir(store.output_dir) as entries:
+                for entry in entries:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            conn.execute(
+                                """INSERT OR IGNORE INTO directories
+                                   (name, first_seen, generation)
+                                   VALUES (?, NULL, ?)""",
+                                (entry.name, uuid.uuid4().hex),
+                            )
+                            indexed += 1
+                    except OSError:
+                        continue
+            conn.execute(
+                "INSERT OR REPLACE INTO metadata(key, value) VALUES('cursor', '0')"
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO metadata(key, value) VALUES('bootstrap_complete', '1')"
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        return {"indexed": indexed, "already_complete": False}
+    finally:
+        conn.close()
+
+
 def ensure_dirs():
     """Ensure cron directories exist with secure permissions."""
     store = _current_cron_store()
+    output_was_missing = not store.output_dir.exists()
     store.cron_dir.mkdir(parents=True, exist_ok=True)
     store.output_dir.mkdir(parents=True, exist_ok=True)
     _secure_dir(store.cron_dir)
     _secure_dir(store.output_dir)
+    if not _use_linux_output_gc():
+        # A newly-created empty root has no legacy names to migrate. Existing
+        # roots deliberately remain migration-required until the explicit CLI
+        # bootstrap indexes them off the scheduler's bounded critical path.
+        conn = _initialize_portable_output_gc_index(
+            bootstrap_complete_if_new=output_was_missing
+        )
+        conn.close()
 
 
 # =============================================================================
@@ -2456,6 +2583,135 @@ def _prune_job_output(job_output_dir: Path, keep: int) -> int:
     return deleted
 
 
+def _gc_orphaned_output_portable(
+    *,
+    live_ids: Set[str],
+    retention_days: float,
+    interval_seconds: float,
+    max_directories: int,
+) -> int:
+    """Process one bounded page of exact durable portable-GC work items."""
+    store = _current_cron_store()
+    conn = _initialize_portable_output_gc_index()
+    try:
+        complete = conn.execute(
+            "SELECT value FROM metadata WHERE key = 'bootstrap_complete'"
+        ).fetchone()
+        if not complete or complete[0] != "1":
+            logger.error(
+                "Portable cron output GC requires a one-time legacy index bootstrap; "
+                "run `hermes cron gc-bootstrap` for profile store %s",
+                store.cron_dir,
+            )
+            return 0
+        now = time.time()
+        last_gc_row = conn.execute(
+            "SELECT value FROM metadata WHERE key = 'last_gc_at'"
+        ).fetchone()
+        if interval_seconds and last_gc_row:
+            try:
+                if now - float(last_gc_row[0]) < interval_seconds:
+                    return 0
+            except (TypeError, ValueError):
+                pass
+        cursor_row = conn.execute(
+            "SELECT value FROM metadata WHERE key = 'cursor'"
+        ).fetchone()
+        try:
+            cursor = int(cursor_row[0]) if cursor_row else 0
+        except (TypeError, ValueError):
+            cursor = 0
+        rows = conn.execute(
+            """SELECT id, name, first_seen, generation
+               FROM directories WHERE id > ? ORDER BY id LIMIT ?""",
+            (cursor, max_directories),
+        ).fetchall()
+        if len(rows) < max_directories:
+            rows.extend(
+                conn.execute(
+                    """SELECT id, name, first_seen, generation
+                       FROM directories WHERE id <= ? ORDER BY id LIMIT ?""",
+                    (cursor, max_directories - len(rows)),
+                ).fetchall()
+            )
+        if not rows:
+            conn.execute(
+                "INSERT OR REPLACE INTO metadata(key, value) VALUES('cursor', '0')"
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO metadata(key, value) VALUES('last_gc_at', ?)",
+                (repr(now),),
+            )
+            conn.commit()
+            return 0
+
+        outcomes: List[Tuple[str, int, str, Optional[float]]] = []
+        removed = 0
+        for row_id, name, first_seen, generation in rows:
+            entry_path = store.output_dir / name
+            if name in live_ids:
+                outcomes.append(("keep", row_id, generation, None))
+                continue
+            try:
+                entry_stat = os.stat(entry_path, follow_symlinks=False)
+            except FileNotFoundError:
+                outcomes.append(("drop", row_id, generation, None))
+                continue
+            except OSError as exc:
+                logger.debug("Failed to inspect orphaned cron output %s: %s", name, exc)
+                outcomes.append(("keep", row_id, generation, first_seen))
+                continue
+            if not stat.S_ISDIR(entry_stat.st_mode):
+                # Includes symlinks: discard the index row without following or
+                # deleting the link target.
+                outcomes.append(("drop", row_id, generation, None))
+                continue
+            observed_at = float(first_seen) if first_seen is not None else now
+            if now - observed_at < retention_days * 86400:
+                outcomes.append(("keep", row_id, generation, observed_at))
+                continue
+            try:
+                shutil.rmtree(entry_path)
+            except OSError as exc:
+                logger.debug("Failed to prune orphaned cron output %s: %s", name, exc)
+                outcomes.append(("keep", row_id, generation, observed_at))
+            else:
+                removed += 1
+                outcomes.append(("drop", row_id, generation, None))
+
+        # Generation predicates prevent a GC page from dropping or aging a
+        # same-name directory that save_job_output re-enqueued concurrently.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            for action, row_id, generation, observed_at in outcomes:
+                if action == "drop":
+                    conn.execute(
+                        "DELETE FROM directories WHERE id = ? AND generation = ?",
+                        (row_id, generation),
+                    )
+                else:
+                    conn.execute(
+                        """UPDATE directories SET first_seen = ?
+                           WHERE id = ? AND generation = ?""",
+                        (observed_at, row_id, generation),
+                    )
+            conn.execute(
+                "INSERT OR REPLACE INTO metadata(key, value) VALUES('cursor', ?)",
+                (str(rows[-1][0]),),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO metadata(key, value) VALUES('last_gc_at', ?)",
+                (repr(now),),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        return removed
+    finally:
+        conn.close()
+
+
 def gc_orphaned_output(
     *,
     retention_days: Optional[float] = None,
@@ -2515,6 +2771,13 @@ def gc_orphaned_output(
         # jobs store must neither delete every output directory nor suppress a
         # repaired retry for the full GC interval.
         live_ids = {str(job.get("id")) for job in load_jobs() if job.get("id")}
+        if not _use_linux_output_gc():
+            return _gc_orphaned_output_portable(
+                live_ids=live_ids,
+                retention_days=retention_days,
+                interval_seconds=interval_seconds,
+                max_directories=max_directories,
+            )
         try:
             state_path = marker if marker.is_file() else legacy_marker
             state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.is_file() else {}
@@ -2557,11 +2820,7 @@ def gc_orphaned_output(
                 _close_output_gc_scan(output_dir)
                 scan = None
             if scan is None:
-                scan_type = (
-                    _LinuxDirectoryScan
-                    if sys.platform.startswith("linux")
-                    else _PortableDirectoryScan
-                )
+                scan_type = _LinuxDirectoryScan
                 try:
                     scan = scan_type(output_dir, cookie)
                 except OSError:
@@ -2589,7 +2848,7 @@ def gc_orphaned_output(
                 next_cookie = scan.cookie
                 page.append(name)
 
-        if sys.platform.startswith("linux"):
+        if _use_linux_output_gc():
             root_flags = os.O_RDONLY
             for flag_name in ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW"):
                 root_flags |= getattr(os, flag_name, 0)
@@ -2693,6 +2952,10 @@ def save_job_output(job_id: str, output: str):
     job_output_dir = _job_output_dir(job_id)
     job_output_dir.mkdir(parents=True, exist_ok=True)
     _secure_dir(job_output_dir)
+    if not _use_linux_output_gc():
+        # Index before publishing output. A portable write that cannot become
+        # discoverable by bounded restart-safe GC fails closed.
+        _portable_output_gc_enqueue(job_output_dir.name)
 
     timestamp = _hermes_now().strftime("%Y-%m-%d_%H-%M-%S")
     output_file = job_output_dir / f"{timestamp}.md"

@@ -19,6 +19,15 @@ def tmp_cron_dir(tmp_path, monkeypatch):
 
 
 class TestCronCommandLifecycle:
+    def test_gc_bootstrap_dispatches_explicit_migration(self, capsys, monkeypatch):
+        monkeypatch.setattr(
+            "cron.jobs.bootstrap_output_gc_index",
+            lambda: {"indexed": 2, "already_complete": False},
+        )
+
+        assert cron_command(Namespace(cron_command="gc-bootstrap")) == 0
+        assert "2 directories indexed" in capsys.readouterr().out
+
     def test_pause_resume_run(self, tmp_cron_dir, capsys):
         job = create_job(prompt="Check server status", schedule="every 1h")
 

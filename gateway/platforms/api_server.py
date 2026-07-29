@@ -1678,6 +1678,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # Profile namespace for every in-memory run. Durable fallbacks carry
         # the same owner column so a known run_id cannot cross profile islands.
         self._run_profiles: Dict[str, str] = {}
+        # Process-local generation tokens fence cache eviction: a stale
+        # heartbeat may evict only the cache entries created by its own claim,
+        # never a newer local re-claim of the same deterministic run_id.
+        self._run_owner_generations: Dict[str, str] = {}
         # Active approval session key for each run_id.  The approval core
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
@@ -6401,8 +6405,22 @@ class APIServerAdapter(BasePlatformAdapter):
                 raise
         return current
 
+    def _evict_lost_run_owner_cache(self, run_id: str, generation: str) -> bool:
+        """Evict only cache state belonging to the owner generation that lost."""
+        if self._run_owner_generations.get(run_id) != generation:
+            return False
+        self._run_statuses.pop(run_id, None)
+        self._run_profiles.pop(run_id, None)
+        self._run_owner_generations.pop(run_id, None)
+        return True
+
     async def _set_terminal_run_status(
-        self, run_id: str, status: str, **fields: Any
+        self,
+        run_id: str,
+        status: str,
+        *,
+        _owner_generation: Optional[str] = None,
+        **fields: Any,
     ) -> Dict[str, Any]:
         """Persist terminal state before allowing the owner lease to stop.
 
@@ -6434,6 +6452,10 @@ class APIServerAdapter(BasePlatformAdapter):
                     )
                 else:
                     if not renewed:
+                        if _owner_generation is not None:
+                            self._evict_lost_run_owner_cache(
+                                run_id, _owner_generation
+                            )
                         raise _RunOwnershipLost(
                             f"durable run ownership was lost for {run_id}"
                         )
@@ -6703,15 +6725,30 @@ class APIServerAdapter(BasePlatformAdapter):
             return web.json_response(durable_status, headers=response_headers)
 
         # Only the durable CAS winner consumes an execution slot.
+        local_owner_generation = uuid.uuid4().hex
+        self._run_owner_generations[run_id] = local_owner_generation
         self._run_profiles[run_id] = canonical_profile
+
+        async def _set_owned_terminal(
+            owned_run_id: str, status: str, **fields: Any
+        ) -> Dict[str, Any]:
+            return await self._set_terminal_run_status(
+                owned_run_id,
+                status,
+                _owner_generation=local_owner_generation,
+                **fields,
+            )
+
         limited = self._concurrency_limited_response()
         if limited is not None:
-            await self._set_terminal_run_status(
+            await _set_owned_terminal(
                 run_id,
                 "failed",
                 error="Run concurrency limit reached before dispatch; retry with a new Idempotency-Key.",
                 last_event="run.failed",
             )
+            if self._run_owner_generations.get(run_id) == local_owner_generation:
+                self._run_owner_generations.pop(run_id, None)
             return limited
 
         self._run_statuses[run_id] = initial_status
@@ -6785,6 +6822,9 @@ class APIServerAdapter(BasePlatformAdapter):
                         continue
                     if not renewed:
                         ownership_lost = True
+                        self._evict_lost_run_owner_cache(
+                            run_id, local_owner_generation
+                        )
                         active_agent = self._active_run_agents.get(run_id)
                         if active_agent is not None:
                             try:
@@ -6810,7 +6850,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "run_id": run_id,
                         "timestamp": time.time(),
                     })
-                    await self._set_terminal_run_status(
+                    await _set_owned_terminal(
                         run_id,
                         "cancelled",
                         last_event="run.cancelled",
@@ -6943,7 +6983,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "run_id": run_id,
                         "timestamp": time.time(),
                     })
-                    await self._set_terminal_run_status(
+                    await _set_owned_terminal(
                         run_id,
                         "cancelled",
                         last_event="run.cancelled",
@@ -6959,7 +6999,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "timestamp": time.time(),
                         "error": error_msg,
                     })
-                    await self._set_terminal_run_status(
+                    await _set_owned_terminal(
                         run_id,
                         "failed",
                         error=error_msg,
@@ -6974,7 +7014,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         "output": final_response,
                         "usage": usage,
                     })
-                    await self._set_terminal_run_status(
+                    await _set_owned_terminal(
                         run_id,
                         "completed",
                         output=final_response,
@@ -6987,7 +7027,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     # durable row. Its interrupt is cooperative, and no
                     # terminal status may be written under the lost lease.
                     return
-                await self._set_terminal_run_status(
+                await _set_owned_terminal(
                     run_id,
                     "cancelled",
                     last_event="run.cancelled",
@@ -7004,6 +7044,8 @@ class APIServerAdapter(BasePlatformAdapter):
             except _RunOwnershipLost:
                 # Another process reclaimed the lease. Any further terminal
                 # write would target state this executor no longer owns.
+                ownership_lost = True
+                self._evict_lost_run_owner_cache(run_id, local_owner_generation)
                 logger.warning("Stopping run %s after durable lease ownership loss", run_id)
             except _ProviderAuthResolutionError as exc:
                 # /v1/runs builds its own agent via _create_agent() and does
@@ -7015,7 +7057,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 # except-Exception branch below.
                 logger.warning("Provider authentication failed for run=%s: %s", run_id, exc)
                 error_msg = f"⚠️ Provider authentication failed: {exc}"
-                await self._set_terminal_run_status(
+                await _set_owned_terminal(
                     run_id,
                     "failed",
                     error=error_msg,
@@ -7032,7 +7074,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     pass
             except Exception as exc:
                 logger.exception("[api_server] run %s failed", run_id)
-                await self._set_terminal_run_status(
+                await _set_owned_terminal(
                     run_id,
                     "failed",
                     error=_redact_api_error_text(exc),
@@ -7074,6 +7116,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
+                if self._run_owner_generations.get(run_id) == local_owner_generation:
+                    self._run_owner_generations.pop(run_id, None)
 
         self._activate_admitted_request()
         task = asyncio.create_task(_run_and_close())

@@ -3,6 +3,7 @@
 import json
 import os
 import subprocess
+import sqlite3
 import sys
 import threading
 import time
@@ -1846,6 +1847,102 @@ print(json.dumps({{"records": records[0], "removed": removed}}))
         assert new_state["root_ino"] != old_state["root_ino"]
         assert not (set(old_state["first_seen"]) & set(new_state["first_seen"]))
         assert any(old_output.iterdir())
+
+    def test_portable_gc_restarts_use_durable_exact_work_queue(self, tmp_cron_dir, monkeypatch):
+        """Portable schedulers must never replay the output-root prefix after restart."""
+        import cron.jobs as jobs
+
+        monkeypatch.setattr(jobs, "_use_linux_output_gc", lambda: False)
+        save_jobs([])
+        names = [f"portable-{index:04d}" for index in range(17)]
+        for name in names:
+            save_job_output(name, "output")
+
+        output_root = tmp_cron_dir / "cron" / "output"
+        original_scandir = os.scandir
+
+        def reject_root_scan(path):
+            if isinstance(path, (str, os.PathLike)) and os.fspath(path) == os.fspath(
+                output_root
+            ):
+                raise AssertionError("portable GC replayed the output-root prefix")
+            return original_scandir(path)
+
+        monkeypatch.setattr(os, "scandir", reject_root_scan)
+        removed_total = 0
+        previous_remaining = len(names)
+        for _ in range(20):
+            # Clearing process-local scan state simulates a fresh scheduler.
+            jobs._close_output_gc_scan()
+            removed = jobs.gc_orphaned_output(
+                retention_days=0,
+                interval_seconds=0,
+                max_directories=3,
+            )
+            assert removed <= 3
+            removed_total += removed
+            remaining = sum((output_root / name).exists() for name in names)
+            assert previous_remaining - remaining <= 3
+            previous_remaining = remaining
+            if remaining == 0:
+                break
+
+        assert removed_total == len(names)
+        assert previous_remaining == 0
+
+    def test_portable_gc_legacy_bootstrap_is_explicit_and_durable(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        import cron.jobs as jobs
+
+        monkeypatch.setattr(jobs, "_use_linux_output_gc", lambda: False)
+        output = tmp_cron_dir / "cron" / "output"
+        output.mkdir(parents=True)
+        names = [f"legacy-{index:04d}" for index in range(9)]
+        for name in names:
+            (output / name).mkdir()
+        save_jobs([])
+
+        # Scheduler-side GC fails closed until the explicit, off-tick migration.
+        assert jobs.gc_orphaned_output(
+            retention_days=0, interval_seconds=0, max_directories=2
+        ) == 0
+        assert all((output / name).exists() for name in names)
+
+        report = jobs.bootstrap_output_gc_index()
+        assert report == {"indexed": len(names), "already_complete": False}
+
+        for _ in range(10):
+            jobs.gc_orphaned_output(
+                retention_days=0, interval_seconds=0, max_directories=2
+            )
+            if not any((output / name).exists() for name in names):
+                break
+        assert not any((output / name).exists() for name in names)
+        assert jobs.bootstrap_output_gc_index() == {
+            "indexed": 0,
+            "already_complete": True,
+        }
+
+    def test_portable_gc_index_is_scoped_to_each_profile(self, tmp_path, monkeypatch):
+        import cron.jobs as jobs
+
+        monkeypatch.setattr(jobs, "_use_linux_output_gc", lambda: False)
+        homes = [tmp_path / "profile-a", tmp_path / "profile-b"]
+        for index, home in enumerate(homes):
+            with jobs.use_cron_store(home):
+                save_jobs([])
+                save_job_output(f"job-{index}", "output")
+
+        indexed_names = []
+        for home in homes:
+            db_path = home / "cron" / "output-gc.sqlite3"
+            assert db_path.is_file()
+            with sqlite3.connect(db_path) as conn:
+                indexed_names.append(
+                    {row[0] for row in conn.execute("SELECT name FROM directories")}
+                )
+        assert indexed_names == [{"job-0"}, {"job-1"}]
 
     @staticmethod
     def _seed(d, count):
