@@ -859,11 +859,16 @@ class ResponseStore:
     ) -> tuple[bool, bool, Dict[str, Any]]:
         """Cross-process CAS for idempotent run ownership.
 
-        A non-terminal claim can be taken over only after its owner's lease
-        expires.  This lets a restarted gateway recover work abandoned by a
-        crashed process while retries continue to replay a genuinely active
-        owner's status.  ``owner_id=None`` preserves the legacy insert/replay
-        behavior for callers that do not execute runs.
+        A queued claim can be taken over only after its owner's lease expires.
+        Once an owner durably transitions to ``running``, expiry fails closed:
+        Python executor threads cannot be forcibly stopped, so allowing a new
+        process to run the same claim could duplicate external side effects.
+        The first observer atomically terminalizes an expired running claim as
+        failed and clears its owner, fencing any stale executor from publishing
+        a later result. This preserves safe queued recovery without leaking a
+        permanent running status.
+        ``owner_id=None`` preserves the legacy insert/replay behavior for
+        callers that do not execute runs.
         """
         if not self._durable_run_store_available:
             raise RuntimeError("durable response store is unavailable")
@@ -897,13 +902,31 @@ class ResponseStore:
                        FROM run_idempotency WHERE run_id = ?""",
                     (run_id,),
                 ).fetchone()
-                if (
+                try:
+                    existing_status = json.loads(row[1]) if row is not None else {}
+                except (json.JSONDecodeError, TypeError):
+                    existing_status = {}
+                existing_owner_id = row[3] if row is not None else None
+                existing_lease_expires_at = row[4] if row is not None else None
+                matching_claim = (
                     row is not None
                     and owner_id is not None
                     and hmac.compare_digest(str(row[0]), request_fingerprint)
                     and hmac.compare_digest(str(row[5]), profile)
                     and row[2] is None
-                    and (row[3] is None or row[4] is None or float(row[4]) <= now)
+                )
+                lease_expired = (
+                    row is not None
+                    and (
+                        existing_owner_id is None
+                        or existing_lease_expires_at is None
+                        or float(existing_lease_expires_at) <= now
+                    )
+                )
+                if (
+                    matching_claim
+                    and existing_status.get("status") == "queued"
+                    and lease_expired
                 ):
                     cursor = self._conn.execute(
                         """UPDATE run_idempotency
@@ -927,6 +950,47 @@ class ResponseStore:
                     if cursor.rowcount == 1:
                         self._conn.commit()
                         return True, False, status
+                if (
+                    matching_claim
+                    and existing_status.get("status") == "running"
+                    and lease_expired
+                ):
+                    failed_status = {
+                        **existing_status,
+                        "status": "failed",
+                        "updated_at": now,
+                        "error": (
+                            "Run failed because its durable owner lease expired while "
+                            "execution was running; execution was not restarted to "
+                            "preserve at-most-once safety."
+                        ),
+                        "last_event": "run.failed",
+                    }
+                    failed_encoded = json.dumps(
+                        failed_status, default=str, sort_keys=True
+                    )
+                    cursor = self._conn.execute(
+                        """UPDATE run_idempotency
+                           SET status_json = ?, updated_at = ?, terminal_at = ?,
+                               owner_id = NULL, lease_expires_at = NULL
+                           WHERE run_id = ? AND request_fingerprint = ? AND profile = ?
+                             AND terminal_at IS NULL
+                             AND owner_id IS ?
+                             AND (lease_expires_at IS NULL OR lease_expires_at <= ?)""",
+                        (
+                            failed_encoded,
+                            now,
+                            now,
+                            run_id,
+                            request_fingerprint,
+                            profile,
+                            existing_owner_id,
+                            now,
+                        ),
+                    )
+                    if cursor.rowcount == 1:
+                        self._conn.commit()
+                        return False, False, failed_status
                 self._conn.commit()
             except BaseException:
                 self._conn.rollback()
@@ -1202,12 +1266,32 @@ def _admit_api_agent_request(handler):
         draining = self._draining_response()
         if draining is not None:
             return draining
+        # A keyed /v1/runs replay consumes no execution slot. Consult the
+        # header-derived durable identity before rejecting on capacity; the
+        # handler still parses and fingerprints the bounded body, so key reuse
+        # with a different payload remains a 409.
+        durable_replay = False
+        if handler.__name__ == "_handle_runs":
+            idempotency_key = request.headers.get("Idempotency-Key")
+            if (
+                idempotency_key
+                and len(idempotency_key) <= 255
+                and all(0x21 <= ord(char) <= 0x7E for char in idempotency_key)
+            ):
+                request_profile = _api_request_profile.get()
+                run_id = _derive_idempotent_run_id(idempotency_key, request_profile)
+                durable_replay = self._response_store.get_run_status(
+                    run_id,
+                    profile=_canonical_run_profile(request_profile),
+                ) is not None
+
         # Admission and reservation are deliberately adjacent with no await:
         # overlapping requests on this event loop therefore have exactly one
         # winner for the last slot, before either starts reading its body.
-        limited = self._concurrency_limited_response()
-        if limited is not None:
-            return limited
+        if not durable_replay:
+            limited = self._concurrency_limited_response()
+            if limited is not None:
+                return limited
         reservation = {"active": True}
         token = _api_agent_request_reservation.set(reservation)
         self._pending_agent_requests += 1
@@ -6645,17 +6729,14 @@ class APIServerAdapter(BasePlatformAdapter):
                                     "Failed to interrupt run %s after lease loss",
                                     run_id,
                                 )
-                        run_task = self._active_run_tasks.get(run_id)
-                        if (
-                            run_task is not None
-                            and run_task is not asyncio.current_task()
-                        ):
-                            run_task.cancel()
+                        # Cancelling the asyncio wrapper cannot terminate its
+                        # executor thread. Keep task/agent bookkeeping alive
+                        # until the actual worker exits.
                         return
 
             try:
                 lease_heartbeat = asyncio.get_running_loop().create_task(_renew_owner_lease())
-                self._set_run_status(run_id, "running")
+                self._set_run_status(run_id, "running", _require_persisted=True)
                 if run_id in self._stopping_run_ids:
                     _put_event_if_active({
                         "event": "run.cancelled",
@@ -6769,7 +6850,26 @@ class APIServerAdapter(BasePlatformAdapter):
                         }
                         return r, u
 
-                result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
+                executor = asyncio.get_running_loop().run_in_executor(None, _run_sync)
+                try:
+                    result, usage = await asyncio.shield(executor)
+                except asyncio.CancelledError:
+                    # Task cancellation is not executor termination. Ask for a
+                    # cooperative stop, then retain active bookkeeping until
+                    # the non-cooperative thread really returns.
+                    try:
+                        agent.interrupt("Run task cancellation requested")
+                    except Exception:
+                        pass
+                    try:
+                        await asyncio.shield(executor)
+                    except Exception:
+                        pass
+                    raise
+                if ownership_lost:
+                    # A stale executor may finish after external revocation,
+                    # but it must emit no terminal event or status write.
+                    return
                 if run_id in self._stopping_run_ids:
                     _put_event_if_active({
                         "event": "run.cancelled",

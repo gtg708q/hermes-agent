@@ -24,10 +24,13 @@ duplicate the user turn (#860 / #42039). This test locks in:
 """
 
 import tempfile
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+from agent import conversation_loop
 from agent.codex_runtime import run_codex_app_server_turn
 from agent.errors import TurnWallClockExceeded
 from hermes_state import SessionDB
@@ -100,6 +103,49 @@ def test_codex_deadline_appends_and_persists_assistant_closure():
     }
     agent._flush_messages_to_session_db.assert_called_once_with(messages)
     assert result["agent_persisted"] is True
+
+
+def test_codex_deadline_flush_remains_inside_whole_turn_fence(monkeypatch):
+    flush_entered = threading.Event()
+    release_flush = threading.Event()
+    agent = _make_agent(session_db=object())
+    agent.max_wall_clock_seconds = 0.01
+    agent._interrupt_requested = False
+    agent._codex_session.run_turn.side_effect = TurnWallClockExceeded(
+        "wall_clock_budget_reached"
+    )
+
+    def _blocked_flush(_messages):
+        flush_entered.set()
+        release_flush.wait(timeout=2)
+        return True
+
+    agent._flush_messages_to_session_db.side_effect = _blocked_flush
+
+    def _codex_inner(current_agent, *_args, **_kwargs):
+        return run_codex_app_server_turn(
+            current_agent,
+            user_message="deadline",
+            original_user_message="deadline",
+            messages=[{"role": "user", "content": "deadline"}],
+            effective_task_id="task-deadline-fence",
+        )
+
+    monkeypatch.setattr(conversation_loop, "_run_conversation_inner", _codex_inner)
+
+    started = time.monotonic()
+    first = conversation_loop.run_conversation(agent, "deadline")
+    assert time.monotonic() - started < 0.5
+    assert first["turn_exit_reason"] == "wall_clock_budget_reached"
+    assert flush_entered.is_set()
+
+    second = conversation_loop.run_conversation(agent, "must wait for closure")
+    assert second["failed"] is True
+    assert "previous timed-out turn is still finalizing" in second["final_response"]
+
+    release_flush.set()
+    agent._deadline_turn_worker.join(timeout=1)
+    assert not agent._deadline_turn_worker.is_alive()
 
 
 def test_codex_user_interrupt_is_reported_and_cleared():

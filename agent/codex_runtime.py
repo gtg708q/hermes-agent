@@ -20,7 +20,6 @@ import json
 import logging
 import math
 import os
-import threading
 import time
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
@@ -29,11 +28,13 @@ from agent.stream_single_writer import claim_stream_writer, stream_writer_is_cur
 
 logger = logging.getLogger(__name__)
 
-_DEADLINE_CLOSURE_FLUSH_SECONDS = 0.25
-
-
 def _persist_codex_deadline_closure(agent, messages, text: str) -> bool:
-    """Close and durably flush an expired Codex turn without duplicate rows."""
+    """Close and durably flush an expired Codex turn without duplicate rows.
+
+    This runs synchronously inside the whole-turn deadline worker. The caller
+    remains bounded by ``conversation_loop.run_conversation`` while the worker
+    stays alive as the next-turn fence until persistence actually returns.
+    """
     closure = {"role": "assistant", "content": text}
     if not messages or messages[-1] != closure:
         messages.append(closure)
@@ -41,25 +42,11 @@ def _persist_codex_deadline_closure(agent, messages, text: str) -> bool:
     if getattr(agent, "_session_db", None) is None:
         return False
 
-    finished = threading.Event()
-    outcome: Dict[str, Any] = {}
-
-    def _flush() -> None:
-        try:
-            outcome["ok"] = agent._flush_messages_to_session_db(messages) is not False
-        except Exception:
-            logger.warning("codex app-server deadline-closure flush failed", exc_info=True)
-            outcome["ok"] = False
-        finally:
-            finished.set()
-
-    threading.Thread(
-        target=_flush,
-        name="hermes-codex-deadline-flush",
-        daemon=True,
-    ).start()
-    finished.wait(timeout=_DEADLINE_CLOSURE_FLUSH_SECONDS)
-    return finished.is_set() and bool(outcome.get("ok"))
+    try:
+        return agent._flush_messages_to_session_db(messages) is not False
+    except Exception:
+        logger.warning("codex app-server deadline-closure flush failed", exc_info=True)
+        return False
 
 
 def _coerce_usage_int(value: Any) -> int:
