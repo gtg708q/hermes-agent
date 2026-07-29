@@ -1765,80 +1765,148 @@ def _write_bounded_request_dump(
     dedup_seconds: float,
     scan_limit: int = _REQUEST_DUMP_SCAN_LIMIT_DEFAULT,
 ) -> bool:
-    """Enforce retention using one bounded, resumable directory scan page."""
+    """Enforce global retention using one bounded, resumable scan page."""
     with _request_dump_lock(logs_dir):
         scan_limit = min(
             _REQUEST_DUMP_SCAN_LIMIT_MAX,
             max(max_files + 1, 1, int(scan_limit)),
         )
         scan_key = str(logs_dir.resolve())
-        scanner = _REQUEST_DUMP_SCAN_STATES.get(scan_key)
-        if scanner is None:
-            scanner = os.scandir(logs_dir)
-            _REQUEST_DUMP_SCAN_STATES[scan_key] = scanner
+        state = _REQUEST_DUMP_SCAN_STATES.get(scan_key)
+        if state is None:
+            state = {
+                "scanner": os.scandir(logs_dir),
+                "survivors": [],
+            }
+            _REQUEST_DUMP_SCAN_STATES[scan_key] = state
+        scanner = state["scanner"]
 
-        existing_files: List[Tuple[Path, float]] = []
-        duplicate = False
-        now = time.time()
-        exhausted = False
-        for _ in range(scan_limit):
-            try:
-                entry = next(scanner)
-            except StopIteration:
-                exhausted = True
-                break
-            except OSError:
-                exhausted = True
-                break
-            if not entry.name.startswith("request_dump_") or not entry.name.endswith(".json"):
-                continue
-            try:
-                if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
-                    continue
-                existing = Path(entry.path)
-                mtime = entry.stat(follow_symlinks=False).st_mtime
-                age = now - mtime
-                if ttl_days > 0 and age > ttl_days * 86400:
-                    existing.unlink()
-                    continue
-                existing_files.append((existing, mtime))
-                if dedup_seconds > 0 and age <= dedup_seconds:
-                    prior = json.loads(existing.read_text(encoding="utf-8"))
-                    duplicate = duplicate or prior.get("fingerprint") == payload["fingerprint"]
-            except (OSError, ValueError, TypeError):
-                continue
-        if exhausted:
+        def _finish_scan() -> None:
             _REQUEST_DUMP_SCAN_STATES.pop(scan_key, None)
             try:
                 scanner.close()
             except Exception:
                 pass
 
-        if max_files == 0:
-            keep_count = 0
-        elif duplicate:
-            keep_count = max_files
-        else:
-            encoded = json.dumps(
-                payload, ensure_ascii=False, indent=2, default=str
-            ).encode("utf-8")
-            if len(encoded) > max_bytes:
-                raise ValueError("request dump exceeds configured max_bytes")
-            atomic_json_write(dump_file, payload, default=str)
-            existing_files.append((dump_file, now))
-            keep_count = max_files
+        try:
+            # Each item is (path, mtime, fingerprint).  Only the globally newest
+            # max_files items survive between pages, so state remains bounded
+            # independently of the directory backlog.
+            candidates: List[Tuple[Path, float, Optional[str]]] = list(
+                state["survivors"]
+            )
+            now = time.time()
+            exhausted = False
+            for _ in range(scan_limit):
+                try:
+                    entry = next(scanner)
+                except StopIteration:
+                    exhausted = True
+                    break
+                except OSError:
+                    exhausted = True
+                    break
+                if (
+                    not entry.name.startswith("request_dump_")
+                    or not entry.name.endswith(".json")
+                ):
+                    continue
+                try:
+                    if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                        continue
+                    existing = Path(entry.path)
+                    mtime = entry.stat(follow_symlinks=False).st_mtime
+                    age = now - mtime
+                    if ttl_days > 0 and age > ttl_days * 86400:
+                        existing.unlink()
+                        continue
+                    fingerprint = None
+                    if dedup_seconds > 0 and age <= dedup_seconds:
+                        try:
+                            prior = json.loads(existing.read_text(encoding="utf-8"))
+                            value = prior.get("fingerprint")
+                            if isinstance(value, str):
+                                fingerprint = value
+                        except (OSError, ValueError, TypeError, AttributeError):
+                            pass
+                    candidates.append((existing, mtime, fingerprint))
+                except (OSError, ValueError, TypeError):
+                    continue
 
-        bounded_page = sorted(
-            existing_files,
-            key=lambda item: item[1],
-            reverse=True,
-        )
-        for stale, _mtime in bounded_page[keep_count:]:
-            try:
-                stale.unlink()
-            except OSError:
-                pass
-        return not duplicate and max_files > 0
+            # A scanner may observe a file written during an earlier page.  Fold
+            # repeated paths before applying fingerprint and count retention.
+            newest_by_path: Dict[Path, Tuple[Path, float, Optional[str]]] = {}
+            for candidate in candidates:
+                prior = newest_by_path.get(candidate[0])
+                if prior is None or candidate[1] > prior[1]:
+                    newest_by_path[candidate[0]] = candidate
+            ordered = sorted(
+                newest_by_path.values(), key=lambda item: item[1], reverse=True
+            )
+
+            payload_fingerprint = payload.get("fingerprint")
+            duplicate = False
+            seen_fingerprints = set()
+            retained: List[Tuple[Path, float, Optional[str]]] = []
+            discarded: List[Tuple[Path, float, Optional[str]]] = []
+            for candidate in ordered:
+                _path, mtime, fingerprint = candidate
+                fingerprint_is_fresh = (
+                    dedup_seconds > 0
+                    and now - mtime <= dedup_seconds
+                    and fingerprint is not None
+                )
+                if fingerprint_is_fresh and fingerprint == payload_fingerprint:
+                    duplicate = True
+                if fingerprint_is_fresh and fingerprint in seen_fingerprints:
+                    discarded.append(candidate)
+                    continue
+                if fingerprint_is_fresh:
+                    seen_fingerprints.add(fingerprint)
+                retained.append(candidate)
+
+            if max_files > 0 and not duplicate:
+                encoded = json.dumps(
+                    payload, ensure_ascii=False, indent=2, default=str
+                ).encode("utf-8")
+                if len(encoded) > max_bytes:
+                    raise ValueError("request dump exceeds configured max_bytes")
+                atomic_json_write(dump_file, payload, default=str)
+                retained = [
+                    candidate for candidate in retained if candidate[0] != dump_file
+                ]
+                retained.append(
+                    (
+                        dump_file,
+                        now,
+                        payload_fingerprint
+                        if isinstance(payload_fingerprint, str)
+                        else None,
+                    )
+                )
+                retained.sort(key=lambda item: item[1], reverse=True)
+
+            keep_count = max_files if max_files > 0 else 0
+            discarded.extend(retained[keep_count:])
+            retained = retained[:keep_count]
+            retained_paths = {candidate[0] for candidate in retained}
+            deleted_paths = set()
+            for stale, _mtime, _fingerprint in discarded:
+                if stale in retained_paths or stale in deleted_paths:
+                    continue
+                deleted_paths.add(stale)
+                try:
+                    stale.unlink()
+                except OSError:
+                    pass
+
+            state["survivors"] = retained
+            if exhausted:
+                _finish_scan()
+            return not duplicate and max_files > 0
+        except Exception:
+            _finish_scan()
+            raise
 
 
 def dump_api_request_debug(

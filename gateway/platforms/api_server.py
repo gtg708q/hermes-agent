@@ -7368,12 +7368,9 @@ class APIServerAdapter(BasePlatformAdapter):
             self._run_profiles.pop(run_id, None)
         try:
             cutoff = now - self._RUN_STATUS_TTL
-            while True:
-                deleted = self._response_store.delete_expired_terminal_runs(
-                    cutoff, limit=self._RUN_STATUS_GC_BATCH
-                )
-                if deleted < self._RUN_STATUS_GC_BATCH:
-                    break
+            self._response_store.delete_expired_terminal_runs(
+                cutoff, limit=self._RUN_STATUS_GC_BATCH
+            )
         except Exception:
             logger.exception("Failed to sweep expired durable run statuses")
 

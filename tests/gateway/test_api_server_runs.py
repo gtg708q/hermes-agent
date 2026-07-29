@@ -853,31 +853,110 @@ class TestStartRun:
         assert remaining == 1
         store.close()
 
-    def test_one_sweep_drains_more_than_one_expired_sql_batch(self, tmp_path):
+    def test_each_sweep_deletes_one_expired_sql_batch_and_repeated_ticks_converge(
+        self, tmp_path
+    ):
         store = ResponseStore(db_path=str(tmp_path / "catch-up-response-store.db"))
         now = time.time()
-        for index in range(250):
-            run_id = f"run_backlog_{index}"
-            status = {"run_id": run_id, "status": "queued"}
-            store.claim_run(run_id, f"fingerprint-{index}", status)
-            store.put_run_status(run_id, {**status, "status": "completed"})
+        expired_count = 2048
         with store._lock:
-            store._conn.execute(
-                "UPDATE run_idempotency SET terminal_at = ?", (now - 100,)
+            store._conn.executemany(
+                """INSERT INTO run_idempotency
+                   (run_id, request_fingerprint, status_json, updated_at, terminal_at, profile)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        f"run_backlog_{index}",
+                        f"fingerprint-{index}",
+                        json.dumps({"run_id": f"run_backlog_{index}", "status": "completed"}),
+                        now - 100,
+                        now - 100,
+                        "default",
+                    )
+                    for index in range(expired_count)
+                ]
+            )
+            store._conn.executemany(
+                """INSERT INTO run_idempotency
+                   (run_id, request_fingerprint, status_json, updated_at, terminal_at, profile)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        "run_active",
+                        "active",
+                        json.dumps({"status": "running"}),
+                        now,
+                        None,
+                        "default",
+                    ),
+                    (
+                        "run_fresh",
+                        "fresh",
+                        json.dumps({"status": "completed"}),
+                        now,
+                        now + APIServerAdapter._RUN_STATUS_TTL,
+                        "default",
+                    ),
+                ],
             )
             store._conn.commit()
 
         restarted = _make_adapter()
         restarted._response_store.close()
         restarted._response_store = store
-        restarted._sweep_orphaned_runs_once(now=now + restarted._RUN_STATUS_TTL)
+        sweep_now = now + restarted._RUN_STATUS_TTL
+        restarted._sweep_orphaned_runs_once(now=sweep_now)
 
         with store._lock:
             remaining = store._conn.execute(
                 "SELECT COUNT(*) FROM run_idempotency"
             ).fetchone()[0]
-        assert remaining == 0
+        assert remaining == expired_count + 2 - restarted._RUN_STATUS_GC_BATCH
+        assert store.get_run_status("run_active") is not None
+        assert store.get_run_status("run_fresh") is not None
+
+        ticks = 1
+        while remaining > 2:
+            restarted._sweep_orphaned_runs_once(now=sweep_now)
+            ticks += 1
+            with store._lock:
+                next_remaining = store._conn.execute(
+                    "SELECT COUNT(*) FROM run_idempotency"
+                ).fetchone()[0]
+            assert 0 < remaining - next_remaining <= restarted._RUN_STATUS_GC_BATCH
+            remaining = next_remaining
+
+        assert ticks > 1
+        assert remaining == 2
+        assert store.get_run_status("run_active") is not None
+        assert store.get_run_status("run_fresh") is not None
         store.close()
+
+    @pytest.mark.asyncio
+    async def test_durable_status_sweeper_yields_between_batches(self, adapter):
+        real_sleep = asyncio.sleep
+        sleep_calls = 0
+
+        async def _yield_then_stop(_delay):
+            nonlocal sleep_calls
+            sleep_calls += 1
+            await real_sleep(0)
+            if sleep_calls == 2:
+                raise asyncio.CancelledError
+
+        with (
+            patch("gateway.platforms.api_server.asyncio.sleep", side_effect=_yield_then_stop),
+            patch.object(
+                adapter._response_store,
+                "delete_expired_terminal_runs",
+                return_value=adapter._RUN_STATUS_GC_BATCH,
+            ) as delete_batch,
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await adapter._sweep_orphaned_runs()
+
+        assert sleep_calls == 2
+        delete_batch.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_terminal_status_write_retries_before_run_releases_ownership(
