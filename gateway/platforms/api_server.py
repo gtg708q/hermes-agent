@@ -1678,6 +1678,11 @@ class APIServerAdapter(BasePlatformAdapter):
         # Profile namespace for every in-memory run. Durable fallbacks carry
         # the same owner column so a known run_id cannot cross profile islands.
         self._run_profiles: Dict[str, str] = {}
+        # Immutable owner generation associated with each live profile guard.
+        # Unlike _run_owner_generations this survives lease loss until every
+        # transport/control reference from that generation has been cleaned up.
+        self._run_profile_generations: Dict[str, str] = {}
+        self._run_owner_state_lock = threading.RLock()
         # Process-local generation tokens fence cache eviction: a stale
         # heartbeat may evict only the cache entries created by its own claim,
         # never a newer local re-claim of the same deterministic run_id.
@@ -6407,11 +6412,33 @@ class APIServerAdapter(BasePlatformAdapter):
 
     def _evict_lost_run_owner_cache(self, run_id: str, generation: str) -> bool:
         """Evict only cache state belonging to the owner generation that lost."""
-        if self._run_owner_generations.get(run_id) != generation:
+        with self._run_owner_state_lock:
+            if self._run_owner_generations.get(run_id) != generation:
+                return False
+            if run_id in self._run_profiles:
+                self._run_profile_generations.setdefault(run_id, generation)
+            self._run_statuses.pop(run_id, None)
+            self._run_owner_generations.pop(run_id, None)
+            self._cleanup_run_profile_if_inactive(run_id, generation)
+            return True
+
+    def _cleanup_run_profile_if_inactive(
+        self, run_id: str, owner_generation: str
+    ) -> bool:
+        """Remove a generation's profile guard only after all local state is gone."""
+        if self._run_profile_generations.get(run_id) != owner_generation:
             return False
-        self._run_statuses.pop(run_id, None)
+        if (
+            run_id in self._run_statuses
+            or run_id in self._run_streams
+            or run_id in self._active_run_agents
+            or run_id in self._active_run_tasks
+            or run_id in self._run_approval_sessions
+            or run_id in self._stopping_run_ids
+        ):
+            return False
         self._run_profiles.pop(run_id, None)
-        self._run_owner_generations.pop(run_id, None)
+        self._run_profile_generations.pop(run_id, None)
         return True
 
     async def _set_terminal_run_status(
@@ -6431,12 +6458,23 @@ class APIServerAdapter(BasePlatformAdapter):
         """
         while True:
             try:
-                return self._set_run_status(
-                    run_id,
-                    status,
-                    _require_persisted=True,
-                    **fields,
-                )
+                with self._run_owner_state_lock:
+                    if (
+                        _owner_generation is not None
+                        and self._run_owner_generations.get(run_id)
+                        != _owner_generation
+                    ):
+                        raise _RunOwnershipLost(
+                            f"durable run ownership was lost for {run_id}"
+                        )
+                    return self._set_run_status(
+                        run_id,
+                        status,
+                        _require_persisted=True,
+                        **fields,
+                    )
+            except _RunOwnershipLost:
+                raise
             except Exception:
                 try:
                     renewed = await asyncio.to_thread(
@@ -6461,21 +6499,39 @@ class APIServerAdapter(BasePlatformAdapter):
                         )
                 await asyncio.sleep(self._RUN_TERMINAL_WRITE_RETRY_SECONDS)
 
-    def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
+    def _make_run_event_callback(
+        self,
+        run_id: str,
+        loop: "asyncio.AbstractEventLoop",
+        owner_generation: str,
+    ):
         """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
+        def _enqueue_if_owned(
+            queue: "asyncio.Queue[Optional[Dict]]", event: Dict[str, Any]
+        ) -> None:
+            with self._run_owner_state_lock:
+                if (
+                    self._run_owner_generations.get(run_id) == owner_generation
+                    and self._run_streams.get(run_id) is queue
+                ):
+                    queue.put_nowait(event)
+
         def _push(event: Dict[str, Any]) -> None:
-            self._set_run_status(
-                run_id,
-                self._run_statuses.get(run_id, {}).get("status", "running"),
-                last_event=event.get("event"),
-            )
-            q = self._run_streams.get(run_id)
-            if q is None:
-                return
-            try:
-                loop.call_soon_threadsafe(q.put_nowait, event)
-            except Exception:
-                pass
+            with self._run_owner_state_lock:
+                if self._run_owner_generations.get(run_id) != owner_generation:
+                    return
+                self._set_run_status(
+                    run_id,
+                    self._run_statuses.get(run_id, {}).get("status", "running"),
+                    last_event=event.get("event"),
+                )
+                q = self._run_streams.get(run_id)
+                if q is None:
+                    return
+                try:
+                    loop.call_soon_threadsafe(_enqueue_if_owned, q, event)
+                except Exception:
+                    pass
 
         def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
             ts = time.time()
@@ -6726,8 +6782,10 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Only the durable CAS winner consumes an execution slot.
         local_owner_generation = uuid.uuid4().hex
-        self._run_owner_generations[run_id] = local_owner_generation
-        self._run_profiles[run_id] = canonical_profile
+        with self._run_owner_state_lock:
+            self._run_owner_generations[run_id] = local_owner_generation
+            self._run_profiles[run_id] = canonical_profile
+            self._run_profile_generations[run_id] = local_owner_generation
 
         async def _set_owned_terminal(
             owned_run_id: str, status: str, **fields: Any
@@ -6766,12 +6824,19 @@ class APIServerAdapter(BasePlatformAdapter):
         self._run_streams_created[run_id] = created_at
         self._run_approval_sessions[run_id] = approval_session_key
 
-        event_cb = self._make_run_event_callback(run_id, loop)
+        event_cb = self._make_run_event_callback(
+            run_id, loop, local_owner_generation
+        )
 
         def _put_event_if_active(event: Optional[Dict]) -> None:
             """Enqueue only while this run still owns live transport state."""
-            if self._run_streams.get(run_id) is q:
-                q.put_nowait(event)
+            with self._run_owner_state_lock:
+                if (
+                    self._run_owner_generations.get(run_id)
+                    == local_owner_generation
+                    and self._run_streams.get(run_id) is q
+                ):
+                    q.put_nowait(event)
 
         # Also wire stream_delta_callback so message.delta events flow through.
         def _text_cb(delta: Optional[str]) -> None:
@@ -6871,33 +6936,41 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_agents[run_id] = agent
 
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
-                    event = dict(approval_data or {})
-                    # Redact credentials from the command before it enters the
-                    # SSE/API event stream — same egress bug as #48456, second
-                    # transport: API/desktop clients would otherwise receive the
-                    # raw command Tirith flagged. Reuse the gateway seam.
-                    if "command" in event:
-                        from gateway.run import _redact_approval_command
+                    with self._run_owner_state_lock:
+                        if (
+                            self._run_owner_generations.get(run_id)
+                            != local_owner_generation
+                        ):
+                            return
+                        event = dict(approval_data or {})
+                        # Redact credentials from the command before it enters the
+                        # SSE/API event stream — same egress bug as #48456, second
+                        # transport: API/desktop clients would otherwise receive the
+                        # raw command Tirith flagged. Reuse the gateway seam.
+                        if "command" in event:
+                            from gateway.run import _redact_approval_command
 
-                        event["command"] = _redact_approval_command(event.get("command"))
-                    event.update({
-                        "event": "approval.request",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                        "choices": _approval_event_choices(
-                            smart_denied=bool(event.get("smart_denied")),
-                            allow_permanent=event.get("allow_permanent") is not False,
-                        ),
-                    })
-                    self._set_run_status(
-                        run_id,
-                        "waiting_for_approval",
-                        last_event="approval.request",
-                    )
-                    try:
-                        loop.call_soon_threadsafe(q.put_nowait, event)
-                    except Exception:
-                        pass
+                            event["command"] = _redact_approval_command(
+                                event.get("command")
+                            )
+                        event.update({
+                            "event": "approval.request",
+                            "run_id": run_id,
+                            "timestamp": time.time(),
+                            "choices": _approval_event_choices(
+                                smart_denied=bool(event.get("smart_denied")),
+                                allow_permanent=event.get("allow_permanent") is not False,
+                            ),
+                        })
+                        self._set_run_status(
+                            run_id,
+                            "waiting_for_approval",
+                            last_event="approval.request",
+                        )
+                        try:
+                            loop.call_soon_threadsafe(_put_event_if_active, event)
+                        except Exception:
+                            pass
 
                 def _run_sync():
                     from gateway.session_context import clear_session_vars
@@ -7116,8 +7189,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
-                if self._run_owner_generations.get(run_id) == local_owner_generation:
-                    self._run_owner_generations.pop(run_id, None)
+                with self._run_owner_state_lock:
+                    if self._run_owner_generations.get(run_id) == local_owner_generation:
+                        self._run_owner_generations.pop(run_id, None)
+                self._cleanup_run_profile_if_inactive(
+                    run_id, local_owner_generation
+                )
 
         self._activate_admitted_request()
         task = asyncio.create_task(_run_and_close())
@@ -7227,6 +7304,11 @@ class APIServerAdapter(BasePlatformAdapter):
             self._run_stream_subscribers.discard(run_id)
             self._run_streams.pop(run_id, None)
             self._run_streams_created.pop(run_id, None)
+            profile_generation = self._run_profile_generations.get(run_id)
+            if profile_generation is not None:
+                self._cleanup_run_profile_if_inactive(
+                    run_id, profile_generation
+                )
 
         return response
 
@@ -7350,8 +7432,9 @@ class APIServerAdapter(BasePlatformAdapter):
         if agent is None and task is None:
             return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
 
-        self._set_run_status(run_id, "stopping", last_event="run.stopping")
-        self._stopping_run_ids.add(run_id)
+        if run_id in self._run_owner_generations:
+            self._set_run_status(run_id, "stopping", last_event="run.stopping")
+            self._stopping_run_ids.add(run_id)
 
         if agent is not None:
             try:
@@ -7399,6 +7482,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
+                profile_generation = self._run_profile_generations.get(run_id)
+                if profile_generation is not None:
+                    self._cleanup_run_profile_if_inactive(
+                        run_id, profile_generation
+                    )
 
         stale_statuses = [
             run_id
@@ -7408,7 +7496,13 @@ class APIServerAdapter(BasePlatformAdapter):
         ]
         for run_id in stale_statuses:
             self._run_statuses.pop(run_id, None)
-            self._run_profiles.pop(run_id, None)
+            profile_generation = self._run_profile_generations.get(run_id)
+            if profile_generation is None:
+                self._run_profiles.pop(run_id, None)
+            else:
+                self._cleanup_run_profile_if_inactive(
+                    run_id, profile_generation
+                )
         try:
             cutoff = now - self._RUN_STATUS_TTL
             self._response_store.delete_expired_terminal_runs(

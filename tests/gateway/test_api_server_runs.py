@@ -104,6 +104,12 @@ def _create_profiled_runs_app(adapter: APIServerAdapter) -> web.Application:
     app["api_server_adapter"] = adapter
     app.router.add_post("/p/{profile}/v1/runs", adapter._handle_runs)
     app.router.add_get("/p/{profile}/v1/runs/{run_id}", adapter._handle_get_run)
+    app.router.add_get(
+        "/p/{profile}/v1/runs/{run_id}/events", adapter._handle_run_events
+    )
+    app.router.add_post(
+        "/p/{profile}/v1/runs/{run_id}/stop", adapter._handle_stop_run
+    )
     return app
 
 
@@ -1541,13 +1547,27 @@ class TestStartRun:
         second._RUN_OWNER_LEASE_SECONDS = 0.05
         release = threading.Event()
         started = threading.Event()
+        force_first_owner_loss = threading.Event()
         key = "running-owner-must-not-be-taken-over"
         first_app = _create_runs_app(first)
         second_app = _create_runs_app(second)
 
-        with patch.object(first, "_create_agent") as first_create, patch.object(
-            second, "_create_agent"
-        ) as second_create:
+        real_renew_run_lease = first_store.renew_run_lease
+
+        def _controlled_first_renewal(*args, **kwargs):
+            if force_first_owner_loss.is_set():
+                return False
+            return real_renew_run_lease(*args, **kwargs)
+
+        with (
+            patch.object(first, "_create_agent") as first_create,
+            patch.object(second, "_create_agent") as second_create,
+            patch.object(
+                first_store,
+                "renew_run_lease",
+                side_effect=_controlled_first_renewal,
+            ),
+        ):
             first_agent = MagicMock()
 
             def _noncooperative_run(**_kwargs):
@@ -1569,6 +1589,9 @@ class TestStartRun:
                 )
                 run_id = (await accepted.json())["run_id"]
                 assert await asyncio.to_thread(started.wait, 1)
+                # Prevent gateway A's heartbeat from winning the race between
+                # forced expiry and gateway B's deterministic takeover.
+                force_first_owner_loss.set()
                 with second_store._lock:
                     second_store._conn.execute(
                         "UPDATE run_idempotency SET lease_expires_at = 0 WHERE run_id = ?",
@@ -1623,6 +1646,128 @@ class TestStartRun:
         assert adapter._run_profiles[run_id] == "default"
         assert adapter._run_owner_generations[run_id] == "new-generation"
         adapter._response_store.close()
+
+    def test_lease_loss_keeps_profile_tombstone_while_control_state_is_live(self):
+        adapter = _make_adapter()
+        run_id = "run_profile_tombstone"
+        generation = "owner-generation"
+        adapter._run_statuses[run_id] = {"run_id": run_id, "status": "running"}
+        adapter._run_profiles[run_id] = "profile-b"
+        adapter._run_owner_generations[run_id] = generation
+        adapter._run_streams[run_id] = asyncio.Queue()
+
+        assert adapter._evict_lost_run_owner_cache(run_id, generation) is True
+        assert run_id not in adapter._run_statuses
+        assert adapter._run_profiles[run_id] == "profile-b"
+
+        adapter._run_streams.pop(run_id)
+        adapter._cleanup_run_profile_if_inactive(run_id, generation)
+        assert run_id not in adapter._run_profiles
+        adapter._response_store.close()
+
+    @pytest.mark.asyncio
+    async def test_late_callbacks_are_fenced_and_foreign_profile_stays_denied_after_lease_loss(
+        self, tmp_path
+    ):
+        db_path = tmp_path / "response-store.db"
+        owner_store = ResponseStore(db_path=str(db_path))
+        successor_store = ResponseStore(db_path=str(db_path))
+        adapter = _make_adapter()
+        adapter._response_store.close()
+        adapter._response_store = owner_store
+        adapter._RUN_OWNER_HEARTBEAT_SECONDS = 0.01
+        adapter._RUN_OWNER_LEASE_SECONDS = 1.0
+        app = _create_profiled_runs_app(adapter)
+        release = threading.Event()
+        started = threading.Event()
+        callbacks = {}
+
+        agent = MagicMock()
+
+        def _noncooperative_run(**_kwargs):
+            with approval_mod._lock:
+                callbacks["approval"] = approval_mod._gateway_notify_cbs[
+                    _kwargs["task_id"]
+                ]
+            started.set()
+            release.wait(timeout=5)
+            return {"final_response": "stale-owner-output"}
+
+        agent.run_conversation.side_effect = _noncooperative_run
+        agent.session_prompt_tokens = 0
+        agent.session_completion_tokens = 0
+        agent.session_total_tokens = 0
+
+        def _create_agent(**kwargs):
+            callbacks["progress"] = kwargs["tool_progress_callback"]
+            return agent
+
+        with patch.object(adapter, "_create_agent", side_effect=_create_agent):
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(
+                    "/p/profile-b/v1/runs",
+                    json={"input": "hello"},
+                    headers=_idempotency_headers("lost-owner-callbacks"),
+                )
+                run_id = (await response.json())["run_id"]
+                assert await asyncio.to_thread(started.wait, 1)
+
+                with successor_store._lock:
+                    successor_store._conn.execute(
+                        "UPDATE run_idempotency SET owner_id = ? WHERE run_id = ?",
+                        ("successor-owner", run_id),
+                    )
+                    successor_store._conn.commit()
+                successor_status = {
+                    **successor_store.get_run_status(run_id),
+                    "status": "failed",
+                    "error": "successor failed",
+                    "last_event": "run.failed",
+                }
+                assert successor_store.put_run_status(
+                    run_id,
+                    successor_status,
+                    owner_id="successor-owner",
+                    lease_seconds=1,
+                ) is True
+
+                for _ in range(100):
+                    if run_id not in adapter._run_owner_generations:
+                        break
+                    await asyncio.sleep(0.01)
+                assert run_id not in adapter._run_statuses
+                assert adapter._run_profiles[run_id] == "profile-b"
+                queue = adapter._run_streams[run_id]
+                queued_before = queue.qsize()
+
+                callbacks["progress"]("tool.started", tool_name="terminal")
+                callbacks["approval"]({"command": "pwd"})
+                await asyncio.sleep(0.02)
+
+                assert run_id not in adapter._run_statuses
+                assert queue.qsize() == queued_before
+                foreign_events = await cli.get(
+                    f"/p/profile-a/v1/runs/{run_id}/events"
+                )
+                foreign_stop = await cli.post(
+                    f"/p/profile-a/v1/runs/{run_id}/stop", json={}
+                )
+                assert foreign_events.status == 404
+                assert foreign_stop.status == 404
+                agent.interrupt.assert_called_once_with(
+                    "Durable run lease ownership was lost"
+                )
+
+                polled = await cli.get(f"/p/profile-b/v1/runs/{run_id}")
+                assert polled.status == 200
+                assert (await polled.json())["status"] == "failed"
+                assert adapter._run_statuses[run_id]["status"] == "failed"
+
+                release.set()
+                await asyncio.wait_for(adapter._active_run_tasks[run_id], timeout=1)
+
+        owner_store.close()
+        successor_store.close()
 
     @pytest.mark.asyncio
     async def test_real_lease_loss_tracks_noncooperative_executor_and_fences_terminal(

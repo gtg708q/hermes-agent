@@ -987,10 +987,12 @@ class TestRunEventCallback:
         run_id = "run_subagent_events"
         loop = asyncio.get_running_loop()
         queue = asyncio.Queue()
+        generation = "test-generation"
         adapter._run_streams[run_id] = queue
         adapter._run_statuses.pop(run_id, None)
+        adapter._run_owner_generations[run_id] = generation
 
-        callback = adapter._make_run_event_callback(run_id, loop)
+        callback = adapter._make_run_event_callback(run_id, loop, generation)
 
         callback(
             "subagent.start",
@@ -1040,10 +1042,12 @@ class TestRunEventCallback:
         run_id = "run_subagent_redact"
         loop = asyncio.get_running_loop()
         queue = asyncio.Queue()
+        generation = "test-generation"
         adapter._run_streams[run_id] = queue
         adapter._run_statuses.pop(run_id, None)
+        adapter._run_owner_generations[run_id] = generation
 
-        callback = adapter._make_run_event_callback(run_id, loop)
+        callback = adapter._make_run_event_callback(run_id, loop, generation)
         secret = "sk-proj-abcdef1234567890abcdef1234567890abcdef12"
         callback(
             "subagent.complete",

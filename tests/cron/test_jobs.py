@@ -7,6 +7,8 @@ import sqlite3
 import sys
 import threading
 import time
+from pathlib import Path
+
 import pytest
 from datetime import datetime, timedelta, timezone
 
@@ -1943,6 +1945,227 @@ print(json.dumps({{"records": records[0], "removed": removed}}))
                     {row[0] for row in conn.execute("SELECT name FROM directories")}
                 )
         assert indexed_names == [{"job-0"}, {"job-1"}]
+
+    def test_portable_publication_holds_generation_guard_until_output_is_visible(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        import cron.jobs as jobs
+
+        monkeypatch.setattr(jobs, "_use_linux_output_gc", lambda: False)
+        save_jobs([])
+        save_job_output("raced-job", "old output")
+        publication_entered = threading.Event()
+        release_publication = threading.Event()
+        original_replace = jobs.atomic_replace
+
+        def blocked_replace(source, destination):
+            if Path(destination).parent.name == "raced-job":
+                publication_entered.set()
+                assert release_publication.wait(timeout=2)
+            return original_replace(source, destination)
+
+        monkeypatch.setattr(jobs, "atomic_replace", blocked_replace)
+        save_errors = []
+
+        def publish():
+            try:
+                save_job_output("raced-job", "new output")
+            except BaseException as exc:
+                save_errors.append(exc)
+
+        saver = threading.Thread(target=publish)
+        saver.start()
+        assert publication_entered.wait(timeout=1)
+
+        gc_result = []
+
+        def collect_gc():
+            gc_result.append(
+                jobs.gc_orphaned_output(
+                    retention_days=1, interval_seconds=0, max_directories=1
+                )
+            )
+
+        collector = threading.Thread(target=collect_gc)
+        collector.start()
+        time.sleep(0.05)
+        assert collector.is_alive()
+        release_publication.set()
+        saver.join(timeout=2)
+        collector.join(timeout=2)
+
+        assert not save_errors
+        assert gc_result == [0]
+        assert (jobs.get_cron_output_dir() / "raced-job").is_dir()
+        assert any(
+            path.read_text(encoding="utf-8") == "new output"
+            for path in (jobs.get_cron_output_dir() / "raced-job").glob("*.md")
+        )
+
+    def test_portable_save_waits_out_inflight_delete_then_publishes_new_generation(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        import cron.jobs as jobs
+
+        monkeypatch.setattr(jobs, "_use_linux_output_gc", lambda: False)
+        save_jobs([])
+        save_job_output("delete-race", "old output")
+        delete_entered = threading.Event()
+        release_delete = threading.Event()
+        original_remove = jobs._remove_portable_output_directory
+
+        def blocked_remove(root, name):
+            delete_entered.set()
+            assert release_delete.wait(timeout=2)
+            return original_remove(root, name)
+
+        monkeypatch.setattr(jobs, "_remove_portable_output_directory", blocked_remove)
+        gc_result = []
+        collector = threading.Thread(
+            target=lambda: gc_result.append(
+                jobs.gc_orphaned_output(
+                    retention_days=0, interval_seconds=0, max_directories=1
+                )
+            )
+        )
+        collector.start()
+        assert delete_entered.wait(timeout=1)
+
+        save_result = []
+        saver = threading.Thread(
+            target=lambda: save_result.append(
+                save_job_output("delete-race", "new output")
+            )
+        )
+        saver.start()
+        time.sleep(0.05)
+        assert saver.is_alive()
+        release_delete.set()
+        collector.join(timeout=2)
+        saver.join(timeout=2)
+
+        assert gc_result == [1]
+        assert len(save_result) == 1
+        assert save_result[0].read_text(encoding="utf-8") == "new output"
+
+    def test_portable_gc_rechecks_selected_generation_before_delete(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        import cron.jobs as jobs
+
+        monkeypatch.setattr(jobs, "_use_linux_output_gc", lambda: False)
+        save_jobs([])
+        save_job_output("generation-race", "current output")
+        db_path = tmp_cron_dir / "cron" / "output-gc.sqlite3"
+        real_initialize = jobs._initialize_portable_output_gc_index
+
+        class GenerationBarrierConnection:
+            def __init__(self, connection):
+                self.connection = connection
+                self.injected = False
+
+            def execute(self, sql, parameters=()):
+                if sql == "BEGIN IMMEDIATE" and not self.injected:
+                    self.injected = True
+                    with sqlite3.connect(db_path) as successor:
+                        successor.execute(
+                            "UPDATE directories SET generation = ? WHERE name = ?",
+                            ("fresh-generation", "generation-race"),
+                        )
+                return self.connection.execute(sql, parameters)
+
+            def __getattr__(self, name):
+                return getattr(self.connection, name)
+
+        monkeypatch.setattr(
+            jobs,
+            "_initialize_portable_output_gc_index",
+            lambda **kwargs: GenerationBarrierConnection(real_initialize(**kwargs)),
+        )
+
+        assert jobs.gc_orphaned_output(
+            retention_days=0, interval_seconds=0, max_directories=1
+        ) == 0
+        assert (jobs.get_cron_output_dir() / "generation-race").is_dir()
+
+    def test_portable_aux_index_failures_do_not_disable_cron_runtime(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        import cron.jobs as jobs
+
+        monkeypatch.setattr(jobs, "_use_linux_output_gc", lambda: False)
+        due_job = create_job(
+            prompt="still dispatch", schedule="1m", deliver="local"
+        )
+        records = load_jobs()
+        records[0]["next_run_at"] = (
+            datetime.now(timezone.utc) - timedelta(minutes=1)
+        ).isoformat()
+        save_jobs(records)
+        db_path = tmp_cron_dir / "cron" / "output-gc.sqlite3"
+        db_path.write_bytes(b"not a sqlite database")
+
+        # The auxiliary retention index must not participate in jobs storage or
+        # due-job admission, even when it is corrupt.
+        save_jobs(records)
+        assert load_jobs()[0]["id"] == due_job["id"]
+        assert any(job["id"] == due_job["id"] for job in get_due_jobs())
+
+        output_file = save_job_output("corrupt-index-output", "published")
+        assert output_file.read_text(encoding="utf-8") == "published"
+        assert jobs.gc_orphaned_output(
+            retention_days=0, interval_seconds=0, max_directories=1
+        ) == 0
+        with pytest.raises(sqlite3.DatabaseError):
+            jobs.bootstrap_output_gc_index()
+
+    def test_portable_locked_index_is_bounded_and_output_save_fails_open(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        import cron.jobs as jobs
+
+        monkeypatch.setattr(jobs, "_use_linux_output_gc", lambda: False)
+        save_jobs([])
+        first = save_job_output("seed", "seed")
+        assert first.exists()
+        db_path = tmp_cron_dir / "cron" / "output-gc.sqlite3"
+        lock_holder = sqlite3.connect(db_path)
+        lock_holder.execute("BEGIN IMMEDIATE")
+        started_at = time.monotonic()
+        try:
+            output_file = save_job_output("locked-index-output", "published")
+            assert time.monotonic() - started_at < 0.5
+            assert output_file.read_text(encoding="utf-8") == "published"
+            assert jobs.gc_orphaned_output(
+                retention_days=0, interval_seconds=0, max_directories=1
+            ) == 0
+        finally:
+            lock_holder.rollback()
+            lock_holder.close()
+
+    def test_portable_unwritable_index_fails_open_except_explicit_bootstrap(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        import cron.jobs as jobs
+
+        monkeypatch.setattr(jobs, "_use_linux_output_gc", lambda: False)
+        real_connect = jobs.sqlite3.connect
+
+        def denied_connect(database, *args, **kwargs):
+            if Path(database) == jobs._portable_output_gc_db_path():
+                raise PermissionError("index is unwritable")
+            return real_connect(database, *args, **kwargs)
+
+        monkeypatch.setattr(jobs.sqlite3, "connect", denied_connect)
+        save_jobs([])
+        assert load_jobs() == []
+        output_file = save_job_output("unwritable-index-output", "published")
+        assert output_file.read_text(encoding="utf-8") == "published"
+        assert jobs.gc_orphaned_output(
+            retention_days=0, interval_seconds=0, max_directories=1
+        ) == 0
+        with pytest.raises(PermissionError, match="unwritable"):
+            jobs.bootstrap_output_gc_index()
 
     @staticmethod
     def _seed(d, count):
