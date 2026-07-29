@@ -8,6 +8,7 @@ Output is saved to ~/.hermes/cron/output/{job_id}/{timestamp}.md
 import atexit
 import contextlib
 import copy
+import ctypes
 from contextvars import ContextVar
 from dataclasses import dataclass
 import json
@@ -19,6 +20,8 @@ import threading
 import time
 import os
 import re
+import stat
+import sys
 import uuid
 
 # Cross-process advisory file locking for jobs.json critical sections.
@@ -92,13 +95,108 @@ TICKER_INTERVAL_SECONDS = 60
 _jobs_file_lock = threading.RLock()
 _jobs_lock_state = threading.local()
 
-# Keep one live lazy output-directory traversal per profile store. Reopening a
-# scandir and skipping to a persisted numeric offset makes a full rotation
-# quadratic; retaining the iterator makes every tick pay only for entries it
-# actually advances. The lock also prevents two in-process tickers for the same
-# store from concurrently consuming an iterator.
+# Linux directory offsets are opaque filesystem cookies, not ordinal indexes.
+# Persisting d_off lets a restarted gateway seek directly to the next record;
+# unlike a numeric index, this does not replay an ever-growing prefix. One live
+# DIR stream is retained between ticks as an optimization, while the durable
+# cookie remains the source of truth across process restarts.
 _output_gc_scan_lock = threading.RLock()
 _output_gc_scans: Dict[Path, Any] = {}
+
+
+class _LinuxDirent(ctypes.Structure):
+    _fields_ = [
+        ("d_ino", ctypes.c_ulong),
+        ("d_off", ctypes.c_long),
+        ("d_reclen", ctypes.c_ushort),
+        ("d_type", ctypes.c_ubyte),
+        ("d_name", ctypes.c_char * 256),
+    ]
+
+
+class _LinuxDirectoryScan:
+    """A readdir stream that exposes the kernel's durable next-entry cookie."""
+
+    def __init__(self, path: Path, cookie: int = 0) -> None:
+        libc = ctypes.CDLL(None, use_errno=True)
+        fdopendir = libc.fdopendir
+        fdopendir.argtypes = [ctypes.c_int]
+        fdopendir.restype = ctypes.c_void_p
+        readdir = libc.readdir
+        readdir.argtypes = [ctypes.c_void_p]
+        readdir.restype = ctypes.POINTER(_LinuxDirent)
+        closedir = libc.closedir
+        closedir.argtypes = [ctypes.c_void_p]
+        closedir.restype = ctypes.c_int
+
+        flags = os.O_RDONLY
+        for flag_name in ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW"):
+            flags |= getattr(os, flag_name, 0)
+        fd = os.open(path, flags)
+        try:
+            root_stat = os.fstat(fd)
+            if not stat.S_ISDIR(root_stat.st_mode):
+                raise NotADirectoryError(path)
+            if cookie:
+                if os.lseek(fd, cookie, os.SEEK_SET) != cookie:
+                    raise OSError(f"directory seek did not reach cookie {cookie}")
+            dirp = fdopendir(fd)
+            if not dirp:
+                error = ctypes.get_errno()
+                raise OSError(error, os.strerror(error), path)
+        except BaseException:
+            os.close(fd)
+            raise
+
+        # fdopendir owns fd from here onward; closedir releases it.
+        self._dirp = dirp
+        self._readdir = readdir
+        self._closedir = closedir
+        self.root_dev = int(root_stat.st_dev)
+        self.root_ino = int(root_stat.st_ino)
+        self.cookie = cookie
+
+    def next_record(self) -> Optional[str]:
+        ctypes.set_errno(0)
+        record_ptr = self._readdir(self._dirp)
+        if not record_ptr:
+            error = ctypes.get_errno()
+            if error:
+                raise OSError(error, os.strerror(error))
+            return None
+        record = record_ptr.contents
+        self.cookie = int(record.d_off)
+        return os.fsdecode(bytes(record.d_name))
+
+    def close(self) -> None:
+        if self._dirp is None:
+            return
+        dirp, self._dirp = self._dirp, None
+        if self._closedir(dirp) != 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error))
+
+
+class _PortableDirectoryScan:
+    """Bounded in-process fallback where durable Linux cookies are unavailable."""
+
+    def __init__(self, path: Path, cookie: int = 0) -> None:
+        if cookie:
+            raise OSError("durable directory cookies are unsupported on this platform")
+        root_stat = os.stat(path, follow_symlinks=False)
+        self.root_dev = int(root_stat.st_dev)
+        self.root_ino = int(root_stat.st_ino)
+        self.cookie = 0
+        self._entries = os.scandir(path)
+
+    def next_record(self) -> Optional[str]:
+        try:
+            return next(self._entries).name
+        except StopIteration:
+            return None
+
+    def close(self) -> None:
+        self._entries.close()
 
 
 def _close_output_gc_scan(output_dir: Optional[Path] = None) -> None:
@@ -2402,11 +2500,14 @@ def gc_orphaned_output(
     ):
         return 0
 
-    output_dir = get_cron_output_dir()
-    marker = output_dir / ".orphan-gc.json"
+    store = _current_cron_store()
+    output_dir = store.output_dir
+    marker = store.cron_dir / ".output-gc-state.json"
+    legacy_marker = output_dir / ".orphan-gc.json"
     now = time.time()
+    root_fd: Optional[int] = None
     try:
-        if marker.is_symlink():
+        if marker.is_symlink() or (not marker.exists() and legacy_marker.is_symlink()):
             return 0
         if interval_seconds and marker.is_file() and now - marker.stat().st_mtime < interval_seconds:
             return 0
@@ -2415,45 +2516,103 @@ def gc_orphaned_output(
         # repaired retry for the full GC interval.
         live_ids = {str(job.get("id")) for job in load_jobs() if job.get("id")}
         try:
-            state = json.loads(marker.read_text(encoding="utf-8")) if marker.is_file() else {}
+            state_path = marker if marker.is_file() else legacy_marker
+            state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.is_file() else {}
         except (OSError, ValueError, TypeError):
             state = {}
+
+        root_stat = os.stat(output_dir, follow_symlinks=False)
+        if not stat.S_ISDIR(root_stat.st_mode):
+            return 0
+        root_dev = int(root_stat.st_dev)
+        root_ino = int(root_stat.st_ino)
+        state_matches_root = (
+            state.get("version") == 1
+            and state.get("root_dev") == root_dev
+            and state.get("root_ino") == root_ino
+        )
         first_seen = {
             str(name): float(seen)
             for name, seen in (state.get("first_seen") or {}).items()
             if isinstance(name, str) and isinstance(seen, (int, float))
         }
+        if not state_matches_root:
+            # Cookies and observations from a replaced inode must never apply to
+            # same-named entries in the new output directory.
+            first_seen = {}
+        raw_cookie = state.get("cookie", 0) if state_matches_root else 0
+        cookie = raw_cookie if isinstance(raw_cookie, int) and raw_cookie >= 0 else 0
 
-        # Resume the same lazy scandir across ticks. Every next() call, including
-        # skipped/non-directory entries and the exhaustion probe, consumes this
-        # tick's budget. Legacy persisted numeric cursors are intentionally
-        # ignored: after restart a fresh linear rotation is cheaper than replaying
-        # an ever-growing prefix on every page.
-        page = []
+        # Every next_record call consumes budget, including dot/non-directory
+        # records and the EOF probe. Linux reopens at d_off in O(1) after restart.
+        page: List[str] = []
+        next_cookie = cookie
         with _output_gc_scan_lock:
-            entries = _output_gc_scans.get(output_dir)
-            if entries is None:
-                entries = os.scandir(output_dir)
-                _output_gc_scans[output_dir] = entries
-            try:
-                for _ in range(max_directories):
-                    try:
-                        page.append(next(entries))
-                    except StopIteration:
-                        _close_output_gc_scan(output_dir)
-                        break
-            except BaseException:
+            scan = _output_gc_scans.get(output_dir)
+            if scan is not None and (
+                scan.root_dev != root_dev
+                or scan.root_ino != root_ino
+                or (sys.platform.startswith("linux") and scan.cookie != cookie)
+            ):
                 _close_output_gc_scan(output_dir)
-                raise
+                scan = None
+            if scan is None:
+                scan_type = (
+                    _LinuxDirectoryScan
+                    if sys.platform.startswith("linux")
+                    else _PortableDirectoryScan
+                )
+                try:
+                    scan = scan_type(output_dir, cookie)
+                except OSError:
+                    if not cookie:
+                        raise
+                    # Invalid/stale cookies reset without processing entries.
+                    first_seen = {}
+                    cookie = 0
+                    next_cookie = 0
+                    scan = scan_type(output_dir, 0)
+                _output_gc_scans[output_dir] = scan
+            for _ in range(max_directories):
+                try:
+                    name = scan.next_record()
+                except OSError:
+                    _close_output_gc_scan(output_dir)
+                    first_seen = {}
+                    next_cookie = 0
+                    page = []
+                    break
+                if name is None:
+                    _close_output_gc_scan(output_dir)
+                    next_cookie = 0
+                    break
+                next_cookie = scan.cookie
+                page.append(name)
+
+        if sys.platform.startswith("linux"):
+            root_flags = os.O_RDONLY
+            for flag_name in ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW"):
+                root_flags |= getattr(os, flag_name, 0)
+            root_fd = os.open(output_dir, root_flags)
+            current_root = os.fstat(root_fd)
+        else:
+            current_root = os.stat(output_dir, follow_symlinks=False)
+        if (int(current_root.st_dev), int(current_root.st_ino)) != (root_dev, root_ino):
+            _close_output_gc_scan(output_dir)
+            raise RuntimeError("cron output directory changed during GC scan")
 
         candidates = []
-        for entry in page:
-            name = entry.name
-            if name in {marker.name, ".orphan-gc"} or name in live_ids:
+        for name in page:
+            if name in {".", "..", legacy_marker.name, ".orphan-gc"} or name in live_ids:
                 first_seen.pop(name, None)
                 continue
             try:
-                if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                entry_stat = (
+                    os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+                    if root_fd is not None
+                    else os.stat(output_dir / name, follow_symlinks=False)
+                )
+                if not stat.S_ISDIR(entry_stat.st_mode):
                     first_seen.pop(name, None)
                     continue
             except OSError as exc:
@@ -2461,12 +2620,18 @@ def gc_orphaned_output(
                 continue
             seen_at = first_seen.setdefault(name, now)
             if now - seen_at >= retention_days * 86400:
-                candidates.append(Path(entry.path))
+                candidates.append(name)
 
         def _persist_gc_state() -> None:
-            state = {"first_seen": first_seen}
+            state = {
+                "version": 1,
+                "root_dev": root_dev,
+                "root_ino": root_ino,
+                "cookie": next_cookie,
+                "first_seen": first_seen,
+            }
             fd, tmp_name = tempfile.mkstemp(
-                dir=str(output_dir), prefix=".orphan-gc-", suffix=".tmp"
+                dir=str(store.cron_dir), prefix=".output-gc-state-", suffix=".tmp"
             )
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -2474,6 +2639,8 @@ def gc_orphaned_output(
                     handle.flush()
                     os.fsync(handle.fileno())
                 atomic_replace(tmp_name, marker)
+                with contextlib.suppress(OSError):
+                    legacy_marker.unlink()
             except BaseException:
                 with contextlib.suppress(OSError):
                     os.unlink(tmp_name)
@@ -2482,26 +2649,41 @@ def gc_orphaned_output(
         _persist_gc_state()
     except (OSError, ValueError, TypeError, RuntimeError):
         _close_output_gc_scan(output_dir)
+        if root_fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(root_fd)
         return 0
 
     removed = 0
-    for path in candidates:
-        try:
-            if path.name in live_ids or not path.is_dir() or path.is_symlink():
-                continue
-            shutil.rmtree(path)
-            removed += 1
-            first_seen.pop(path.name, None)
-        except OSError as exc:
-            logger.debug("Failed to prune orphaned cron output %s: %s", path, exc)
-    if removed:
-        # The pre-delete marker intentionally makes failed deletions retryable.
-        # Once deletion succeeds, durably remove those observations too so the
-        # marker cannot grow forever or resurrect stale ages on name reuse.
-        try:
-            _persist_gc_state()
-        except OSError as exc:
-            logger.debug("Failed to persist orphan GC deletions: %s", exc)
+    try:
+        for name in candidates:
+            try:
+                entry_stat = (
+                    os.stat(name, dir_fd=root_fd, follow_symlinks=False)
+                    if root_fd is not None
+                    else os.stat(output_dir / name, follow_symlinks=False)
+                )
+                if name in live_ids or not stat.S_ISDIR(entry_stat.st_mode):
+                    continue
+                if root_fd is not None:
+                    shutil.rmtree(name, dir_fd=root_fd)
+                else:
+                    shutil.rmtree(output_dir / name)
+                removed += 1
+                first_seen.pop(name, None)
+            except OSError as exc:
+                logger.debug("Failed to prune orphaned cron output %s: %s", name, exc)
+        if removed:
+            # The pre-delete marker intentionally makes failed deletions retryable.
+            # Once deletion succeeds, durably remove those observations too so the
+            # marker cannot grow forever or resurrect stale ages on name reuse.
+            try:
+                _persist_gc_state()
+            except OSError as exc:
+                logger.debug("Failed to persist orphan GC deletions: %s", exc)
+    finally:
+        if root_fd is not None:
+            os.close(root_fd)
     return removed
 
 

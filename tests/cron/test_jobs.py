@@ -2,6 +2,8 @@
 
 import json
 import os
+import subprocess
+import sys
 import threading
 import time
 import pytest
@@ -1746,6 +1748,106 @@ class TestCronOutputRetention:
     """Per-run cron output must self-prune so long deploys don't fill the disk (#52383)."""
 
     @staticmethod
+    def _run_output_gc_process(home, *, retention_days, max_directories):
+        env = os.environ.copy()
+        env["HERMES_HOME"] = str(home)
+        env["PYTHONPATH"] = os.getcwd()
+        script = f"""
+import json
+from cron import jobs
+records = [0]
+original = jobs._LinuxDirectoryScan.next_record
+def counted(scan):
+    records[0] += 1
+    return original(scan)
+jobs._LinuxDirectoryScan.next_record = counted
+removed = jobs.gc_orphaned_output(
+    retention_days={retention_days!r},
+    interval_seconds=0,
+    max_directories={max_directories!r},
+)
+print(json.dumps({{"records": records[0], "removed": removed}}))
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            check=True,
+            cwd=os.getcwd(),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        stats = json.loads(result.stdout)
+        assert stats["records"] <= max_directories
+        return stats
+
+    @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux directory cookies")
+    def test_gc_orphaned_output_resumes_durable_cookie_across_real_restarts(self, tmp_path):
+        home = tmp_path / "hermes-home"
+        cron_dir = home / "cron"
+        output = cron_dir / "output"
+        output.mkdir(parents=True)
+        (cron_dir / "jobs.json").write_text("[]", encoding="utf-8")
+        names = {f"entry-{index:04d}" for index in range(40)}
+        for name in names:
+            (output / name).mkdir()
+
+        state_file = cron_dir / ".output-gc-state.json"
+        self._run_output_gc_process(home, retention_days=30, max_directories=5)
+        first = json.loads(state_file.read_text(encoding="utf-8"))
+        first_seen = set(first["first_seen"])
+        assert 0 < len(first_seen) <= 5
+        assert first["version"] == 1
+        assert first["cookie"] > 0
+        assert (first["root_dev"], first["root_ino"]) == (
+            output.stat().st_dev,
+            output.stat().st_ino,
+        )
+
+        # A fresh interpreter must seek to the durable cookie, not replay the
+        # first process's prefix. Only this page's bounded records may be new.
+        self._run_output_gc_process(home, retention_days=30, max_directories=5)
+        second = json.loads(state_file.read_text(encoding="utf-8"))
+        newly_seen = set(second["first_seen"]) - first_seen
+        assert 0 < len(newly_seen) <= 5
+
+        # Repeated process-equivalent restarts still finish the rotation and
+        # eventually visit/delete entries at the tail.
+        for _ in range(40):
+            if not any((output / name).exists() for name in names):
+                break
+            self._run_output_gc_process(home, retention_days=0, max_directories=5)
+        assert not any((output / name).exists() for name in names)
+
+    @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux directory cookies")
+    def test_gc_orphaned_output_resets_cookie_when_output_inode_is_replaced(self, tmp_path):
+        home = tmp_path / "hermes-home"
+        cron_dir = home / "cron"
+        output = cron_dir / "output"
+        output.mkdir(parents=True)
+        (cron_dir / "jobs.json").write_text("[]", encoding="utf-8")
+        for index in range(12):
+            (output / f"old-{index:03d}").mkdir()
+
+        self._run_output_gc_process(home, retention_days=30, max_directories=5)
+        state_file = cron_dir / ".output-gc-state.json"
+        old_state = json.loads(state_file.read_text(encoding="utf-8"))
+        old_output = cron_dir / "old-output"
+        output.rename(old_output)
+        output.mkdir()
+        for index in range(4):
+            (output / f"new-{index:03d}").mkdir()
+
+        self._run_output_gc_process(home, retention_days=30, max_directories=5)
+        new_state = json.loads(state_file.read_text(encoding="utf-8"))
+        assert (new_state["root_dev"], new_state["root_ino"]) == (
+            output.stat().st_dev,
+            output.stat().st_ino,
+        )
+        assert new_state["root_ino"] != old_state["root_ino"]
+        assert not (set(old_state["first_seen"]) & set(new_state["first_seen"]))
+        assert any(old_output.iterdir())
+
+    @staticmethod
     def _seed(d, count):
         d.mkdir(parents=True, exist_ok=True)
         names = [f"2026-06-25_10-00-{i:02d}.md" for i in range(count)]
@@ -1839,7 +1941,9 @@ class TestCronOutputRetention:
         assert not (output / "fresh-orphan").exists()
         assert not stale.exists()
 
-        marker_state = json.loads((output / ".orphan-gc.json").read_text())
+        marker_state = json.loads(
+            (tmp_cron_dir / "cron" / ".output-gc-state.json").read_text()
+        )
         assert "fresh-orphan" not in marker_state["first_seen"]
         assert "stale-orphan" not in marker_state["first_seen"]
 
@@ -1885,7 +1989,7 @@ class TestCronOutputRetention:
         os.utime(first, (old, old))
 
         assert gc_orphaned_output(retention_days=0, interval_seconds=3600) == 1
-        marker = output / ".orphan-gc.json"
+        marker = tmp_cron_dir / "cron" / ".output-gc-state.json"
         marker_mtime = marker.stat().st_mtime
 
         second = output / "second"
@@ -1941,7 +2045,8 @@ class TestCronOutputRetention:
         assert sum(removed) == 6
         assert not stale.exists()
 
-    def test_gc_orphaned_output_reuses_bounded_scandir_until_rotation_closes(
+    @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux directory cookies")
+    def test_gc_orphaned_output_bounds_records_and_closes_rotation(
         self, tmp_cron_dir, monkeypatch
     ):
         from cron import jobs
@@ -1951,64 +2056,49 @@ class TestCronOutputRetention:
         directory_names = {f"entry-{index:04d}" for index in range(60)}
         for name in directory_names:
             (output / name).mkdir()
-        marker = output / ".orphan-gc.json"
-        marker.write_text('{"cursor": 999999, "first_seen": {}}', encoding="utf-8")
+        marker = tmp_cron_dir / "cron" / ".output-gc-state.json"
+        next_calls = 0
+        opens = 0
+        closes = 0
+        real_init = jobs._LinuxDirectoryScan.__init__
+        real_next = jobs._LinuxDirectoryScan.next_record
+        real_close = jobs._LinuxDirectoryScan.close
 
-        real_scandir = os.scandir
-        scans = []
-        yielded_names = set()
-        yielded_count = 0
+        def counting_init(scan, *args, **kwargs):
+            nonlocal opens
+            opens += 1
+            real_init(scan, *args, **kwargs)
 
-        class CountingScandir:
-            def __init__(self, path):
-                self._entries = real_scandir(path)
-                self.next_calls = 0
-                self.closed = False
+        def counting_next(scan):
+            nonlocal next_calls
+            next_calls += 1
+            return real_next(scan)
 
-            def __iter__(self):
-                return self
+        def counting_close(scan):
+            nonlocal closes
+            closes += 1
+            return real_close(scan)
 
-            def __next__(self):
-                nonlocal yielded_count
-                self.next_calls += 1
-                entry = next(self._entries)
-                yielded_count += 1
-                yielded_names.add(entry.name)
-                return entry
-
-            def close(self):
-                self.closed = True
-                self._entries.close()
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *_exc):
-                self.close()
-
-        def counting_scandir(path):
-            scan = CountingScandir(path)
-            scans.append(scan)
-            return scan
-
-        monkeypatch.setattr(jobs.os, "scandir", counting_scandir)
+        monkeypatch.setattr(jobs._LinuxDirectoryScan, "__init__", counting_init)
+        monkeypatch.setattr(jobs._LinuxDirectoryScan, "next_record", counting_next)
+        monkeypatch.setattr(jobs._LinuxDirectoryScan, "close", counting_close)
         for _ in range(100):
-            calls_before = scans[-1].next_calls if scans else 0
+            calls_before = next_calls
             jobs.gc_orphaned_output(
                 retention_days=30,
                 interval_seconds=0,
                 max_directories=4,
             )
-            assert scans[-1].next_calls - calls_before <= 4
-            if directory_names <= yielded_names and scans[-1].closed:
+            assert next_calls - calls_before <= 4
+            state = json.loads(marker.read_text(encoding="utf-8"))
+            if directory_names <= set(state["first_seen"]) and state["cookie"] == 0:
                 break
         else:
             pytest.fail("output GC did not finish one bounded directory rotation")
 
-        assert len(scans) == 1
-        assert scans[0].closed is True
-        assert scans[0].next_calls == yielded_count + 1
-        assert "cursor" not in json.loads(marker.read_text(encoding="utf-8"))
+        assert opens == 1
+        assert closes == 1
+        assert next_calls == len(directory_names) + 3  # '.', '..', then EOF
 
 
 # =========================================================================
