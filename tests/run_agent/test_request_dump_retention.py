@@ -5,7 +5,10 @@ from __future__ import annotations
 import json
 import multiprocessing
 import os
+import sys
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -28,6 +31,132 @@ def _write_dump_worker(logs_dir_raw: str, index: int) -> None:
         ttl_days=7,
         dedup_seconds=0,
     )
+
+
+def _hold_request_dump_lock(logs_dir_raw: str, ready, release) -> None:
+    from agent.agent_runtime_helpers import _request_dump_lock
+
+    with _request_dump_lock(Path(logs_dir_raw), timeout_seconds=5) as acquired:
+        if not acquired:
+            raise RuntimeError("worker could not acquire request-dump lock")
+        ready.set()
+        if not release.wait(timeout=10):
+            raise RuntimeError("timed out waiting to release request-dump lock")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX flock contention test")
+def test_request_dump_skips_quickly_on_process_lock_contention(tmp_path):
+    from agent import agent_runtime_helpers as helpers
+
+    _write_bounded_request_dump = helpers._write_bounded_request_dump
+
+    ctx = multiprocessing.get_context("spawn")
+    ready = ctx.Event()
+    release = ctx.Event()
+    process = ctx.Process(
+        target=_hold_request_dump_lock,
+        args=(str(tmp_path), ready, release),
+    )
+    process.start()
+    try:
+        assert ready.wait(timeout=10)
+        dump_file = tmp_path / "request_dump_contended.json"
+
+        started = time.monotonic()
+        wrote = _write_bounded_request_dump(
+            logs_dir=tmp_path,
+            dump_file=dump_file,
+            payload={"fingerprint": "contended"},
+            max_files=2,
+            max_bytes=4096,
+            ttl_days=7,
+            dedup_seconds=0,
+        )
+        elapsed = time.monotonic() - started
+
+        assert wrote is False
+        assert elapsed < 1.0
+        assert not dump_file.exists()
+        assert str(tmp_path.resolve()) not in helpers._REQUEST_DUMP_SCAN_STATES
+
+        release.set()
+        process.join(timeout=10)
+        assert process.exitcode == 0
+
+        assert _write_bounded_request_dump(
+            logs_dir=tmp_path,
+            dump_file=dump_file,
+            payload={"fingerprint": "released"},
+            max_files=2,
+            max_bytes=4096,
+            ttl_days=7,
+            dedup_seconds=0,
+        ) is True
+        assert dump_file.exists()
+    finally:
+        release.set()
+        process.join(timeout=10)
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=10)
+
+
+def test_request_dump_windows_lock_timeout_does_not_unlock_unacquired_lock(
+    monkeypatch, tmp_path
+):
+    from agent import agent_runtime_helpers as helpers
+
+    calls = []
+    opened_handles = []
+    contended = True
+
+    original_open = type(tmp_path).open
+
+    class _TrackedHandle:
+        def __init__(self, inner):
+            self.inner = inner
+            self.closed = False
+
+        def __getattr__(self, name):
+            return getattr(self.inner, name)
+
+        def close(self):
+            self.closed = True
+            self.inner.close()
+
+    def tracked_open(path, *args, **kwargs):
+        handle = _TrackedHandle(original_open(path, *args, **kwargs))
+        opened_handles.append(handle)
+        return handle
+
+    def locking(_fd, mode, _size):
+        calls.append(mode)
+        if mode == fake_msvcrt.LK_NBLCK and contended:
+            raise OSError("lock is held")
+
+    fake_msvcrt = SimpleNamespace(LK_NBLCK=1, LK_UNLCK=2, locking=locking)
+    monkeypatch.setitem(sys.modules, "msvcrt", fake_msvcrt)
+    monkeypatch.setattr(type(tmp_path), "open", tracked_open)
+    monkeypatch.setattr(helpers.os, "name", "nt")
+
+    started = time.monotonic()
+    with helpers._request_dump_lock(
+        tmp_path, timeout_seconds=0.05, poll_seconds=0.005
+    ) as acquired:
+        assert acquired is False
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.5
+    assert fake_msvcrt.LK_UNLCK not in calls
+    assert opened_handles and all(handle.closed for handle in opened_handles)
+
+    contended = False
+    with helpers._request_dump_lock(
+        tmp_path, timeout_seconds=0.05, poll_seconds=0.005
+    ) as acquired:
+        assert acquired is True
+    assert calls[-1] == fake_msvcrt.LK_UNLCK
+    assert all(handle.closed for handle in opened_handles)
 
 
 def test_request_dump_count_cap_is_cross_process_safe(tmp_path):

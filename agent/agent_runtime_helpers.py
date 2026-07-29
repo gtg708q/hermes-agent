@@ -23,6 +23,7 @@ Methods covered:
 from __future__ import annotations
 
 import copy
+import errno
 import hashlib
 import json
 import logging
@@ -1711,39 +1712,72 @@ _REQUEST_DUMP_THREAD_LOCK = threading.Lock()
 _REQUEST_DUMP_SCAN_STATES: Dict[str, Any] = {}
 _REQUEST_DUMP_SCAN_LIMIT_DEFAULT = 256
 _REQUEST_DUMP_SCAN_LIMIT_MAX = 4096
+_REQUEST_DUMP_LOCK_TIMEOUT_SECONDS = 0.25
+_REQUEST_DUMP_LOCK_POLL_SECONDS = 0.01
 
 
 @contextmanager
-def _request_dump_lock(logs_dir: Path):
-    """Serialize request-dump retention across threads and OS processes."""
+def _request_dump_lock(
+    logs_dir: Path,
+    *,
+    timeout_seconds: float = _REQUEST_DUMP_LOCK_TIMEOUT_SECONDS,
+    poll_seconds: float = _REQUEST_DUMP_LOCK_POLL_SECONDS,
+):
+    """Try to serialize request-dump retention across threads and processes."""
     logs_dir.mkdir(parents=True, exist_ok=True)
-    with _REQUEST_DUMP_THREAD_LOCK:
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    thread_acquired = _REQUEST_DUMP_THREAD_LOCK.acquire(
+        timeout=max(0.0, deadline - time.monotonic())
+    )
+    if not thread_acquired:
+        yield False
+        return
+
+    try:
         lock_path = logs_dir / ".request_dump.lock"
         handle = lock_path.open("a+")
+        process_acquired = False
         try:
-            if os.name == "posix":
-                import fcntl
+            while True:
+                try:
+                    if os.name == "posix":
+                        import fcntl
 
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            elif os.name == "nt":
-                import msvcrt
+                        fcntl.flock(
+                            handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
+                        )
+                    elif os.name == "nt":
+                        import msvcrt
 
-                handle.seek(0, os.SEEK_END)
-                if handle.tell() == 0:
-                    handle.write("0")
-                    handle.flush()
-                handle.seek(0)
-                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
-            yield
+                        handle.seek(0, os.SEEK_END)
+                        if handle.tell() == 0:
+                            handle.write("0")
+                            handle.flush()
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    process_acquired = True
+                    break
+                except OSError as lock_error:
+                    if os.name == "posix" and lock_error.errno not in {
+                        errno.EACCES,
+                        errno.EAGAIN,
+                    }:
+                        raise
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(max(0.0, poll_seconds), remaining))
+
+            yield process_acquired
         finally:
-            if os.name == "posix":
+            if process_acquired and os.name == "posix":
                 try:
                     import fcntl
 
                     fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
                 except OSError:
                     pass
-            elif os.name == "nt":
+            elif process_acquired and os.name == "nt":
                 try:
                     import msvcrt
 
@@ -1752,6 +1786,8 @@ def _request_dump_lock(logs_dir: Path):
                 except OSError:
                     pass
             handle.close()
+    finally:
+        _REQUEST_DUMP_THREAD_LOCK.release()
 
 
 def _write_bounded_request_dump(
@@ -1766,7 +1802,9 @@ def _write_bounded_request_dump(
     scan_limit: int = _REQUEST_DUMP_SCAN_LIMIT_DEFAULT,
 ) -> bool:
     """Enforce global retention using one bounded, resumable scan page."""
-    with _request_dump_lock(logs_dir):
+    with _request_dump_lock(logs_dir) as acquired:
+        if not acquired:
+            return False
         scan_limit = min(
             _REQUEST_DUMP_SCAN_LIMIT_MAX,
             max(max_files + 1, 1, int(scan_limit)),
