@@ -1202,6 +1202,12 @@ def _admit_api_agent_request(handler):
         draining = self._draining_response()
         if draining is not None:
             return draining
+        # Admission and reservation are deliberately adjacent with no await:
+        # overlapping requests on this event loop therefore have exactly one
+        # winner for the last slot, before either starts reading its body.
+        limited = self._concurrency_limited_response()
+        if limited is not None:
+            return limited
         reservation = {"active": True}
         token = _api_agent_request_reservation.set(reservation)
         self._pending_agent_requests += 1
@@ -6412,10 +6418,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # Durable ownership is claimed only after the request body has been
         # parsed and validated, so malformed requests cannot reserve a key.
 
-        try:
-            body = await request.json()
-        except Exception:
-            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        body, body_error = await self._read_json_body(request)
+        if body_error is not None:
+            return body_error
 
         raw_input = body.get("input")
         if not raw_input:
@@ -6608,8 +6613,10 @@ class APIServerAdapter(BasePlatformAdapter):
         # profile scope). Capture now and re-enter inside the task/executor.
         async def _run_and_close():
             lease_heartbeat: Optional[asyncio.Task[Any]] = None
+            ownership_lost = False
 
             async def _renew_owner_lease() -> None:
+                nonlocal ownership_lost
                 while True:
                     await asyncio.sleep(self._RUN_OWNER_HEARTBEAT_SECONDS)
                     try:
@@ -6626,6 +6633,24 @@ class APIServerAdapter(BasePlatformAdapter):
                         logger.exception("Failed to renew run-owner lease for %s", run_id)
                         continue
                     if not renewed:
+                        ownership_lost = True
+                        active_agent = self._active_run_agents.get(run_id)
+                        if active_agent is not None:
+                            try:
+                                active_agent.interrupt(
+                                    "Durable run lease ownership was lost"
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "Failed to interrupt run %s after lease loss",
+                                    run_id,
+                                )
+                        run_task = self._active_run_tasks.get(run_id)
+                        if (
+                            run_task is not None
+                            and run_task is not asyncio.current_task()
+                        ):
+                            run_task.cancel()
                         return
 
             try:
@@ -6790,6 +6815,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         last_event="run.completed",
                     )
             except asyncio.CancelledError:
+                if ownership_lost:
+                    # The heartbeat proved this executor no longer owns the
+                    # durable row. Its interrupt is cooperative, and no
+                    # terminal status may be written under the lost lease.
+                    return
                 await self._set_terminal_run_status(
                     run_id,
                     "cancelled",

@@ -20,6 +20,7 @@ import json
 import logging
 import math
 import os
+import threading
 import time
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
@@ -27,6 +28,38 @@ from typing import Any, Callable, Dict, List
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 
 logger = logging.getLogger(__name__)
+
+_DEADLINE_CLOSURE_FLUSH_SECONDS = 0.25
+
+
+def _persist_codex_deadline_closure(agent, messages, text: str) -> bool:
+    """Close and durably flush an expired Codex turn without duplicate rows."""
+    closure = {"role": "assistant", "content": text}
+    if not messages or messages[-1] != closure:
+        messages.append(closure)
+
+    if getattr(agent, "_session_db", None) is None:
+        return False
+
+    finished = threading.Event()
+    outcome: Dict[str, Any] = {}
+
+    def _flush() -> None:
+        try:
+            outcome["ok"] = agent._flush_messages_to_session_db(messages) is not False
+        except Exception:
+            logger.warning("codex app-server deadline-closure flush failed", exc_info=True)
+            outcome["ok"] = False
+        finally:
+            finished.set()
+
+    threading.Thread(
+        target=_flush,
+        name="hermes-codex-deadline-flush",
+        daemon=True,
+    ).start()
+    finished.wait(timeout=_DEADLINE_CLOSURE_FLUSH_SECONDS)
+    return finished.is_set() and bool(outcome.get("ok"))
 
 
 def _coerce_usage_int(value: Any) -> int:
@@ -742,16 +775,22 @@ def run_codex_app_server_turn(
         )
         if _user_interrupted:
             agent.clear_interrupt()
+        _final_response = (
+            "Stopped this run because the configured whole-turn wall-clock "
+            "budget was reached (wall_clock_budget_reached)."
+            if _wall_clock_stopped
+            else (
+                f"Codex app-server turn failed: {exc}. "
+                f"Fall back to default runtime with `/codex-runtime auto`."
+            )
+        )
+        _deadline_persisted = (
+            _persist_codex_deadline_closure(agent, messages, _final_response)
+            if _wall_clock_stopped
+            else False
+        )
         return {
-            "final_response": (
-                "Stopped this run because the configured whole-turn wall-clock "
-                "budget was reached (wall_clock_budget_reached)."
-                if _wall_clock_stopped
-                else (
-                    f"Codex app-server turn failed: {exc}. "
-                    f"Fall back to default runtime with `/codex-runtime auto`."
-                )
-            ),
+            "final_response": _final_response,
             "messages": messages,
             "api_calls": 0,
             "completed": False,
@@ -763,6 +802,7 @@ def run_codex_app_server_turn(
                 else {}
             ),
             "error": "wall_clock_budget_reached" if _wall_clock_stopped else str(exc),
+            **({"agent_persisted": True} if _deadline_persisted else {}),
         }
 
     # This runtime bypasses the normal conversation-loop finalizer. Mirror its

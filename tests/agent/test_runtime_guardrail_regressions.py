@@ -21,12 +21,12 @@ def test_terminal_deadline_preserves_omitted_default_until_it_is_stricter():
     assert 0 < bounded["timeout"] <= 0.5
 
 
-def test_terminal_deadline_never_injects_timeout_above_foreground_maximum():
+def test_terminal_deadline_preserves_explicit_timeout_above_stock_maximum():
     agent = SimpleNamespace(_turn_deadline_monotonic=time.monotonic() + 900)
     bounded = _apply_tool_transport_deadline(
         agent, "terminal", {"command": "true", "timeout": 800}
     )
-    assert bounded["timeout"] <= 600
+    assert bounded["timeout"] == 800
 
 
 def test_repeated_error_signature_includes_tool_identity_and_normalized_args():
@@ -102,3 +102,20 @@ def test_whole_turn_deadline_bounds_blocked_finalization_and_fences_next_turn(mo
     worker = agent._deadline_turn_worker
     worker.join(timeout=1)
     assert not worker.is_alive()
+
+
+def test_whole_turn_deadline_rejects_result_finished_during_handoff(monkeypatch):
+    def _late_inner(agent, *args, **kwargs):
+        time.sleep(0.03)
+        return {"final_response": "late success", "messages": []}
+
+    monkeypatch.setattr(conversation_loop, "_run_conversation_inner", _late_inner)
+    agent = MagicMock()
+    agent.max_wall_clock_seconds = 0.01
+    agent._interrupt_requested = False
+
+    result = conversation_loop.run_conversation(agent, "hello")
+
+    assert result["failed"] is True
+    assert result["turn_exit_reason"] == "wall_clock_budget_reached"
+    assert result["final_response"] != "late success"

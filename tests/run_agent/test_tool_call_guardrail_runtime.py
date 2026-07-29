@@ -211,6 +211,44 @@ def test_sequential_blocking_tool_returns_at_whole_turn_deadline_without_late_ou
     assert "tool.completed" not in completed
 
 
+def test_sequential_worker_stops_all_projections_when_flush_crosses_deadline():
+    agent = _make_agent("web_search")
+    flush_entered = threading.Event()
+    release_flush = threading.Event()
+    progress = []
+    completed = []
+    steer = []
+    agent._turn_deadline_monotonic = time.monotonic() + 0.1
+    agent.tool_progress_callback = lambda event, *_a, **_k: progress.append(event)
+    agent.tool_complete_callback = lambda *args, **kwargs: completed.append((args, kwargs))
+    agent._apply_pending_steer_to_tool_results = lambda *args: steer.append(args)
+
+    def _blocking_flush(_messages):
+        flush_entered.set()
+        release_flush.wait(timeout=2)
+        return True
+
+    agent._flush_messages_to_session_db = _blocking_flush
+    tc = _mock_tool_call("web_search", '{"query":"fast"}', "c-flush-deadline")
+    messages = []
+
+    with patch("run_agent.handle_function_call", return_value="result"):
+        agent._execute_tool_calls_sequential(
+            SimpleNamespace(content="", tool_calls=[tc]), messages, "task-1"
+        )
+        assert flush_entered.is_set()
+        # A cached gateway agent can already own a fresh mutable deadline. The
+        # abandoned worker must still honor its private originating fence.
+        agent._turn_deadline_monotonic = time.monotonic() + 30
+        release_flush.set()
+        time.sleep(0.1)
+
+    assert "tool.completed" not in progress
+    assert "tool.output_risk" not in progress
+    assert completed == []
+    assert steer == []
+
+
 def test_sequential_deadline_worker_receives_interrupt_and_clears_targeted_bit():
     from tools.interrupt import _interrupted_threads, _lock, is_interrupted
 

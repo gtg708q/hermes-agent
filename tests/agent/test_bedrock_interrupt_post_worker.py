@@ -137,3 +137,33 @@ def test_bedrock_deadline_fences_worker_callbacks_after_bounded_return():
 
     assert elapsed < 0.3
     assert deltas == []
+
+
+def test_bedrock_deadline_fences_worker_before_late_stream_writer_claim():
+    agent = _FakeAgent()
+    agent._turn_deadline_monotonic = time.monotonic() + 0.05
+    release = threading.Event()
+    claims = []
+
+    def _blocking_converse_stream(**_kwargs):
+        release.wait(timeout=2)
+        return {"stream": []}
+
+    fake_client = SimpleNamespace(converse_stream=_blocking_converse_stream)
+    with patch("agent.bedrock_adapter._get_bedrock_runtime_client", return_value=fake_client), \
+         patch("agent.bedrock_adapter.stream_converse_with_callbacks") as stream_callbacks, \
+         patch("agent.bedrock_adapter.is_stale_connection_error", return_value=False), \
+         patch("agent.bedrock_adapter.is_streaming_access_denied_error", return_value=False), \
+         patch("agent.bedrock_adapter.invalidate_runtime_client", lambda *a, **k: None), \
+         patch("agent.chat_completion_helpers.claim_stream_writer", side_effect=lambda _agent: claims.append("old")):
+        with pytest.raises(Exception, match="wall_clock_budget_reached"):
+            cch.interruptible_streaming_api_call(
+                agent,
+                {"__bedrock_region__": "us-east-1", "__bedrock_converse__": True},
+            )
+        agent._turn_deadline_monotonic = time.monotonic() + 30
+        release.set()
+        time.sleep(0.1)
+
+    assert claims == []
+    stream_callbacks.assert_not_called()

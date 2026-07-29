@@ -99,7 +99,7 @@ _MAX_TOOL_WORKERS = 8
 # guard does not preempt a slow-but-valid summarization attempt.
 _DEFAULT_CONCURRENT_TOOL_TIMEOUT_S = 420.0
 _TERMINAL_DEFAULT_FOREGROUND_TIMEOUT_S = 180.0
-_TERMINAL_MAX_FOREGROUND_TIMEOUT_S = 600.0
+
 
 
 def _parse_tool_arguments(raw_arguments: Any) -> tuple[dict, Optional[str]]:
@@ -166,7 +166,7 @@ def _apply_tool_transport_deadline(agent, name: str, args: dict) -> dict:
             configured = _TERMINAL_DEFAULT_FOREGROUND_TIMEOUT_S
         args["timeout"] = max(
             0.01,
-            min(configured, remaining, _TERMINAL_MAX_FOREGROUND_TIMEOUT_S),
+            min(configured, remaining),
         )
     elif name == "process":
         args = dict(args)
@@ -230,6 +230,17 @@ def _flush_session_db_after_tool_progress(
         # exactly the blocking operation the whole-turn deadline must bound.
         return True
     return _persist()
+
+
+def _private_tool_deadline_expired(messages: list) -> bool:
+    """Check the immutable deadline/fence captured by a bounded tool worker."""
+    deadline_fence = getattr(messages, "_deadline_fence", None)
+    if deadline_fence is not None and deadline_fence.is_set():
+        return True
+    deadline = getattr(messages, "_deadline", None)
+    return bool(
+        isinstance(deadline, (int, float)) and time.monotonic() >= deadline
+    )
 
 
 def _ra():
@@ -1984,6 +1995,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             stage=f"tool result {function_name}",
         ):
             return
+        # Persistence itself may block past the public turn boundary. Recheck
+        # the private worker's immutable fence immediately on return; the
+        # mutable agent deadline may already belong to a newer cached turn.
+        if _private_tool_deadline_expired(messages):
+            return
 
         # UI completion/progress events are projections of the canonical tool
         # row, never a competing in-memory authority.
@@ -1999,7 +2015,6 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
         if (
             not _execution_blocked
-            and _turn_deadline_remaining(agent) != 0
             and agent.tool_complete_callback
         ):
             try:

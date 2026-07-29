@@ -29,6 +29,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 from agent.codex_runtime import run_codex_app_server_turn
+from agent.errors import TurnWallClockExceeded
 from hermes_state import SessionDB
 from run_agent import AIAgent
 
@@ -73,6 +74,31 @@ def test_codex_success_flushes_and_reports_persisted():
     )
     assert result["completed"] is True
     # With the agent as sole persister, the gateway must SKIP its DB write.
+    assert result["agent_persisted"] is True
+
+
+def test_codex_deadline_appends_and_persists_assistant_closure():
+    agent = _make_agent(session_db=object())
+    agent._turn_deadline_monotonic = 1.0
+    agent._codex_session.run_turn.side_effect = TurnWallClockExceeded(
+        "wall_clock_budget_reached"
+    )
+    messages = [{"role": "user", "content": "do not lose this boundary"}]
+
+    result = run_codex_app_server_turn(
+        agent,
+        user_message="do not lose this boundary",
+        original_user_message="do not lose this boundary",
+        messages=messages,
+        effective_task_id="task-deadline",
+    )
+
+    assert result["error"] == "wall_clock_budget_reached"
+    assert messages[-1] == {
+        "role": "assistant",
+        "content": result["final_response"],
+    }
+    agent._flush_messages_to_session_db.assert_called_once_with(messages)
     assert result["agent_persisted"] is True
 
 

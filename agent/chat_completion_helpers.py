@@ -2553,6 +2553,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
                 # Claim the delta sink for this bedrock stream (#65991) so a
                 # superseded attempt's callbacks are fenced by the sink guard.
+                # The socket call above can unblock after this turn already
+                # expired. Never let that stale worker supersede a newer turn's
+                # writer token before its callback fence gets a chance to run.
+                if not _bedrock_callback_allowed():
+                    return
                 claim_stream_writer(agent)
 
                 def _on_text(text):

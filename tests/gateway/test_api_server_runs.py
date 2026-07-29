@@ -14,7 +14,7 @@ import json
 import threading
 import time
 import uuid
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
@@ -906,6 +906,96 @@ class TestStartRun:
         assert kwargs["requested_model"] == "MiniMax-M3"
         assert kwargs["requested_provider"] == "minimax"
         assert kwargs["model_options"] == model_options
+
+
+    @pytest.mark.asyncio
+    async def test_overlapping_capacity_admission_selects_one_before_body_await(
+        self, adapter
+    ):
+        adapter._max_concurrent_runs = 1
+        app = _create_runs_app(adapter)
+        first_parse_entered = asyncio.Event()
+        release_parse = asyncio.Event()
+        original_read = adapter._read_json_body
+        parse_calls = 0
+
+        async def _blocked_read(request):
+            nonlocal parse_calls
+            parse_calls += 1
+            first_parse_entered.set()
+            await release_parse.wait()
+            return await original_read(request)
+
+        first_key = "capacity-first"
+        second_key = "capacity-second"
+        with patch.object(adapter, "_read_json_body", side_effect=_blocked_read), \
+             patch.object(adapter, "_create_agent") as create_agent:
+            agent = MagicMock()
+            agent.run_conversation.return_value = {"final_response": "done"}
+            agent.session_prompt_tokens = 0
+            agent.session_completion_tokens = 0
+            agent.session_total_tokens = 0
+            create_agent.return_value = agent
+            async with TestClient(TestServer(app)) as cli:
+                first_task = asyncio.create_task(
+                    cli.post(
+                        "/v1/runs",
+                        json={"input": "first"},
+                        headers=_idempotency_headers(first_key),
+                    )
+                )
+                await asyncio.wait_for(first_parse_entered.wait(), timeout=1)
+                second_task = asyncio.create_task(
+                    cli.post(
+                        "/v1/runs",
+                        json={"input": "second"},
+                        headers=_idempotency_headers(second_key),
+                    )
+                )
+                await asyncio.sleep(0.05)
+                second_finished_before_release = second_task.done()
+                release_parse.set()
+                first, second = await asyncio.gather(first_task, second_task)
+
+        assert second_finished_before_release is True
+        assert parse_calls == 1
+        assert first.status == 202
+        assert second.status == 429
+        assert adapter._response_store.get_run_status(
+            _derive_idempotent_run_id(second_key, None)
+        ) is None
+
+    @pytest.mark.asyncio
+    async def test_lease_heartbeat_loss_interrupts_agent_without_terminal_write(
+        self, adapter
+    ):
+        adapter._RUN_OWNER_HEARTBEAT_SECONDS = 0.01
+        app = _create_runs_app(adapter)
+        agent, ready, interrupted = _make_slow_agent()
+
+        with patch.object(adapter, "_create_agent", return_value=agent), \
+             patch.object(
+                 adapter._response_store, "renew_run_lease", return_value=False
+             ) as renew, \
+             patch.object(
+                 adapter, "_set_terminal_run_status", new_callable=AsyncMock
+             ) as terminal_write:
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await response.json())["run_id"]
+                assert await asyncio.to_thread(ready.wait, 1)
+                for _ in range(50):
+                    if interrupted.is_set() and run_id not in adapter._active_run_tasks:
+                        break
+                    await asyncio.sleep(0.01)
+
+        renew.assert_called()
+        agent.interrupt.assert_called_once_with(
+            "Durable run lease ownership was lost"
+        )
+        terminal_write.assert_not_awaited()
+        assert run_id not in adapter._active_run_tasks
+        assert run_id not in adapter._active_run_agents
 
 
 # ---------------------------------------------------------------------------

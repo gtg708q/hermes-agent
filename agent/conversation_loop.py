@@ -7115,10 +7115,18 @@ def run_conversation(agent, *args: Any, **kwargs: Any) -> Dict[str, Any]:
     worker.start()
     finished.wait(timeout=max(0.0, deadline - time.monotonic()))
 
-    if finished.is_set():
+    def _finished_on_time() -> bool:
+        finished_at = outcome.get("finished_at")
+        return bool(
+            finished.is_set()
+            and isinstance(finished_at, (int, float))
+            and finished_at <= deadline
+        )
+
+    if _finished_on_time():
         # The inner loop may itself cross the fence and synchronously persist a
-        # deadline result just as the wait expires. Prefer that canonical,
-        # fully-finalized result whenever it is already available.
+        # deadline result just as the wait expires. Accept only a result whose
+        # worker-recorded completion timestamp stayed inside the absolute bound.
         if "error" in outcome:
             raise outcome["error"]
         return outcome["result"]
@@ -7139,10 +7147,29 @@ def run_conversation(agent, *args: Any, **kwargs: Any) -> Dict[str, Any]:
     # Do not join indefinitely: a wedged filesystem/SQLite call must not hold
     # the caller forever, and the live worker remains recorded to fence turns.
     finished.wait(timeout=_DEADLINE_FINALIZATION_HANDOFF_SECONDS)
-    if finished.is_set():
+    if _finished_on_time():
         if "error" in outcome:
             raise outcome["error"]
         return outcome["result"]
+
+    # A canonical inner finalizer that completed after the absolute timestamp
+    # fence may still have durably closed the user/assistant boundary. Never
+    # accept a late successful result, but preserve an already-persisted
+    # deadline failure instead of replacing it with an empty transcript that
+    # makes the user turn replayable on resume.
+    late_result = outcome.get("result")
+    if (
+        finished.is_set()
+        and isinstance(late_result, dict)
+        and late_result.get("turn_exit_reason") == "wall_clock_budget_reached"
+        and late_result.get("failed") is True
+        and isinstance(late_result.get("messages"), list)
+        and late_result["messages"]
+        and late_result["messages"][-1].get("role") == "assistant"
+        and late_result["messages"][-1].get("content")
+        == late_result.get("final_response")
+    ):
+        return late_result
 
     text = (
         "Stopped this run because the configured whole-turn wall-clock budget "
