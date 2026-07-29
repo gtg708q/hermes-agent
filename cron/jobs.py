@@ -2377,9 +2377,8 @@ def gc_orphaned_output(
         return 0
 
     output_dir = get_cron_output_dir()
-    marker = output_dir / ".orphan-gc"
+    marker = output_dir / ".orphan-gc.json"
     now = time.time()
-    cutoff = now - retention_days * 86400
     try:
         if marker.is_symlink():
             return 0
@@ -2389,36 +2388,74 @@ def gc_orphaned_output(
         # jobs store must neither delete every output directory nor suppress a
         # repaired retry for the full GC interval.
         live_ids = {str(job.get("id")) for job in load_jobs() if job.get("id")}
+        try:
+            state = json.loads(marker.read_text(encoding="utf-8")) if marker.is_file() else {}
+        except (OSError, ValueError, TypeError):
+            state = {}
+        cursor = max(0, int(state.get("cursor", 0) or 0))
+        first_seen = {
+            str(name): float(seen)
+            for name, seen in (state.get("first_seen") or {}).items()
+            if isinstance(name, str) and isinstance(seen, (int, float))
+        }
+
+        # os.scandir is lazy: only the selected page receives stat/is_dir work.
+        # Persisting an offset rotates pages so a stable fresh prefix cannot
+        # starve stale entries later in a large output store.
+        page = []
+        reached_end = True
+        with os.scandir(output_dir) as entries:
+            for index, entry in enumerate(entries):
+                if index < cursor:
+                    continue
+                if len(page) >= max_directories:
+                    reached_end = False
+                    break
+                page.append(entry)
+        next_cursor = 0 if reached_end else cursor + len(page)
+
         candidates = []
-        # Apply the per-pass budget only after filtering for stale orphans.
-        # Capping the alphabetic orphan list first lets a stable prefix of fresh
-        # directories permanently starve stale entries later in the scan.
-        for path in sorted(output_dir.iterdir(), key=lambda item: item.name):
-            if path.name == marker.name or path.name in live_ids:
+        for entry in page:
+            name = entry.name
+            if name in {marker.name, ".orphan-gc"} or name in live_ids:
+                first_seen.pop(name, None)
                 continue
             try:
-                if path.is_symlink() or not path.is_dir():
-                    continue
-                if path.stat().st_mtime > cutoff:
+                if entry.is_symlink() or not entry.is_dir(follow_symlinks=False):
+                    first_seen.pop(name, None)
                     continue
             except OSError as exc:
-                logger.debug("Failed to inspect orphaned cron output %s: %s", path, exc)
+                logger.debug("Failed to inspect orphaned cron output %s: %s", name, exc)
                 continue
-            candidates.append(path)
-            if len(candidates) >= max_directories:
-                break
-        marker.touch(exist_ok=True)
+            seen_at = first_seen.setdefault(name, now)
+            if now - seen_at >= retention_days * 86400:
+                candidates.append(Path(entry.path))
+
+        state = {"cursor": next_cursor, "first_seen": first_seen}
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(output_dir), prefix=".orphan-gc-", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(state, handle, sort_keys=True)
+                handle.flush()
+                os.fsync(handle.fileno())
+            atomic_replace(tmp_name, marker)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_name)
+            raise
     except (OSError, ValueError, TypeError, RuntimeError):
         return 0
+
     removed = 0
     for path in candidates:
         try:
             if path.name in live_ids or not path.is_dir() or path.is_symlink():
                 continue
-            if path.stat().st_mtime > cutoff:
-                continue
             shutil.rmtree(path)
             removed += 1
+            first_seen.pop(path.name, None)
         except OSError as exc:
             logger.debug("Failed to prune orphaned cron output %s: %s", path, exc)
     return removed

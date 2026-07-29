@@ -1812,22 +1812,30 @@ class TestCronOutputRetention:
         )
         assert jobs._cron_output_keep() == jobs._CRON_OUTPUT_DEFAULT_KEEP
 
-    def test_gc_orphaned_output_removes_only_stale_unknown_jobs(self, tmp_cron_dir):
-        from cron.jobs import gc_orphaned_output, get_cron_output_dir, save_jobs
+    def test_gc_orphaned_output_ages_orphans_from_first_observation(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        from cron import jobs
 
-        output = get_cron_output_dir()
-        save_jobs([{"id": "live", "name": "live"}])
+        output = jobs.get_cron_output_dir()
+        jobs.save_jobs([{"id": "live", "name": "live"}])
         for name in ("live", "fresh-orphan", "stale-orphan"):
             d = output / name
             d.mkdir(parents=True)
             (d / "run.md").write_text("output")
         stale = output / "stale-orphan"
-        old = time.time() - 10 * 86400
+        observed_at = 1_000_000.0
+        old = observed_at - 10 * 86400
         os.utime(stale, (old, old))
 
-        assert gc_orphaned_output(retention_days=7) == 1
+        monkeypatch.setattr(jobs.time, "time", lambda: observed_at)
+        assert jobs.gc_orphaned_output(retention_days=7, interval_seconds=0) == 0
+        assert stale.exists()
+
+        monkeypatch.setattr(jobs.time, "time", lambda: observed_at + 8 * 86400)
+        assert jobs.gc_orphaned_output(retention_days=7, interval_seconds=0) == 2
         assert (output / "live").exists()
-        assert (output / "fresh-orphan").exists()
+        assert not (output / "fresh-orphan").exists()
         assert not stale.exists()
 
     def test_gc_orphaned_output_fails_closed_on_corrupt_jobs_store(self, tmp_cron_dir):
@@ -1842,7 +1850,7 @@ class TestCronOutputRetention:
 
         assert jobs.gc_orphaned_output(retention_days=0, interval_seconds=3600) == 0
         assert orphan.exists()
-        assert not (output / ".orphan-gc").exists()
+        assert not (output / ".orphan-gc.json").exists()
 
     @pytest.mark.skipif(
         os.name == "nt", reason="Creating symlinks requires elevated privileges on Windows"
@@ -1872,7 +1880,7 @@ class TestCronOutputRetention:
         os.utime(first, (old, old))
 
         assert gc_orphaned_output(retention_days=0, interval_seconds=3600) == 1
-        marker = output / ".orphan-gc"
+        marker = output / ".orphan-gc.json"
         marker_mtime = marker.stat().st_mtime
 
         second = output / "second"
@@ -1900,10 +1908,10 @@ class TestCronOutputRetention:
             gc_orphaned_output(
                 retention_days=0, interval_seconds=0, max_directories=1
             )
-            for _ in range(3)
+            for _ in range(len(live_ids) + len(orphans))
         ]
 
-        assert removed == [1, 1, 1]
+        assert sum(removed) == 3
         assert all((output / job_id).is_dir() for job_id in live_ids)
         assert all(not orphan.exists() for orphan in orphans)
 
@@ -1919,9 +1927,13 @@ class TestCronOutputRetention:
         old = time.time() - 10 * 86400
         os.utime(stale, (old, old))
 
-        assert gc_orphaned_output(
-            retention_days=7, interval_seconds=0, max_directories=1
-        ) == 1
+        removed = [
+            gc_orphaned_output(
+                retention_days=0, interval_seconds=0, max_directories=1
+            )
+            for _ in range(14)
+        ]
+        assert sum(removed) == 6
         assert not stale.exists()
 
 
