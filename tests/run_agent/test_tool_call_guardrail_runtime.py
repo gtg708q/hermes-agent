@@ -211,6 +211,88 @@ def test_sequential_blocking_tool_returns_at_whole_turn_deadline_without_late_ou
     assert "tool.completed" not in completed
 
 
+def test_sequential_abandoned_worker_stays_fenced_until_exit_then_cleans_up():
+    from tools.interrupt import is_interrupted
+
+    agent = _make_agent("web_search")
+    started = threading.Event()
+    release = threading.Event()
+    exited = threading.Event()
+    observed = []
+    agent._turn_deadline_monotonic = time.monotonic() + 0.05
+    tc = _mock_tool_call("web_search", '{"query":"slow"}', "c-fenced-sequential")
+
+    def _blocking_call(*_args, **_kwargs):
+        started.set()
+        release.wait(timeout=2)
+        observed.append(is_interrupted())
+        exited.set()
+        return "late"
+
+    try:
+        with patch("run_agent.handle_function_call", side_effect=_blocking_call):
+            agent._execute_tool_calls_sequential(
+                SimpleNamespace(content="", tool_calls=[tc]), [], "task-1"
+            )
+            assert started.is_set()
+            assert agent._tool_worker_threads
+            agent.clear_interrupt()
+            assert agent._interrupt_requested is True
+            release.set()
+            assert exited.wait(timeout=1)
+    finally:
+        release.set()
+
+    deadline = time.monotonic() + 1
+    while agent._tool_worker_threads and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert observed == [True]
+    assert agent._tool_worker_threads == set()
+    assert agent._interrupt_requested is False
+
+
+def test_concurrent_abandoned_worker_cleanup_does_not_clear_newer_interrupt():
+    from tools.interrupt import is_interrupted
+
+    agent = _make_agent("web_search")
+    started = threading.Event()
+    release = threading.Event()
+    exited = threading.Event()
+    observed = []
+    agent._turn_deadline_monotonic = time.monotonic() + 0.05
+    tc = _mock_tool_call("web_search", '{"query":"slow"}', "c-fenced-concurrent")
+
+    def _blocking_call(*_args, **_kwargs):
+        started.set()
+        release.wait(timeout=2)
+        observed.append(is_interrupted())
+        exited.set()
+        return "late"
+
+    try:
+        with patch.object(agent, "_invoke_tool", side_effect=_blocking_call):
+            agent._execute_tool_calls_concurrent(
+                SimpleNamespace(content="", tool_calls=[tc]), [], "task-1"
+            )
+            assert started.is_set()
+            assert agent._tool_worker_threads
+            agent.clear_interrupt()
+            agent.interrupt("newer unrelated stop")
+            release.set()
+            assert exited.wait(timeout=1)
+
+        deadline = time.monotonic() + 1
+        while agent._tool_worker_threads and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert observed == [True]
+        assert agent._tool_worker_threads == set()
+        assert agent._interrupt_requested is True
+        assert agent._interrupt_message == "newer unrelated stop"
+    finally:
+        release.set()
+        agent.clear_interrupt()
+
+
 def test_sequential_worker_stops_all_projections_when_flush_crosses_deadline():
     agent = _make_agent("web_search")
     flush_entered = threading.Event()

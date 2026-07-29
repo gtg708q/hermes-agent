@@ -249,6 +249,29 @@ def _ra():
     return run_agent
 
 
+def _release_tool_worker_interrupt(agent, worker_tid: int) -> None:
+    """Drop one worker tid and clear a deferred turn fence after the last exit."""
+    fence_generation = None
+    with agent._tool_worker_threads_lock:
+        agent._tool_worker_threads.discard(worker_tid)
+        clear_deferred_fence = (
+            not agent._tool_worker_threads
+            and bool(getattr(agent, "_tool_worker_interrupt_fenced", False))
+        )
+        if clear_deferred_fence:
+            agent._tool_worker_interrupt_fenced = False
+            fence_generation = getattr(
+                agent, "_tool_worker_interrupt_fence_generation", None
+            )
+            agent._tool_worker_interrupt_fence_generation = None
+    try:
+        _ra()._set_interrupt(False, worker_tid)
+    except Exception:
+        pass
+    if clear_deferred_fence:
+        agent.clear_interrupt(_expected_interrupt_generation=fence_generation)
+
+
 def _is_interpreter_shutdown_submit_error(exc: RuntimeError) -> bool:
     return "cannot schedule new futures after interpreter shutdown" in str(exc)
 
@@ -728,7 +751,7 @@ def _execute_tool_calls_concurrent_inline(agent, assistant_message, messages: li
         # Register this worker tid so the agent can fan out an interrupt
         # to it — see AIAgent.interrupt().  Must happen first thing, and
         # must be paired with discard + clear in the finally block.
-        _worker_tid = threading.current_thread().ident
+        _worker_tid = threading.get_ident()
         with agent._tool_worker_threads_lock:
             agent._tool_worker_threads.add(_worker_tid)
         # Race: if the agent was interrupted between fan-out (which
@@ -839,12 +862,7 @@ def _execute_tool_calls_concurrent_inline(agent, assistant_message, messages: li
             # because BaseException subclasses (CancelledError, KeyboardInterrupt)
             # bypass ``except Exception`` and would otherwise leak the tid
             # into _interrupted_threads, poisoning the recycled thread.
-            with agent._tool_worker_threads_lock:
-                agent._tool_worker_threads.discard(_worker_tid)
-            try:
-                _ra()._set_interrupt(False, _worker_tid)
-            except Exception:
-                pass
+            _release_tool_worker_interrupt(agent, _worker_tid)
 
     # Start spinner for CLI mode (skip when TUI handles tool progress)
     spinner = None
@@ -2190,12 +2208,7 @@ def execute_tool_calls_concurrent(
         except BaseException as exc:
             outcome["error"] = exc
         finally:
-            with agent._tool_worker_threads_lock:
-                agent._tool_worker_threads.discard(worker_tid)
-            try:
-                _ra()._set_interrupt(False, worker_tid)
-            except Exception:
-                pass
+            _release_tool_worker_interrupt(agent, worker_tid)
             outcome["finished_at"] = time.monotonic()
             finished.set()
 
@@ -2339,12 +2352,7 @@ def _execute_tool_calls_sequential_bounded(agent, assistant_message, messages: l
         except BaseException as exc:
             outcome["error"] = exc
         finally:
-            with agent._tool_worker_threads_lock:
-                agent._tool_worker_threads.discard(worker_tid)
-            try:
-                _ra()._set_interrupt(False, worker_tid)
-            except Exception:
-                pass
+            _release_tool_worker_interrupt(agent, worker_tid)
             outcome["finished_at"] = time.monotonic()
             finished.set()
 

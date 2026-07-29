@@ -830,6 +830,9 @@ def init_agent(
     # their tids explicitly.
     agent._tool_worker_threads: set[int] = set()
     agent._tool_worker_threads_lock = threading.Lock()
+    agent._tool_worker_interrupt_fenced = False
+    agent._tool_worker_interrupt_fence_generation = None
+    agent._interrupt_generation = 0
     
     # Subagent delegation state
     agent._delegate_depth = 0        # 0 = top-level agent, incremented for children

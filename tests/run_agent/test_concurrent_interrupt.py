@@ -120,10 +120,8 @@ def test_concurrent_preflight_interrupt_skips_all(monkeypatch):
 
 
 
-def test_clear_interrupt_clears_worker_tids(monkeypatch):
-    """After clear_interrupt(), stale worker-tid bits must be cleared so the
-    next turn's tools — which may be scheduled onto recycled tids — don't
-    see a false interrupt."""
+def test_clear_interrupt_preserves_live_worker_fence(monkeypatch):
+    """Finalization must not unfence a still-live abandoned tool worker."""
     from tools.interrupt import is_interrupted, set_interrupt
 
     agent = _make_agent(monkeypatch)
@@ -138,8 +136,13 @@ def test_clear_interrupt_clears_worker_tids(monkeypatch):
 
     agent.clear_interrupt()
 
-    assert is_interrupted() is False, (
-        "clear_interrupt() did not clear the interrupt bit for a tracked "
-        "worker tid — stale interrupt can leak into the next turn"
-    )
+    assert is_interrupted() is True
+    assert agent._interrupt_requested is True
+
+    # Do not leak the simulated worker/main-thread bit into later tests.
+    with agent._tool_worker_threads_lock:
+        agent._tool_worker_threads.discard(fake_tid)
+    set_interrupt(False, fake_tid)
+    agent.clear_interrupt()
+    assert is_interrupted() is False
 

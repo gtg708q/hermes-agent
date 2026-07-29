@@ -2898,10 +2898,14 @@ class AIAgent:
         _redirect_lock = getattr(self, "_pending_redirect_lock", None)
         if _redirect_lock is not None:
             with _redirect_lock:
+                self._interrupt_generation = (
+                    getattr(self, "_interrupt_generation", 0) + 1
+                )
                 self._interrupt_requested = True
                 self._interrupt_message = message
                 self._pending_redirect = None
         else:
+            self._interrupt_generation = getattr(self, "_interrupt_generation", 0) + 1
             self._interrupt_requested = True
             self._interrupt_message = message
             self._pending_redirect = None
@@ -2973,16 +2977,49 @@ class AIAgent:
         if not self.quiet_mode:
             print("\n⚡ Interrupt requested" + (f": '{message[:40]}...'" if message and len(message) > 40 else f": '{message}'" if message else ""))
 
-    def clear_interrupt(self, *, preserve_redirect: bool = False) -> bool:
+    def clear_interrupt(
+        self,
+        *,
+        preserve_redirect: bool = False,
+        _expected_interrupt_generation: Optional[int] = None,
+    ) -> bool:
         """Clear the interrupt request and per-thread tool signal.
 
         ``preserve_redirect`` is used only by the conversation loop after it
         intentionally cancels a model request to rebuild that same logical
         turn. Public hard-stop paths keep the default and clear everything.
         """
+        # Finalization must not unfence a deadline-abandoned tool worker. Keep
+        # its targeted bit and the agent-wide next-turn fence until the last
+        # tracked worker exits and performs deferred cleanup.
+        _tracker = getattr(self, "_tool_worker_threads", None)
+        _tracker_lock = getattr(self, "_tool_worker_threads_lock", None)
+        if _tracker is not None and _tracker_lock is not None:
+            with _tracker_lock:
+                _worker_tids = list(_tracker)
+                if _worker_tids:
+                    if not getattr(self, "_tool_worker_interrupt_fenced", False):
+                        self._tool_worker_interrupt_fenced = True
+                        self._tool_worker_interrupt_fence_generation = getattr(
+                            self, "_interrupt_generation", 0
+                        )
+                    self._interrupt_requested = True
+                    for _wtid in _worker_tids:
+                        try:
+                            _set_interrupt(True, _wtid)
+                        except Exception:
+                            pass
+                    return True
+
         _redirect_lock = getattr(self, "_pending_redirect_lock", None)
         if _redirect_lock is not None:
             with _redirect_lock:
+                if (
+                    _expected_interrupt_generation is not None
+                    and getattr(self, "_interrupt_generation", 0)
+                    != _expected_interrupt_generation
+                ):
+                    return False
                 if preserve_redirect and not self._pending_redirect:
                     return False
                 self._interrupt_requested = False
@@ -2990,6 +3027,12 @@ class AIAgent:
                 if not preserve_redirect:
                     self._pending_redirect = None
         else:
+            if (
+                _expected_interrupt_generation is not None
+                and getattr(self, "_interrupt_generation", 0)
+                != _expected_interrupt_generation
+            ):
+                return False
             if preserve_redirect and not getattr(self, "_pending_redirect", None):
                 return False
             self._interrupt_requested = False
@@ -3000,23 +3043,7 @@ class AIAgent:
         execution_thread_id = getattr(self, "_execution_thread_id", None)
         if isinstance(execution_thread_id, int):
             _set_interrupt(False, execution_thread_id)
-        # Also clear any concurrent-tool worker thread bits.  Tracked
-        # workers normally clear their own bit on exit, but an explicit
-        # clear here guarantees no stale interrupt can survive a turn
-        # boundary and fire on a subsequent, unrelated tool call that
-        # happens to get scheduled onto the same recycled worker tid.
-        # `getattr` fallback covers test stubs that build AIAgent via
-        # object.__new__ and skip __init__.
-        _tracker = getattr(self, "_tool_worker_threads", None)
-        _tracker_lock = getattr(self, "_tool_worker_threads_lock", None)
-        if _tracker is not None and _tracker_lock is not None:
-            with _tracker_lock:
-                _worker_tids = list(_tracker)
-            for _wtid in _worker_tids:
-                try:
-                    _set_interrupt(False, _wtid)
-                except Exception:
-                    pass
+        self._tool_worker_interrupt_fenced = False
         # A hard interrupt supersedes any pending /steer — the steer was
         # meant for the agent's next tool-call iteration, which will no
         # longer happen. Drop it instead of surprising the user with a

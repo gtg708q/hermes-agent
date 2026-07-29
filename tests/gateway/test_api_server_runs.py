@@ -620,6 +620,86 @@ class TestStartRun:
         store.close()
 
     @pytest.mark.asyncio
+    async def test_stale_queued_recovery_reserves_capacity_before_body_parse(
+        self, tmp_path
+    ):
+        """A reclaimable queued row is execution work, not a replay-only drain."""
+        stale_key = "stale-queued-capacity"
+        new_key = "new-while-stale-parses"
+        stale_body = {"input": "recover me"}
+        stale_run_id = _derive_idempotent_run_id(stale_key, None)
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                {"body": stale_body, "gateway_session_key": None, "profile": "default"},
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        store = ResponseStore(db_path=str(tmp_path / "response-store.db"))
+        store.claim_run(
+            stale_run_id,
+            fingerprint,
+            {"run_id": stale_run_id, "status": "queued"},
+            owner_id="crashed-owner",
+            lease_seconds=30,
+            now=time.time() - 31,
+        )
+        metadata = store.get_run_claim_metadata(stale_run_id, profile="default")
+        assert metadata is not None
+        assert metadata["status"]["status"] == "queued"
+        assert metadata["lease_expires_at"] <= time.time()
+
+        adapter = _make_adapter()
+        adapter._response_store.close()
+        adapter._response_store = store
+        adapter._max_concurrent_runs = 1
+        app = _create_runs_app(adapter)
+        parse_started = asyncio.Event()
+        release_parse = asyncio.Event()
+        original_read = adapter._read_json_body
+
+        async def _blocked_stale_read(request):
+            if request.headers.get("Idempotency-Key") == stale_key:
+                parse_started.set()
+                await release_parse.wait()
+            return await original_read(request)
+
+        with patch.object(adapter, "_read_json_body", side_effect=_blocked_stale_read), \
+             patch.object(adapter, "_create_agent") as create_agent:
+            agent = MagicMock()
+            agent.run_conversation.return_value = {"final_response": "recovered"}
+            agent.session_prompt_tokens = 0
+            agent.session_completion_tokens = 0
+            agent.session_total_tokens = 0
+            create_agent.return_value = agent
+            async with TestClient(TestServer(app)) as cli:
+                stale_task = asyncio.create_task(cli.post(
+                    "/v1/runs", json=stale_body, headers=_idempotency_headers(stale_key)
+                ))
+                await asyncio.wait_for(parse_started.wait(), timeout=1)
+                new_response = await cli.post(
+                    "/v1/runs",
+                    json={"input": "new work"},
+                    headers=_idempotency_headers(new_key),
+                )
+                release_parse.set()
+                stale_response = await stale_task
+                for _ in range(20):
+                    if create_agent.called:
+                        break
+                    await asyncio.sleep(0.02)
+
+        assert new_response.status == 429
+        assert stale_response.status == 202
+        create_agent.assert_called_once()
+        durable = store.get_run_status(stale_run_id)
+        assert durable is not None
+        assert durable["status"] in {"queued", "running", "completed"}
+        store.close()
+
+    @pytest.mark.asyncio
     async def test_expired_running_claim_resolves_failed_without_execution(
         self, tmp_path
     ):
@@ -1260,7 +1340,7 @@ class TestStartRun:
 
         with patch.object(
             adapter._response_store,
-            "get_run_status",
+            "get_run_claim_metadata",
             side_effect=OSError("response store read failed"),
         ), patch.object(adapter, "_read_json_body", new_callable=AsyncMock) as read_body:
             async with TestClient(TestServer(app)) as cli:

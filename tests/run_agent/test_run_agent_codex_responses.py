@@ -3207,6 +3207,117 @@ def test_dump_api_request_debug_count_limit_is_thread_safe(monkeypatch, tmp_path
     assert len(list(tmp_path.glob("request_dump_*.json"))) == 1
 
 
+def test_dump_api_request_cleanup_bounds_metadata_io_per_call(monkeypatch, tmp_path):
+    """A huge legacy backlog must not make one provider failure scan everything."""
+    _patch_agent_bootstrap(monkeypatch)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"sessions": {"request_dumps": {
+            "max_files": 5, "ttl_days": 30, "deduplicate_seconds": 3600,
+            "cleanup_scan_limit": 64,
+        }}},
+    )
+    for index in range(2000):
+        (tmp_path / f"request_dump_legacy_{index:05d}.json").write_text(
+            json.dumps({"fingerprint": f"legacy-{index}"})
+        )
+
+    stat_calls = 0
+    read_calls = 0
+    original_stat = type(tmp_path).stat
+    original_read_text = type(tmp_path).read_text
+
+    def _counted_stat(path, *args, **kwargs):
+        nonlocal stat_calls
+        stat_calls += 1
+        return original_stat(path, *args, **kwargs)
+
+    def _counted_read(path, *args, **kwargs):
+        nonlocal read_calls
+        read_calls += 1
+        return original_read_text(path, *args, **kwargs)
+
+    agent = run_agent.AIAgent(
+        model="gpt-4o", base_url="http://127.0.0.1:9208/v1",
+        api_key="test-key", quiet_mode=True, max_iterations=1,
+        skip_context_files=True, skip_memory=True,
+    )
+    agent.logs_dir = tmp_path
+    monkeypatch.setattr(type(tmp_path), "stat", _counted_stat)
+    monkeypatch.setattr(type(tmp_path), "read_text", _counted_read)
+    agent._dump_api_request_debug(
+        {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]},
+        reason="bounded-cleanup", error=RuntimeError("bounded-cleanup"),
+    )
+
+    assert stat_calls <= 130
+    assert read_calls <= 64
+
+
+def test_dump_api_request_cleanup_repeated_bounded_passes_converge(monkeypatch, tmp_path):
+    _patch_agent_bootstrap(monkeypatch)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"sessions": {"request_dumps": {
+            "max_files": 5, "ttl_days": 30, "deduplicate_seconds": 0,
+            "cleanup_scan_limit": 32,
+        }}},
+    )
+    for index in range(500):
+        (tmp_path / f"request_dump_legacy_{index:05d}.json").write_text("{}")
+    agent = run_agent.AIAgent(
+        model="gpt-4o", base_url="http://127.0.0.1:9208/v1",
+        api_key="test-key", quiet_mode=True, max_iterations=1,
+        skip_context_files=True, skip_memory=True,
+    )
+    agent.logs_dir = tmp_path
+    kwargs = {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}
+
+    for index in range(40):
+        agent._dump_api_request_debug(
+            kwargs, reason=f"pass-{index}", error=RuntimeError(f"pass-{index}")
+        )
+
+    assert len(list(tmp_path.glob("request_dump_*.json"))) <= 5
+
+
+@pytest.mark.parametrize("scanner_error", [False, True])
+def test_dump_api_request_cleanup_closes_terminal_scan_state(
+    monkeypatch, tmp_path, scanner_error
+):
+    from agent import agent_runtime_helpers as helpers
+
+    class _TerminalScanner:
+        def __init__(self):
+            self.closed = False
+
+        def __next__(self):
+            if scanner_error:
+                raise OSError("directory scan failed")
+            raise StopIteration
+
+        def close(self):
+            self.closed = True
+
+    scanner = _TerminalScanner()
+    monkeypatch.setattr(helpers.os, "scandir", lambda _path: scanner)
+
+    wrote = helpers._write_bounded_request_dump(
+        logs_dir=tmp_path,
+        dump_file=tmp_path / "request_dump_new.json",
+        payload={"fingerprint": "new"},
+        max_files=0,
+        max_bytes=1024,
+        ttl_days=7,
+        dedup_seconds=0,
+        scan_limit=8,
+    )
+
+    assert wrote is False
+    assert scanner.closed is True
+    assert str(tmp_path.resolve()) not in helpers._REQUEST_DUMP_SCAN_STATES
+
+
 # --- Reasoning-only response tests (fix for empty content retry loop) ---
 
 

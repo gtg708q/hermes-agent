@@ -1086,6 +1086,30 @@ class ResponseStore:
         except (json.JSONDecodeError, TypeError):
             return None
 
+    def get_run_claim_metadata(
+        self, run_id: str, *, profile: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Return one locked snapshot of status and admission lease fields."""
+        with self._lock:
+            profile_clause = "" if profile is None else " AND profile = ?"
+            params: tuple[Any, ...] = (run_id,) if profile is None else (run_id, profile)
+            row = self._conn.execute(
+                """SELECT status_json, terminal_at, lease_expires_at
+                   FROM run_idempotency WHERE run_id = ?""" + profile_clause,
+                params,
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            status = json.loads(row[0])
+        except (json.JSONDecodeError, TypeError):
+            status = {}
+        return {
+            "status": status if isinstance(status, dict) else {},
+            "terminal_at": row[1],
+            "lease_expires_at": row[2],
+        }
+
     def delete_terminal_run(self, run_id: str, cutoff: float) -> None:
         with self._lock:
             self._conn.execute(
@@ -1282,10 +1306,22 @@ def _admit_api_agent_request(handler):
                 request_profile = _api_request_profile.get()
                 run_id = _derive_idempotent_run_id(idempotency_key, request_profile)
                 try:
-                    durable_replay = self._response_store.get_run_status(
+                    claim_metadata = self._response_store.get_run_claim_metadata(
                         run_id,
                         profile=_canonical_run_profile(request_profile),
-                    ) is not None
+                    )
+                    if claim_metadata is not None:
+                        durable_status = claim_metadata["status"]
+                        lease_expires_at = claim_metadata["lease_expires_at"]
+                        reclaimable_queued = (
+                            claim_metadata["terminal_at"] is None
+                            and durable_status.get("status") == "queued"
+                            and (
+                                lease_expires_at is None
+                                or float(lease_expires_at) <= time.time()
+                            )
+                        )
+                        durable_replay = not reclaimable_queued
                 except Exception as exc:
                     logger.exception(
                         "Failed to inspect durable run ownership for %s", run_id

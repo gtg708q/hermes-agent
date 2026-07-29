@@ -1708,6 +1708,9 @@ def extract_reasoning(agent, assistant_message) -> Optional[str]:
 
 
 _REQUEST_DUMP_THREAD_LOCK = threading.Lock()
+_REQUEST_DUMP_SCAN_STATES: Dict[str, Any] = {}
+_REQUEST_DUMP_SCAN_LIMIT_DEFAULT = 256
+_REQUEST_DUMP_SCAN_LIMIT_MAX = 4096
 
 
 @contextmanager
@@ -1760,26 +1763,56 @@ def _write_bounded_request_dump(
     max_bytes: int = 1_000_000,
     ttl_days: float,
     dedup_seconds: float,
+    scan_limit: int = _REQUEST_DUMP_SCAN_LIMIT_DEFAULT,
 ) -> bool:
-    """Atomically enforce TTL/dedupe/count policy and optionally write a dump."""
+    """Enforce retention using one bounded, resumable directory scan page."""
     with _request_dump_lock(logs_dir):
-        existing_files: List[Path] = []
+        scan_limit = min(
+            _REQUEST_DUMP_SCAN_LIMIT_MAX,
+            max(max_files + 1, 1, int(scan_limit)),
+        )
+        scan_key = str(logs_dir.resolve())
+        scanner = _REQUEST_DUMP_SCAN_STATES.get(scan_key)
+        if scanner is None:
+            scanner = os.scandir(logs_dir)
+            _REQUEST_DUMP_SCAN_STATES[scan_key] = scanner
+
+        existing_files: List[Tuple[Path, float]] = []
         duplicate = False
         now = time.time()
-        for existing in logs_dir.glob("request_dump_*.json"):
+        exhausted = False
+        for _ in range(scan_limit):
             try:
-                if not existing.is_file() or existing.is_symlink():
+                entry = next(scanner)
+            except StopIteration:
+                exhausted = True
+                break
+            except OSError:
+                exhausted = True
+                break
+            if not entry.name.startswith("request_dump_") or not entry.name.endswith(".json"):
+                continue
+            try:
+                if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
                     continue
-                age = now - existing.stat().st_mtime
+                existing = Path(entry.path)
+                mtime = entry.stat(follow_symlinks=False).st_mtime
+                age = now - mtime
                 if ttl_days > 0 and age > ttl_days * 86400:
                     existing.unlink()
                     continue
-                existing_files.append(existing)
+                existing_files.append((existing, mtime))
                 if dedup_seconds > 0 and age <= dedup_seconds:
                     prior = json.loads(existing.read_text(encoding="utf-8"))
                     duplicate = duplicate or prior.get("fingerprint") == payload["fingerprint"]
             except (OSError, ValueError, TypeError):
                 continue
+        if exhausted:
+            _REQUEST_DUMP_SCAN_STATES.pop(scan_key, None)
+            try:
+                scanner.close()
+            except Exception:
+                pass
 
         if max_files == 0:
             keep_count = 0
@@ -1792,15 +1825,15 @@ def _write_bounded_request_dump(
             if len(encoded) > max_bytes:
                 raise ValueError("request dump exceeds configured max_bytes")
             atomic_json_write(dump_file, payload, default=str)
-            existing_files.append(dump_file)
+            existing_files.append((dump_file, now))
             keep_count = max_files
 
-        bounded = sorted(
+        bounded_page = sorted(
             existing_files,
-            key=lambda path: path.stat().st_mtime,
+            key=lambda item: item[1],
             reverse=True,
         )
-        for stale in bounded[keep_count:]:
+        for stale, _mtime in bounded_page[keep_count:]:
             try:
                 stale.unlink()
             except OSError:
@@ -1915,13 +1948,21 @@ def dump_api_request_debug(
                 raise ValueError("request dump max_bytes is outside safe bounds")
             ttl_days = float(dump_cfg.get("ttl_days", 7))
             dedup_seconds = float(dump_cfg.get("deduplicate_seconds", 3600))
+            cleanup_scan_limit = int(dump_cfg.get(
+                "cleanup_scan_limit", _REQUEST_DUMP_SCAN_LIMIT_DEFAULT
+            ))
+            if cleanup_scan_limit <= 0:
+                raise ValueError("request dump cleanup_scan_limit must be positive")
+            cleanup_scan_limit = min(
+                cleanup_scan_limit, _REQUEST_DUMP_SCAN_LIMIT_MAX
+            )
             if not math.isfinite(ttl_days) or not math.isfinite(dedup_seconds):
                 raise ValueError("request dump retention values must be finite")
             ttl_days = max(0.0, ttl_days)
             dedup_seconds = max(0.0, dedup_seconds)
         except Exception:
-            max_files, max_bytes, ttl_days, dedup_seconds = (
-                20, 1_000_000, 7.0, 3600.0
+            max_files, max_bytes, ttl_days, dedup_seconds, cleanup_scan_limit = (
+                20, 1_000_000, 7.0, 3600.0, _REQUEST_DUMP_SCAN_LIMIT_DEFAULT
             )
 
         def _encoded_size(payload: Dict[str, Any]) -> int:
@@ -1977,6 +2018,7 @@ def dump_api_request_debug(
             max_bytes=max_bytes,
             ttl_days=ttl_days,
             dedup_seconds=dedup_seconds,
+            scan_limit=cleanup_scan_limit,
         )
         if not wrote_dump:
             return None
