@@ -19,6 +19,8 @@ import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 from run_agent import AIAgent
 
 from agent.chat_completion_helpers import (
@@ -134,6 +136,32 @@ def test_turn_deadline_caps_each_structured_request_timeout_phase():
     assert 0 < effective.read <= 1.0
     assert 0 < effective.write <= 1.0
     assert effective.pool == 0.2
+
+
+def test_direct_api_call_absolute_deadline_aborts_stalled_transport():
+    from agent.errors import TurnWallClockExceeded
+
+    agent = _make_agent()
+    agent._turn_deadline_monotonic = time.monotonic() + 0.05
+    fake_client = MagicMock()
+    aborted = threading.Event()
+
+    def _request(**_kwargs):
+        assert aborted.wait(timeout=1)
+        raise RuntimeError("socket aborted by deadline watchdog")
+
+    fake_client.chat.completions.create.side_effect = _request
+    agent._create_request_openai_client.return_value = fake_client
+    agent._abort_request_openai_client.side_effect = lambda *_a, **_k: aborted.set()
+
+    started = time.monotonic()
+    with pytest.raises(TurnWallClockExceeded, match="wall_clock_budget_reached"):
+        direct_api_call(agent, {"model": "m", "messages": [], "timeout": 30.0})
+
+    assert time.monotonic() - started < 0.5
+    agent._abort_request_openai_client.assert_called_once_with(
+        fake_client, reason="turn_deadline"
+    )
 
 
 def test_direct_api_call_interrupt_aborts_active_client_and_raises():

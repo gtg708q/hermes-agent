@@ -16,6 +16,7 @@ resolved through :func:`_ra` so those patches keep working.
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import json
 import logging
@@ -1157,7 +1158,7 @@ def _loop_guard_reason(agent: Any, messages: List[Dict[str, Any]], started_at: f
     return None
 
 
-def run_conversation(
+def _run_conversation_inner(
     agent,
     user_message: Any,
     system_message: str = None,
@@ -1191,12 +1192,19 @@ def run_conversation(
     """
     # Start the whole-turn clock at the public turn entry, before decoding,
     # prompt construction, compression, plugins, persistence, or prefetch.
-    _turn_started_at = time.monotonic()
+    _turn_started_at = getattr(agent, "_turn_started_monotonic", None)
+    if not isinstance(_turn_started_at, (int, float)):
+        _turn_started_at = time.monotonic()
     _wall_clock_limit = max(
         0.0, float(getattr(agent, "max_wall_clock_seconds", 0) or 0)
     )
+    _preassigned_deadline = getattr(agent, "_turn_deadline_monotonic", None)
     agent._turn_deadline_monotonic = (
-        _turn_started_at + _wall_clock_limit if _wall_clock_limit else None
+        float(_preassigned_deadline)
+        if isinstance(_preassigned_deadline, (int, float)) and _wall_clock_limit
+        else _turn_started_at + _wall_clock_limit
+        if _wall_clock_limit
+        else None
     )
 
     if moa_config is None:
@@ -7043,6 +7051,113 @@ def run_conversation(
         _pending_verification_response_previewed=_pending_verification_response_previewed,
     )
 
+
+_DEADLINE_FINALIZATION_HANDOFF_SECONDS = 0.25
+
+
+def run_conversation(agent, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    """Run one turn behind an absolute boundary that includes finalization.
+
+    A timed-out daemon may still unwind a blocking SQLite/filesystem call, so a
+    cached agent refuses a new turn until that worker exits. This preserves
+    session ordering instead of allowing a late prior-turn write to race the
+    next user message. After interrupting at the deadline, allow only a small,
+    fixed handoff window for an already-running canonical finalizer to publish
+    its persisted result; genuinely blocked finalization remains bounded.
+    """
+    wall_clock_limit = max(
+        0.0, float(getattr(agent, "max_wall_clock_seconds", 0) or 0)
+    )
+    if not wall_clock_limit:
+        return _run_conversation_inner(agent, *args, **kwargs)
+
+    prior_worker = getattr(agent, "_deadline_turn_worker", None)
+    if isinstance(prior_worker, threading.Thread) and prior_worker.is_alive():
+        text = (
+            "Cannot start this turn because the previous timed-out turn is still "
+            "finalizing its session state. Please retry shortly."
+        )
+        return {
+            "final_response": text,
+            "messages": [],
+            "api_calls": 0,
+            "completed": False,
+            "failed": True,
+            "partial": True,
+            "error": text,
+        }
+
+    started_at = time.monotonic()
+    deadline = started_at + wall_clock_limit
+    agent._turn_started_monotonic = started_at
+    agent._turn_deadline_monotonic = deadline
+    finished = threading.Event()
+    outcome: Dict[str, Any] = {}
+    run_context = contextvars.copy_context()
+
+    def _run() -> None:
+        try:
+            outcome["result"] = run_context.run(
+                _run_conversation_inner, agent, *args, **kwargs
+            )
+        except BaseException as exc:
+            outcome["error"] = exc
+        finally:
+            outcome["finished_at"] = time.monotonic()
+            finished.set()
+
+    worker = threading.Thread(
+        target=_run,
+        name="hermes-whole-turn-deadline",
+        daemon=True,
+    )
+    agent._deadline_turn_worker = worker
+    worker.start()
+    finished.wait(timeout=max(0.0, deadline - time.monotonic()))
+
+    if finished.is_set():
+        # The inner loop may itself cross the fence and synchronously persist a
+        # deadline result just as the wait expires. Prefer that canonical,
+        # fully-finalized result whenever it is already available.
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["result"]
+
+    agent._wall_clock_expired = True
+    try:
+        # AIAgent.interrupt targets its bound execution thread and fans out to
+        # tool workers.  Do not lazily import run_agent on this expired path:
+        # import time itself would sit outside the bound, and turn startup
+        # already records a pending thread signal if binding is not complete.
+        agent.interrupt("whole-turn wall-clock budget reached")
+    except Exception:
+        pass
+
+    # The inner loop owns transcript closure and persistence.  At the exact
+    # deadline it may already be in that canonical finalizer, so give it one
+    # short, monotonic-clock-independent handoff window after the interrupt.
+    # Do not join indefinitely: a wedged filesystem/SQLite call must not hold
+    # the caller forever, and the live worker remains recorded to fence turns.
+    finished.wait(timeout=_DEADLINE_FINALIZATION_HANDOFF_SECONDS)
+    if finished.is_set():
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["result"]
+
+    text = (
+        "Stopped this run because the configured whole-turn wall-clock budget "
+        "was reached (wall_clock_budget_reached)."
+    )
+    return {
+        "final_response": text,
+        "messages": [],
+        "api_calls": int(getattr(agent, "_api_call_count", 0) or 0),
+        "completed": False,
+        "failed": True,
+        "partial": True,
+        "turn_exit_reason": "wall_clock_budget_reached",
+        "error": text,
+    }
 
 
 __all__ = ["run_conversation"]

@@ -565,6 +565,8 @@ def direct_api_call(agent, api_kwargs: dict):
     agent._touch_activity("waiting for non-streaming API response")
     request_client_holder = {"client": None}
     request_client_lock = threading.Lock()
+    deadline_expired = threading.Event()
+    watchdog_cancel = threading.Event()
 
     def _abort_active_request(reason: str) -> None:
         """Abort the inline request from a watchdog/interrupt thread."""
@@ -582,22 +584,52 @@ def direct_api_call(agent, api_kwargs: dict):
         with request_client_lock:
             request_client_holder["client"] = client
         agent._active_request_abort = _abort_active_request
+        if deadline_expired.is_set():
+            _abort_active_request("turn_deadline")
         return client
+
+    deadline = getattr(agent, "_turn_deadline_monotonic", None)
+    watchdog = None
+    if isinstance(deadline, (int, float)) and math.isfinite(deadline):
+        def _deadline_watchdog() -> None:
+            remaining = max(0.0, deadline - time.monotonic())
+            if watchdog_cancel.wait(timeout=remaining):
+                return
+            deadline_expired.set()
+            _abort_active_request("turn_deadline")
+
+        watchdog = threading.Thread(
+            target=_deadline_watchdog,
+            name="hermes-direct-api-deadline",
+            daemon=True,
+        )
+        watchdog.start()
 
     try:
         response = _dispatch_nonstreaming_api_request(
             agent, api_kwargs, make_client=_make_client
         )
     except Exception:
+        if deadline_expired.is_set():
+            from agent.errors import TurnWallClockExceeded
+
+            raise TurnWallClockExceeded("wall_clock_budget_reached") from None
         if getattr(agent, "_interrupt_requested", False):
             raise InterruptedError("Agent interrupted during API call") from None
         raise
     else:
+        if deadline_expired.is_set():
+            from agent.errors import TurnWallClockExceeded
+
+            raise TurnWallClockExceeded("wall_clock_budget_reached")
         if getattr(agent, "_interrupt_requested", False):
             raise InterruptedError("Agent interrupted during API call")
         _reset_stale_streak(agent)
         return response
     finally:
+        watchdog_cancel.set()
+        if watchdog is not None and watchdog is not threading.current_thread():
+            watchdog.join(timeout=_turn_deadline_join_timeout(agent))
         if getattr(agent, "_active_request_abort", None) is _abort_active_request:
             agent._active_request_abort = None
         with request_client_lock:

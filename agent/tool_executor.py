@@ -98,6 +98,8 @@ _MAX_TOOL_WORKERS = 8
 # Keep this above the stock auxiliary.web_extract timeout (360s) so the batch
 # guard does not preempt a slow-but-valid summarization attempt.
 _DEFAULT_CONCURRENT_TOOL_TIMEOUT_S = 420.0
+_TERMINAL_DEFAULT_FOREGROUND_TIMEOUT_S = 180.0
+_TERMINAL_MAX_FOREGROUND_TIMEOUT_S = 600.0
 
 
 def _parse_tool_arguments(raw_arguments: Any) -> tuple[dict, Optional[str]]:
@@ -149,7 +151,24 @@ def _apply_tool_transport_deadline(agent, name: str, args: dict) -> dict:
     remaining = _turn_deadline_remaining(agent)
     if remaining is None:
         return args
-    if name in {"terminal", "process"}:
+    if name == "terminal":
+        args = dict(args)
+        configured = args.get("timeout")
+        if configured is None and remaining >= _TERMINAL_DEFAULT_FOREGROUND_TIMEOUT_S:
+            return args
+        try:
+            configured = (
+                float(configured)
+                if configured is not None
+                else _TERMINAL_DEFAULT_FOREGROUND_TIMEOUT_S
+            )
+        except (TypeError, ValueError):
+            configured = _TERMINAL_DEFAULT_FOREGROUND_TIMEOUT_S
+        args["timeout"] = max(
+            0.01,
+            min(configured, remaining, _TERMINAL_MAX_FOREGROUND_TIMEOUT_S),
+        )
+    elif name == "process":
         args = dict(args)
         configured = args.get("timeout")
         try:
@@ -158,6 +177,22 @@ def _apply_tool_transport_deadline(agent, name: str, args: dict) -> dict:
             configured = remaining
         args["timeout"] = max(0.01, min(configured, remaining))
     return args
+
+
+def _tool_execution_signature(name: str, args: Any, result: Any) -> str:
+    """Hash the failed operation, not merely its often-generic error text."""
+    try:
+        normalized_args = json.dumps(
+            args, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str
+        )
+    except Exception:
+        normalized_args = repr(args)
+    payload = json.dumps(
+        [str(name), normalized_args, _multimodal_text_summary(result)],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _flush_session_db_after_tool_progress(
@@ -1076,9 +1111,9 @@ def _execute_tool_calls_concurrent_inline(agent, assistant_message, messages: li
             if blocked:
                 effect_disposition = "none"
 
-            _execution_signature = hashlib.sha256(
-                _multimodal_text_summary(function_result).encode("utf-8")
-            ).hexdigest()
+            _execution_signature = _tool_execution_signature(
+                function_name, function_args, function_result
+            )
             if not blocked:
                 function_result = agent._append_guardrail_observation(
                     function_name,
@@ -1847,9 +1882,9 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # Log tool errors to the persistent error log so [error] tags
         # in the UI always have a corresponding detailed entry on disk.
         _is_error_result, _ = _detect_tool_failure(function_name, function_result)
-        _execution_signature = hashlib.sha256(
-            _multimodal_text_summary(function_result).encode("utf-8")
-        ).hexdigest()
+        _execution_signature = _tool_execution_signature(
+            function_name, function_args, function_result
+        )
         # The agent-runtime tools above (todo, session_search, memory,
         # context-engine, memory-manager, clarify, delegate_task) are
         # dispatched inline — they never reach handle_function_call, so the

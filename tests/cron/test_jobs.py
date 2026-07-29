@@ -1,5 +1,6 @@
 """Tests for cron/jobs.py — schedule parsing, job CRUD, and due-job detection."""
 
+import json
 import os
 import threading
 import time
@@ -1837,6 +1838,10 @@ class TestCronOutputRetention:
         assert (output / "live").exists()
         assert not (output / "fresh-orphan").exists()
         assert not stale.exists()
+
+        marker_state = json.loads((output / ".orphan-gc.json").read_text())
+        assert "fresh-orphan" not in marker_state["first_seen"]
+        assert "stale-orphan" not in marker_state["first_seen"]
 
     def test_gc_orphaned_output_fails_closed_on_corrupt_jobs_store(self, tmp_cron_dir):
         from cron import jobs

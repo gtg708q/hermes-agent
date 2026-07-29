@@ -659,11 +659,13 @@ class ResponseStore:
             except Exception:
                 db_path = ":memory:"
         self._db_path: Optional[str] = db_path if db_path != ":memory:" else None
+        self._durable_run_store_available = db_path != ":memory:"
         try:
             self._conn = sqlite3.connect(db_path, check_same_thread=False)
         except Exception:
             self._conn = sqlite3.connect(":memory:", check_same_thread=False)
             self._db_path = None
+            self._durable_run_store_available = False
         # Use shared WAL-fallback helper so response_store.db degrades
         # gracefully on NFS/SMB/FUSE-mounted HERMES_HOME (same filesystem
         # issue addressed for state.db/kanban.db — see
@@ -863,6 +865,8 @@ class ResponseStore:
         owner's status.  ``owner_id=None`` preserves the legacy insert/replay
         behavior for callers that do not execute runs.
         """
+        if not self._durable_run_store_available:
+            raise RuntimeError("durable response store is unavailable")
         encoded = json.dumps(status, default=str, sort_keys=True)
         now = time.time() if now is None else float(now)
         lease_expires_at = now + max(0.0, float(lease_seconds))
@@ -1419,6 +1423,10 @@ try:
     from tools.cronjob_tools import _scan_cron_prompt as _scan_cron_prompt
 except Exception:  # pragma: no cover - scanner is optional hardening
     _scan_cron_prompt = None
+
+
+class _RunOwnershipLost(RuntimeError):
+    """Terminal status cannot be written because another owner holds the run."""
 
 
 class _ProviderAuthResolutionError(RuntimeError):
@@ -6256,7 +6264,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 )
             except Exception:
                 try:
-                    await asyncio.to_thread(
+                    renewed = await asyncio.to_thread(
                         self._response_store.renew_run_lease,
                         run_id,
                         self._run_owner_id,
@@ -6267,6 +6275,11 @@ class APIServerAdapter(BasePlatformAdapter):
                         "Failed to retain run-owner lease after terminal write failure for %s",
                         run_id,
                     )
+                else:
+                    if not renewed:
+                        raise _RunOwnershipLost(
+                            f"durable run ownership was lost for {run_id}"
+                        )
                 await asyncio.sleep(self._RUN_TERMINAL_WRITE_RETRY_SECONDS)
 
     def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
@@ -6791,6 +6804,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
                 raise
+            except _RunOwnershipLost:
+                # Another process reclaimed the lease. Any further terminal
+                # write would target state this executor no longer owns.
+                logger.warning("Stopping run %s after durable lease ownership loss", run_id)
             except _ProviderAuthResolutionError as exc:
                 # /v1/runs builds its own agent via _create_agent() and does
                 # not route through _run_agent() (see that method's own

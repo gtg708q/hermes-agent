@@ -2431,20 +2431,23 @@ def gc_orphaned_output(
             if now - seen_at >= retention_days * 86400:
                 candidates.append(Path(entry.path))
 
-        state = {"cursor": next_cursor, "first_seen": first_seen}
-        fd, tmp_name = tempfile.mkstemp(
-            dir=str(output_dir), prefix=".orphan-gc-", suffix=".tmp"
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                json.dump(state, handle, sort_keys=True)
-                handle.flush()
-                os.fsync(handle.fileno())
-            atomic_replace(tmp_name, marker)
-        except BaseException:
-            with contextlib.suppress(OSError):
-                os.unlink(tmp_name)
-            raise
+        def _persist_gc_state() -> None:
+            state = {"cursor": next_cursor, "first_seen": first_seen}
+            fd, tmp_name = tempfile.mkstemp(
+                dir=str(output_dir), prefix=".orphan-gc-", suffix=".tmp"
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                    json.dump(state, handle, sort_keys=True)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                atomic_replace(tmp_name, marker)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.unlink(tmp_name)
+                raise
+
+        _persist_gc_state()
     except (OSError, ValueError, TypeError, RuntimeError):
         return 0
 
@@ -2458,6 +2461,14 @@ def gc_orphaned_output(
             first_seen.pop(path.name, None)
         except OSError as exc:
             logger.debug("Failed to prune orphaned cron output %s: %s", path, exc)
+    if removed:
+        # The pre-delete marker intentionally makes failed deletions retryable.
+        # Once deletion succeeds, durably remove those observations too so the
+        # marker cannot grow forever or resurrect stale ages on name reuse.
+        try:
+            _persist_gc_state()
+        except OSError as exc:
+            logger.debug("Failed to persist orphan GC deletions: %s", exc)
     return removed
 
 

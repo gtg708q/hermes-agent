@@ -158,6 +158,36 @@ def auth_adapter():
 
 
 class TestStartRun:
+    @pytest.mark.asyncio
+    async def test_idempotent_run_fails_closed_after_response_store_disk_fallback(
+        self, adapter
+    ):
+        import sqlite3
+
+        real_connect = sqlite3.connect
+        calls = 0
+
+        def _fail_disk_once(path, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError("disk unavailable")
+            return real_connect(path, *args, **kwargs)
+
+        adapter._response_store.close()
+        with patch("sqlite3.connect", side_effect=_fail_disk_once):
+            adapter._response_store = ResponseStore(db_path="/unavailable/response_store.db")
+
+        app = _create_runs_app(adapter)
+        with patch.object(adapter, "_create_agent") as create_agent:
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post("/v1/runs", json={"input": "hello"})
+                payload = await response.json()
+
+        assert response.status == 503
+        assert payload["error"]["code"] == "idempotency_store_unavailable"
+        create_agent.assert_not_called()
+
     def test_idempotent_run_id_scopes_key_by_canonical_profile(self):
         key = "same-client-key"
 
@@ -627,6 +657,53 @@ class TestStartRun:
         assert terminal_attempts >= 2
         assert durable is not None
         assert durable["status"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_terminal_status_retry_stops_and_cleans_up_after_lease_loss(
+        self, adapter
+    ):
+        app = _create_runs_app(adapter)
+        original_put = adapter._response_store.put_run_status
+        terminal_attempts = 0
+
+        def _lose_terminal_write(run_id, status, **kwargs):
+            nonlocal terminal_attempts
+            if status.get("status") == "completed":
+                terminal_attempts += 1
+                return False
+            return original_put(run_id, status, **kwargs)
+
+        with (
+            patch.object(
+                adapter._response_store,
+                "put_run_status",
+                side_effect=_lose_terminal_write,
+            ),
+            patch.object(
+                adapter._response_store,
+                "renew_run_lease",
+                return_value=False,
+            ) as renew_lease,
+            patch.object(adapter, "_create_agent") as create_agent,
+        ):
+            agent = MagicMock()
+            agent.run_conversation.return_value = {"final_response": "done"}
+            agent.session_prompt_tokens = 0
+            agent.session_completion_tokens = 0
+            agent.session_total_tokens = 0
+            create_agent.return_value = agent
+
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await response.json())["run_id"]
+                task = adapter._active_run_tasks[run_id]
+                await asyncio.wait_for(task, timeout=1)
+
+        assert terminal_attempts == 1
+        renew_lease.assert_called_once()
+        assert run_id not in adapter._active_run_tasks
+        assert run_id not in adapter._active_run_agents
+        assert run_id not in adapter._run_approval_sessions
 
     @pytest.mark.asyncio
     async def test_start_returns_202(self, adapter):
