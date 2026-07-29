@@ -324,6 +324,27 @@ Orphan GC is profile-safe: it only compares directories under the active
 profile's `cron/output` store with that profile's `jobs.json`, and never follows
 symlinks.
 
+:::caution One-time macOS/Windows upgrade step
+Existing macOS and Windows profiles that already contain cron output directories
+must initialize the portable retention index once after upgrading:
+
+```bash
+hermes cron gc-bootstrap
+```
+
+The command scans only the active profile. Run it separately for every named
+profile that has existing output, for example:
+
+```bash
+hermes --profile work cron gc-bootstrap
+```
+
+Until that one-time bootstrap succeeds, scheduler orphan cleanup fails closed so
+legacy output cannot be deleted without first being indexed. A genuinely fresh
+profile whose `cron/output` directory is empty is detected with a bounded check
+and initialized automatically; it does not require this command.
+:::
+
 ```yaml
 # ~/.hermes/config.yaml
 cron:

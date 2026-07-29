@@ -1926,6 +1926,118 @@ print(json.dumps({{"records": records[0], "removed": removed}}))
             "already_complete": True,
         }
 
+    @pytest.mark.parametrize("portable_platform", ["darwin", "win32"])
+    def test_fresh_portable_gc_auto_bootstraps_before_first_output(
+        self, tmp_cron_dir, monkeypatch, portable_platform
+    ):
+        import cron.jobs as jobs
+
+        monkeypatch.setattr(jobs.sys, "platform", portable_platform)
+        save_jobs([])
+
+        # Gateway startup runs GC before the first job has produced output.
+        assert jobs.gc_orphaned_output(
+            retention_days=0, interval_seconds=0, max_directories=2
+        ) == 0
+
+        output = save_job_output("first-job", "published")
+        assert output.read_text(encoding="utf-8") == "published"
+        assert jobs.gc_orphaned_output(
+            retention_days=0, interval_seconds=0, max_directories=2
+        ) == 1
+        assert not output.parent.exists()
+
+        with sqlite3.connect(tmp_cron_dir / "cron" / "output-gc.sqlite3") as conn:
+            assert conn.execute(
+                "SELECT value FROM metadata WHERE key = 'bootstrap_complete'"
+            ).fetchone() == ("1",)
+
+    def test_portable_bootstrap_fences_bounded_publication_and_consumes_pending(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        import cron.jobs as jobs
+
+        monkeypatch.setattr(jobs, "_use_linux_output_gc", lambda: False)
+        save_jobs([])
+        output_root = jobs.get_cron_output_dir()
+        legacy = output_root / "legacy"
+        legacy.mkdir()
+        (legacy / "run.md").write_text("legacy", encoding="utf-8")
+
+        scan_finished = threading.Event()
+        publication_finished = threading.Event()
+        release_scan = threading.Event()
+        original_scandir = os.scandir
+        original_replace = jobs.atomic_replace
+
+        class ScanBarrier:
+            def __init__(self, iterator):
+                self.iterator = iterator
+
+            def __enter__(self):
+                self.iterator.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self.iterator.__exit__(*args)
+
+            def __iter__(self):
+                return self
+
+            def __next__(self):
+                try:
+                    return next(self.iterator)
+                except StopIteration:
+                    scan_finished.set()
+                    assert publication_finished.wait(timeout=1)
+                    release_scan.wait(timeout=1)
+                    raise
+
+        def barrier_scandir(path):
+            iterator = original_scandir(path)
+            if Path(path) == output_root:
+                return ScanBarrier(iterator)
+            return iterator
+
+        def observe_replace(source, destination):
+            result = original_replace(source, destination)
+            if Path(destination).parent.name == "during-bootstrap":
+                publication_finished.set()
+            return result
+
+        monkeypatch.setattr(os, "scandir", barrier_scandir)
+        monkeypatch.setattr(jobs, "atomic_replace", observe_replace)
+        bootstrap_errors = []
+
+        def run_bootstrap():
+            try:
+                jobs.bootstrap_output_gc_index()
+            except BaseException as exc:
+                bootstrap_errors.append(exc)
+
+        bootstrap = threading.Thread(target=run_bootstrap)
+        bootstrap.start()
+        assert scan_finished.wait(timeout=1)
+
+        saved = []
+        saver = threading.Thread(
+            target=lambda: saved.append(
+                save_job_output("during-bootstrap", "published")
+            )
+        )
+        saver.start()
+        assert publication_finished.wait(timeout=1)
+        release_scan.set()
+        saver.join(timeout=2)
+        bootstrap.join(timeout=2)
+
+        assert not bootstrap_errors
+        assert len(saved) == 1
+        with sqlite3.connect(tmp_cron_dir / "cron" / "output-gc.sqlite3") as conn:
+            assert conn.execute(
+                "SELECT 1 FROM directories WHERE name = ?", ("during-bootstrap",)
+            ).fetchone() == (1,)
+
     def test_portable_gc_index_is_scoped_to_each_profile(self, tmp_path, monkeypatch):
         import cron.jobs as jobs
 
@@ -2012,14 +2124,14 @@ print(json.dumps({{"records": records[0], "removed": removed}}))
         save_job_output("delete-race", "old output")
         delete_entered = threading.Event()
         release_delete = threading.Event()
-        original_remove = jobs._remove_portable_output_directory
+        original_remove = jobs._delete_portable_tombstone
 
-        def blocked_remove(root, name):
+        def blocked_remove(root, tombstone):
             delete_entered.set()
             assert release_delete.wait(timeout=2)
-            return original_remove(root, name)
+            return original_remove(root, tombstone)
 
-        monkeypatch.setattr(jobs, "_remove_portable_output_directory", blocked_remove)
+        monkeypatch.setattr(jobs, "_delete_portable_tombstone", blocked_remove)
         gc_result = []
         collector = threading.Thread(
             target=lambda: gc_result.append(
@@ -2038,15 +2150,142 @@ print(json.dumps({{"records": records[0], "removed": removed}}))
             )
         )
         saver.start()
-        time.sleep(0.05)
-        assert saver.is_alive()
+        saver.join(timeout=0.5)
+        assert len(save_result) == 1
         release_delete.set()
         collector.join(timeout=2)
-        saver.join(timeout=2)
 
         assert gc_result == [1]
-        assert len(save_result) == 1
         assert save_result[0].read_text(encoding="utf-8") == "new output"
+
+    def test_portable_tombstone_delete_releases_global_guard(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        import cron.jobs as jobs
+
+        monkeypatch.setattr(jobs, "_use_linux_output_gc", lambda: False)
+        save_jobs([])
+        save_job_output("detached-delete", "old output")
+        delete_entered = threading.Event()
+        release_delete = threading.Event()
+        original_rmtree = jobs.shutil.rmtree
+
+        def blocked_rmtree(path, *args, **kwargs):
+            if Path(path).name.startswith(".gc-"):
+                delete_entered.set()
+                assert release_delete.wait(timeout=2)
+            return original_rmtree(path, *args, **kwargs)
+
+        monkeypatch.setattr(jobs.shutil, "rmtree", blocked_rmtree)
+        gc_result = []
+        collector = threading.Thread(
+            target=lambda: gc_result.append(
+                jobs.gc_orphaned_output(
+                    retention_days=0, interval_seconds=0, max_directories=1
+                )
+            )
+        )
+        collector.start()
+        assert delete_entered.wait(timeout=1)
+
+        save_result = []
+        saver = threading.Thread(
+            target=lambda: save_result.append(
+                save_job_output("unrelated-job", "new output")
+            )
+        )
+        saver.start()
+        saver.join(timeout=0.5)
+        assert len(save_result) == 1
+
+        release_delete.set()
+        collector.join(timeout=2)
+        assert gc_result == [1]
+
+    @pytest.mark.parametrize("partial_delete", [False, True])
+    def test_portable_gc_recovers_durable_tombstone_after_crash(
+        self, tmp_cron_dir, monkeypatch, partial_delete
+    ):
+        import cron.jobs as jobs
+
+        monkeypatch.setattr(jobs, "_use_linux_output_gc", lambda: False)
+        save_jobs([])
+        output = save_job_output("crash-orphan", "old output")
+        nested = output.parent / "nested"
+        nested.mkdir()
+        (nested / "child").write_text("data", encoding="utf-8")
+        original_rmtree = jobs.shutil.rmtree
+        crashed = False
+
+        def crash_rmtree(path, *args, **kwargs):
+            nonlocal crashed
+            if Path(path).name.startswith(".gc-") and not crashed:
+                crashed = True
+                if partial_delete:
+                    (Path(path) / "nested" / "child").unlink()
+                raise OSError("simulated process crash during tombstone deletion")
+            return original_rmtree(path, *args, **kwargs)
+
+        monkeypatch.setattr(jobs.shutil, "rmtree", crash_rmtree)
+        assert jobs.gc_orphaned_output(
+            retention_days=0, interval_seconds=0, max_directories=1
+        ) == 0
+        tombstones = list(jobs.get_cron_output_dir().glob(".gc-*"))
+        assert len(tombstones) == 1
+        db_path = tmp_cron_dir / "cron" / "output-gc.sqlite3"
+        with sqlite3.connect(db_path) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM tombstones").fetchone() == (1,)
+
+        monkeypatch.setattr(jobs.shutil, "rmtree", original_rmtree)
+        assert jobs.gc_orphaned_output(
+            retention_days=0, interval_seconds=0, max_directories=1
+        ) == 1
+        assert not tombstones[0].exists()
+        with sqlite3.connect(db_path) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM tombstones").fetchone() == (0,)
+            assert conn.execute(
+                "SELECT COUNT(*) FROM directories WHERE name = ?", ("crash-orphan",)
+            ).fetchone() == (0,)
+
+    def test_portable_gc_recovers_crash_after_tombstone_rename_before_commit(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        import cron.jobs as jobs
+
+        monkeypatch.setattr(jobs, "_use_linux_output_gc", lambda: False)
+        save_jobs([])
+        output = save_job_output("rename-crash", "old output")
+        original_stat = jobs.os.stat
+        tombstone_stat_calls = 0
+
+        def crash_after_rename(path, *args, **kwargs):
+            nonlocal tombstone_stat_calls
+            if Path(path).name.startswith(".gc-"):
+                tombstone_stat_calls += 1
+                if tombstone_stat_calls == 2:
+                    raise OSError("simulated crash after rename")
+            return original_stat(path, *args, **kwargs)
+
+        monkeypatch.setattr(jobs.os, "stat", crash_after_rename)
+        assert jobs.gc_orphaned_output(
+            retention_days=0, interval_seconds=0, max_directories=1
+        ) == 0
+        assert not output.parent.exists()
+        tombstones = list(jobs.get_cron_output_dir().glob(".gc-*"))
+        assert len(tombstones) == 1
+        db_path = tmp_cron_dir / "cron" / "output-gc.sqlite3"
+        with sqlite3.connect(db_path) as conn:
+            assert conn.execute(
+                "SELECT state FROM tombstones"
+            ).fetchone() == ("planned",)
+
+        monkeypatch.setattr(jobs.os, "stat", original_stat)
+        assert jobs.gc_orphaned_output(
+            retention_days=0, interval_seconds=0, max_directories=1
+        ) == 1
+        assert not tombstones[0].exists()
+        with sqlite3.connect(db_path) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM tombstones").fetchone() == (0,)
 
     def test_portable_gc_rechecks_selected_generation_before_delete(
         self, tmp_cron_dir, monkeypatch

@@ -628,33 +628,64 @@ def _portable_output_gc_db_path() -> Path:
 
 _PORTABLE_OUTPUT_GC_BUSY_TIMEOUT_SECONDS = 0.1
 _portable_output_file_lock = threading.RLock()
+_PORTABLE_OUTPUT_PENDING_DIR = ".output-gc-pending"
 
 
 @contextlib.contextmanager
-def _portable_output_filesystem_guard():
-    """Serialize portable output publication/deletion across processes."""
+def _portable_output_filesystem_guard(*, timeout: Optional[float] = None):
+    """Serialize portable output filesystem changes across processes.
+
+    Off-tick maintenance may wait indefinitely. Runtime publication passes a
+    short timeout and receives ``False`` rather than waiting behind maintenance.
+    """
     lock_path = _current_cron_store().cron_dir / ".output-publication.lock"
-    with _portable_output_file_lock:
+    acquired_local = (
+        _portable_output_file_lock.acquire()
+        if timeout is None
+        else _portable_output_file_lock.acquire(timeout=max(0.0, timeout))
+    )
+    if not acquired_local:
+        yield False
+        return
+    try:
         lock_fd = None
+        acquired_file = False
         try:
             try:
                 lock_fd = open(lock_path, "a+", encoding="utf-8")
                 lock_fd.seek(0)
-                if fcntl is not None:
-                    fcntl.flock(lock_fd, fcntl.LOCK_EX)
-                elif msvcrt is not None:
-                    getattr(msvcrt, "locking")(
-                        lock_fd.fileno(), getattr(msvcrt, "LK_LOCK"), 1
-                    )
+                deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+                while True:
+                    try:
+                        if fcntl is not None:
+                            operation = fcntl.LOCK_EX
+                            if deadline is not None:
+                                operation |= fcntl.LOCK_NB
+                            fcntl.flock(lock_fd, operation)
+                        elif msvcrt is not None:
+                            mode = getattr(
+                                msvcrt,
+                                "LK_LOCK" if deadline is None else "LK_NBLCK",
+                            )
+                            getattr(msvcrt, "locking")(lock_fd.fileno(), mode, 1)
+                        acquired_file = True
+                        break
+                    except (OSError, IOError):
+                        if deadline is None:
+                            raise
+                        if time.monotonic() >= deadline:
+                            break
+                        time.sleep(0.01)
             except (OSError, IOError) as exc:
                 logger.warning(
                     "Portable cron output filesystem guard unavailable; "
                     "continuing with in-process serialization: %s",
                     exc,
                 )
-            yield
+                acquired_file = True
+            yield acquired_file
         finally:
-            if lock_fd is not None:
+            if lock_fd is not None and acquired_file:
                 try:
                     if fcntl is not None:
                         fcntl.flock(lock_fd, fcntl.LOCK_UN)
@@ -664,7 +695,91 @@ def _portable_output_filesystem_guard():
                         )
                 except (OSError, IOError):
                     pass
+            if lock_fd is not None:
                 lock_fd.close()
+    finally:
+        _portable_output_file_lock.release()
+
+
+def _portable_output_pending_dir() -> Path:
+    return _current_cron_store().cron_dir / _PORTABLE_OUTPUT_PENDING_DIR
+
+
+def _write_portable_output_pending(name: str) -> Path:
+    """Durably mark a fail-open publication before touching its output tree."""
+    pending_dir = _portable_output_pending_dir()
+    pending_dir.mkdir(parents=True, exist_ok=True)
+    _secure_dir(pending_dir)
+    marker = pending_dir / f"{uuid.uuid4().hex}.json"
+    fd, tmp_name = tempfile.mkstemp(dir=str(pending_dir), prefix=".pending-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({"name": name}, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        atomic_replace(tmp_name, marker)
+        _secure_file(marker)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+    return marker
+
+
+def _consume_portable_output_pending(
+    conn: sqlite3.Connection, *, limit: int = 10_000
+) -> List[Path]:
+    """Index a bounded set of durable fail-open publication markers."""
+    consumed: List[Path] = []
+    try:
+        with os.scandir(_portable_output_pending_dir()) as entries:
+            for entry in entries:
+                if len(consumed) >= limit:
+                    break
+                if not entry.name.endswith(".json"):
+                    continue
+                try:
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    payload = json.loads(Path(entry.path).read_text(encoding="utf-8"))
+                    name = payload.get("name")
+                    if not isinstance(name, str) or not name or Path(name).name != name:
+                        continue
+                    conn.execute(
+                        """INSERT INTO directories(name, first_seen, generation)
+                           VALUES (?, NULL, ?)
+                           ON CONFLICT(name) DO UPDATE SET
+                               first_seen = NULL,
+                               generation = excluded.generation""",
+                        (name, uuid.uuid4().hex),
+                    )
+                    consumed.append(Path(entry.path))
+                except (OSError, ValueError, TypeError):
+                    continue
+    except FileNotFoundError:
+        pass
+    return consumed
+
+
+def _unlink_portable_output_pending(markers: List[Path]) -> None:
+    for marker in markers:
+        try:
+            marker.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.debug("Failed to remove cron output pending marker %s: %s", marker, exc)
+
+
+def _portable_output_root_is_empty() -> bool:
+    """Probe at most one entry; scheduler GC must never scan a legacy root."""
+    try:
+        with os.scandir(_current_cron_store().output_dir) as entries:
+            return next(entries, None) is None
+    except OSError:
+        return False
 
 
 def _initialize_portable_output_gc_index(
@@ -694,6 +809,15 @@ def _initialize_portable_output_gc_index(
                    generation TEXT NOT NULL
                )"""
         )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS tombstones (
+                   id INTEGER PRIMARY KEY AUTOINCREMENT,
+                   path TEXT NOT NULL UNIQUE,
+                   directory_name TEXT NOT NULL,
+                   generation TEXT NOT NULL,
+                   state TEXT NOT NULL
+               )"""
+        )
         root_stat = os.stat(store.output_dir, follow_symlinks=False)
         if not stat.S_ISDIR(root_stat.st_mode):
             raise NotADirectoryError(store.output_dir)
@@ -706,6 +830,7 @@ def _initialize_portable_output_gc_index(
             # Never apply names observed under a replaced output root. An
             # explicit bootstrap is required to bind and index the replacement.
             conn.execute("DELETE FROM directories")
+            conn.execute("DELETE FROM tombstones")
             conn.execute(
                 "INSERT OR REPLACE INTO metadata(key, value) VALUES('bootstrap_complete', '0')"
             )
@@ -744,7 +869,9 @@ def _portable_output_gc_enqueue(name: str) -> None:
                    generation = excluded.generation""",
             (name, uuid.uuid4().hex),
         )
+        consumed = _consume_portable_output_pending(conn)
         conn.commit()
+        _unlink_portable_output_pending(consumed)
     finally:
         conn.close()
 
@@ -814,48 +941,57 @@ def bootstrap_output_gc_index() -> Dict[str, Any]:
     This intentionally performs a complete root scan and therefore is never
     called by the scheduler tick. Operators invoke it once via
     ``hermes cron gc-bootstrap`` after upgrading an existing macOS/Windows
-    profile. A successful transaction is durable across process restarts.
+    profile. The filesystem guard spans scan, pending-publication reconciliation,
+    and commit so no successful publication can escape the completed index.
     """
     ensure_dirs()
-    conn = _initialize_portable_output_gc_index()
-    try:
-        complete = conn.execute(
-            "SELECT value FROM metadata WHERE key = 'bootstrap_complete'"
-        ).fetchone()
-        if complete and complete[0] == "1":
-            return {"indexed": 0, "already_complete": True}
-
-        store = _current_cron_store()
-        indexed = 0
-        conn.execute("BEGIN IMMEDIATE")
+    with _portable_output_filesystem_guard() as acquired:
+        if not acquired:
+            raise RuntimeError("portable cron output filesystem guard unavailable")
+        conn = _initialize_portable_output_gc_index()
         try:
-            conn.execute("DELETE FROM directories")
-            with os.scandir(store.output_dir) as entries:
-                for entry in entries:
-                    try:
-                        if entry.is_dir(follow_symlinks=False):
-                            conn.execute(
-                                """INSERT OR IGNORE INTO directories
-                                   (name, first_seen, generation)
-                                   VALUES (?, NULL, ?)""",
-                                (entry.name, uuid.uuid4().hex),
-                            )
-                            indexed += 1
-                    except OSError:
-                        continue
-            conn.execute(
-                "INSERT OR REPLACE INTO metadata(key, value) VALUES('cursor', '0')"
-            )
-            conn.execute(
-                "INSERT OR REPLACE INTO metadata(key, value) VALUES('bootstrap_complete', '1')"
-            )
-            conn.commit()
-        except BaseException:
-            conn.rollback()
-            raise
-        return {"indexed": indexed, "already_complete": False}
-    finally:
-        conn.close()
+            complete = conn.execute(
+                "SELECT value FROM metadata WHERE key = 'bootstrap_complete'"
+            ).fetchone()
+            if complete and complete[0] == "1":
+                return {"indexed": 0, "already_complete": True}
+
+            store = _current_cron_store()
+            indexed = 0
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                conn.execute("DELETE FROM directories")
+                with os.scandir(store.output_dir) as entries:
+                    for entry in entries:
+                        try:
+                            if (
+                                entry.is_dir(follow_symlinks=False)
+                                and not entry.name.startswith(".gc-")
+                            ):
+                                conn.execute(
+                                    """INSERT OR IGNORE INTO directories
+                                       (name, first_seen, generation)
+                                       VALUES (?, NULL, ?)""",
+                                    (entry.name, uuid.uuid4().hex),
+                                )
+                                indexed += 1
+                        except OSError:
+                            continue
+                consumed = _consume_portable_output_pending(conn)
+                conn.execute(
+                    "INSERT OR REPLACE INTO metadata(key, value) VALUES('cursor', '0')"
+                )
+                conn.execute(
+                    "INSERT OR REPLACE INTO metadata(key, value) VALUES('bootstrap_complete', '1')"
+                )
+                conn.commit()
+                _unlink_portable_output_pending(consumed)
+            except BaseException:
+                conn.rollback()
+                raise
+            return {"indexed": indexed, "already_complete": False}
+        finally:
+            conn.close()
 
 
 def ensure_dirs():
@@ -2676,31 +2812,140 @@ def _prune_job_output(job_output_dir: Path, keep: int) -> int:
     return deleted
 
 
-def _remove_portable_output_directory(output_root: Path, name: str) -> bool:
-    """Atomically detach and delete one directory without following symlinks."""
-    entry_path = output_root / name
-    entry_stat = os.stat(entry_path, follow_symlinks=False)
-    if not stat.S_ISDIR(entry_stat.st_mode):
-        return False
-    tombstone = output_root / f".gc-{name}-{uuid.uuid4().hex}"
-    os.rename(entry_path, tombstone)
+_PORTABLE_TOMBSTONE_RE = re.compile(r"^\.gc-[0-9a-f]{32}$")
+
+
+def _portable_tombstone_path(output_root: Path, name: str) -> Optional[Path]:
+    """Return a scoped managed tombstone path, rejecting traversal and aliases."""
+    if not _PORTABLE_TOMBSTONE_RE.fullmatch(name):
+        return None
+    path = output_root / name
+    if path.parent != output_root:
+        return None
+    return path
+
+
+def _recover_portable_tombstone_locked(
+    conn: sqlite3.Connection,
+    output_root: Path,
+    tombstone_id: int,
+) -> Optional[Path]:
+    """Finish a durable planned detach while the filesystem guard is held."""
+    conn.execute("BEGIN IMMEDIATE")
     try:
+        row = conn.execute(
+            """SELECT path, directory_name, generation, state
+               FROM tombstones WHERE id = ?""",
+            (tombstone_id,),
+        ).fetchone()
+        if row is None:
+            conn.rollback()
+            return None
+        tombstone_name, directory_name, generation, state = row
+        tombstone = _portable_tombstone_path(output_root, tombstone_name)
+        if tombstone is None or Path(directory_name).name != directory_name:
+            conn.rollback()
+            return None
+        original = output_root / directory_name
+
+        try:
+            tombstone_stat = os.stat(tombstone, follow_symlinks=False)
+        except FileNotFoundError:
+            tombstone_stat = None
+        if tombstone_stat is not None:
+            if not stat.S_ISDIR(tombstone_stat.st_mode):
+                conn.rollback()
+                return None
+            conn.execute(
+                "UPDATE tombstones SET state = 'detached' WHERE id = ?",
+                (tombstone_id,),
+            )
+            conn.execute(
+                "DELETE FROM directories WHERE name = ? AND generation = ?",
+                (directory_name, generation),
+            )
+            conn.commit()
+            return tombstone
+
+        current = conn.execute(
+            "SELECT generation FROM directories WHERE name = ?", (directory_name,)
+        ).fetchone()
+        if state != "planned" or current != (generation,):
+            # A newer publication owns the original name. The unmaterialized
+            # intent is obsolete and must never detach that newer generation.
+            conn.execute("DELETE FROM tombstones WHERE id = ?", (tombstone_id,))
+            conn.commit()
+            return None
+        try:
+            original_stat = os.stat(original, follow_symlinks=False)
+        except FileNotFoundError:
+            conn.execute(
+                "DELETE FROM directories WHERE name = ? AND generation = ?",
+                (directory_name, generation),
+            )
+            conn.execute("DELETE FROM tombstones WHERE id = ?", (tombstone_id,))
+            conn.commit()
+            return None
+        if not stat.S_ISDIR(original_stat.st_mode):
+            conn.rollback()
+            return None
+
+        os.rename(original, tombstone)
         detached_stat = os.stat(tombstone, follow_symlinks=False)
         if not stat.S_ISDIR(detached_stat.st_mode):
-            try:
-                os.rename(tombstone, entry_path)
-            except OSError:
-                pass
-            return False
-        shutil.rmtree(tombstone)
-        return True
+            raise RuntimeError("portable cron GC detached a non-directory tombstone")
+        conn.execute(
+            "UPDATE tombstones SET state = 'detached' WHERE id = ?",
+            (tombstone_id,),
+        )
+        conn.execute(
+            "DELETE FROM directories WHERE name = ? AND generation = ?",
+            (directory_name, generation),
+        )
+        conn.commit()
+        return tombstone
     except BaseException:
-        if tombstone.exists() and not entry_path.exists():
-            try:
-                os.rename(tombstone, entry_path)
-            except OSError:
-                pass
+        conn.rollback()
         raise
+
+
+def _delete_portable_tombstone(output_root: Path, tombstone: Path) -> bool:
+    """Recursively delete one validated managed tombstone without following links."""
+    managed = _portable_tombstone_path(output_root, tombstone.name)
+    if managed is None or managed != tombstone:
+        return False
+    try:
+        tombstone_stat = os.stat(tombstone, follow_symlinks=False)
+    except FileNotFoundError:
+        return True
+    if not stat.S_ISDIR(tombstone_stat.st_mode):
+        return False
+    shutil.rmtree(tombstone)
+    return True
+
+
+def _finalize_portable_tombstone(
+    conn: sqlite3.Connection, output_root: Path, tombstone_id: int, tombstone: Path
+) -> bool:
+    """Drop durable tombstone state only after the managed path is absent."""
+    with _portable_output_filesystem_guard() as acquired:
+        if not acquired:
+            return False
+        try:
+            os.stat(tombstone, follow_symlinks=False)
+        except FileNotFoundError:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                deleted = conn.execute(
+                    "DELETE FROM tombstones WHERE id = ? AND path = ?",
+                    (tombstone_id, tombstone.name),
+                ).rowcount
+                conn.commit()
+                return bool(deleted)
+            except BaseException:
+                conn.rollback()
+                raise
+        return False
 
 
 def _gc_orphaned_output_portable(
@@ -2710,9 +2955,20 @@ def _gc_orphaned_output_portable(
     interval_seconds: float,
     max_directories: int,
 ) -> int:
-    """Process one bounded page of exact durable portable-GC work items."""
+    """Process one bounded page of portable index and tombstone work."""
     store = _current_cron_store()
-    conn = _initialize_portable_output_gc_index()
+    with _portable_output_filesystem_guard() as acquired:
+        if not acquired:
+            return 0
+        database_was_missing = not _portable_output_gc_db_path().exists()
+        conn = _initialize_portable_output_gc_index(
+            bootstrap_complete_if_new=(
+                database_was_missing and _portable_output_root_is_empty()
+            )
+        )
+        consumed = _consume_portable_output_pending(conn, limit=max_directories)
+        conn.commit()
+        _unlink_portable_output_pending(consumed)
     try:
         complete = conn.execute(
             "SELECT value FROM metadata WHERE key = 'bootstrap_complete'"
@@ -2734,6 +2990,36 @@ def _gc_orphaned_output_portable(
                     return 0
             except (TypeError, ValueError):
                 pass
+
+        removed = 0
+        work_done = 0
+        tombstone_rows = conn.execute(
+            """SELECT id FROM tombstones ORDER BY id LIMIT ?""",
+            (max_directories,),
+        ).fetchall()
+        for (tombstone_id,) in tombstone_rows:
+            work_done += 1
+            with _portable_output_filesystem_guard() as acquired:
+                tombstone = (
+                    _recover_portable_tombstone_locked(
+                        conn, store.output_dir, tombstone_id
+                    )
+                    if acquired
+                    else None
+                )
+            if tombstone is None:
+                continue
+            try:
+                deleted = _delete_portable_tombstone(store.output_dir, tombstone)
+            except OSError as exc:
+                logger.debug("Failed to reap cron output tombstone %s: %s", tombstone, exc)
+                continue
+            if deleted and _finalize_portable_tombstone(
+                conn, store.output_dir, tombstone_id, tombstone
+            ):
+                removed += 1
+
+        remaining = max_directories - work_done
         cursor_row = conn.execute(
             "SELECT value FROM metadata WHERE key = 'cursor'"
         ).fetchone()
@@ -2741,109 +3027,115 @@ def _gc_orphaned_output_portable(
             cursor = int(cursor_row[0]) if cursor_row else 0
         except (TypeError, ValueError):
             cursor = 0
-        rows = conn.execute(
-            """SELECT id, name, first_seen, generation
-               FROM directories WHERE id > ? ORDER BY id LIMIT ?""",
-            (cursor, max_directories),
-        ).fetchall()
-        if len(rows) < max_directories:
-            rows.extend(
-                conn.execute(
-                    """SELECT id, name, first_seen, generation
-                       FROM directories WHERE id <= ? ORDER BY id LIMIT ?""",
-                    (cursor, max_directories - len(rows)),
-                ).fetchall()
-            )
+        rows = []
+        if remaining:
+            rows = conn.execute(
+                """SELECT id, name, first_seen, generation
+                   FROM directories WHERE id > ? ORDER BY id LIMIT ?""",
+                (cursor, remaining),
+            ).fetchall()
+            if len(rows) < remaining:
+                rows.extend(
+                    conn.execute(
+                        """SELECT id, name, first_seen, generation
+                           FROM directories WHERE id <= ? ORDER BY id LIMIT ?""",
+                        (cursor, remaining - len(rows)),
+                    ).fetchall()
+                )
 
-        removed = 0
         for row_id, name, _selected_first_seen, generation in rows:
-            # Synchronize the final generation check with publication. The
-            # transaction remains held through filesystem detachment/deletion
-            # and conditional row mutation, so a saver cannot enqueue a newer
-            # generation between validation and removal.
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                current = conn.execute(
-                    """SELECT first_seen FROM directories
-                       WHERE id = ? AND generation = ?""",
-                    (row_id, generation),
-                ).fetchone()
-                if current is None:
+            tombstone_id: Optional[int] = None
+            with _portable_output_filesystem_guard() as acquired:
+                if not acquired:
+                    continue
+                conn.execute("BEGIN IMMEDIATE")
+                try:
+                    current = conn.execute(
+                        """SELECT first_seen FROM directories
+                           WHERE id = ? AND generation = ?""",
+                        (row_id, generation),
+                    ).fetchone()
+                    if current is None:
+                        conn.rollback()
+                        continue
+                    first_seen = current[0]
+                    if name in live_ids:
+                        conn.execute(
+                            """UPDATE directories SET first_seen = NULL
+                               WHERE id = ? AND generation = ?""",
+                            (row_id, generation),
+                        )
+                        conn.commit()
+                        continue
+                    entry_path = store.output_dir / name
+                    try:
+                        entry_stat = os.stat(entry_path, follow_symlinks=False)
+                    except FileNotFoundError:
+                        conn.execute(
+                            "DELETE FROM directories WHERE id = ? AND generation = ?",
+                            (row_id, generation),
+                        )
+                        conn.commit()
+                        continue
+                    except OSError as exc:
+                        logger.debug(
+                            "Failed to inspect orphaned cron output %s: %s", name, exc
+                        )
+                        conn.commit()
+                        continue
+                    if not stat.S_ISDIR(entry_stat.st_mode):
+                        conn.execute(
+                            "DELETE FROM directories WHERE id = ? AND generation = ?",
+                            (row_id, generation),
+                        )
+                        conn.commit()
+                        continue
+                    observed_at = float(first_seen) if first_seen is not None else now
+                    if now - observed_at < retention_days * 86400:
+                        conn.execute(
+                            """UPDATE directories SET first_seen = ?
+                               WHERE id = ? AND generation = ?""",
+                            (observed_at, row_id, generation),
+                        )
+                        conn.commit()
+                        continue
+
+                    tombstone_name = f".gc-{uuid.uuid4().hex}"
+                    inserted_tombstone_id = conn.execute(
+                        """INSERT INTO tombstones
+                           (path, directory_name, generation, state)
+                           VALUES (?, ?, ?, 'planned')""",
+                        (tombstone_name, name, generation),
+                    ).lastrowid
+                    if inserted_tombstone_id is None:
+                        raise RuntimeError("portable cron GC did not allocate tombstone state")
+                    tombstone_id = int(inserted_tombstone_id)
+                    # Commit intent before rename. A crash on either side of the
+                    # filesystem operation leaves enough durable state to recover.
+                    conn.commit()
+                    tombstone = _recover_portable_tombstone_locked(
+                        conn, store.output_dir, tombstone_id
+                    )
+                except BaseException:
                     conn.rollback()
-                    continue
-                first_seen = current[0]
-                if name in live_ids:
-                    conn.execute(
-                        """UPDATE directories SET first_seen = NULL
-                           WHERE id = ? AND generation = ?""",
-                        (row_id, generation),
-                    )
-                    conn.commit()
-                    continue
-
-                entry_path = store.output_dir / name
-                try:
-                    entry_stat = os.stat(entry_path, follow_symlinks=False)
-                except FileNotFoundError:
-                    conn.execute(
-                        "DELETE FROM directories WHERE id = ? AND generation = ?",
-                        (row_id, generation),
-                    )
-                    conn.commit()
-                    continue
-                except OSError as exc:
-                    logger.debug(
-                        "Failed to inspect orphaned cron output %s: %s", name, exc
-                    )
-                    conn.commit()
-                    continue
-                if not stat.S_ISDIR(entry_stat.st_mode):
-                    conn.execute(
-                        "DELETE FROM directories WHERE id = ? AND generation = ?",
-                        (row_id, generation),
-                    )
-                    conn.commit()
-                    continue
-
-                observed_at = float(first_seen) if first_seen is not None else now
-                if now - observed_at < retention_days * 86400:
-                    conn.execute(
-                        """UPDATE directories SET first_seen = ?
-                           WHERE id = ? AND generation = ?""",
-                        (observed_at, row_id, generation),
-                    )
-                    conn.commit()
-                    continue
-                try:
-                    deleted = _remove_portable_output_directory(
-                        store.output_dir, name
-                    )
-                except OSError as exc:
-                    logger.debug(
-                        "Failed to prune orphaned cron output %s: %s", name, exc
-                    )
-                    conn.execute(
-                        """UPDATE directories SET first_seen = ?
-                           WHERE id = ? AND generation = ?""",
-                        (observed_at, row_id, generation),
-                    )
-                else:
-                    if deleted:
-                        removed += 1
-                    conn.execute(
-                        "DELETE FROM directories WHERE id = ? AND generation = ?",
-                        (row_id, generation),
-                    )
-                conn.commit()
-            except BaseException:
-                conn.rollback()
-                raise
+                    raise
+            if tombstone_id is None or tombstone is None:
+                continue
+            try:
+                deleted = _delete_portable_tombstone(store.output_dir, tombstone)
+            except OSError as exc:
+                logger.debug("Failed to prune orphaned cron output %s: %s", name, exc)
+                continue
+            if deleted and _finalize_portable_tombstone(
+                conn, store.output_dir, tombstone_id, tombstone
+            ):
+                removed += 1
 
         conn.execute("BEGIN IMMEDIATE")
         try:
             conn.execute(
                 "INSERT OR REPLACE INTO metadata(key, value) VALUES('cursor', ?)",
-                (str(rows[-1][0]) if rows else "0",),
+                (str(rows[-1][0]) if rows else str(cursor),),
             )
             conn.execute(
                 "INSERT OR REPLACE INTO metadata(key, value) VALUES('last_gc_at', ?)",
@@ -2919,13 +3211,12 @@ def gc_orphaned_output(
         live_ids = {str(job.get("id")) for job in load_jobs() if job.get("id")}
         if not _use_linux_output_gc():
             try:
-                with _portable_output_filesystem_guard():
-                    return _gc_orphaned_output_portable(
-                        live_ids=live_ids,
-                        retention_days=retention_days,
-                        interval_seconds=interval_seconds,
-                        max_directories=max_directories,
-                    )
+                return _gc_orphaned_output_portable(
+                    live_ids=live_ids,
+                    retention_days=retention_days,
+                    interval_seconds=interval_seconds,
+                    max_directories=max_directories,
+                )
             except Exception as exc:
                 logger.warning(
                     "Portable cron output GC index unavailable; skipping this "
@@ -3102,41 +3393,16 @@ def gc_orphaned_output(
 
 
 def save_job_output(job_id: str, output: str):
-    """Save job output to file."""
+    """Save job output to file; auxiliary retention failures never block it."""
     ensure_dirs()
-    store = _current_cron_store()
     job_output_dir = _job_output_dir(job_id)
     portable = not _use_linux_output_gc()
-    bootstrap_complete_if_new = False
-    if portable and not _portable_output_gc_db_path().exists():
-        # A missing index is safe to initialize automatically only when there
-        # are no legacy output directories waiting for explicit bootstrap.
-        try:
-            with os.scandir(store.output_dir) as entries:
-                bootstrap_complete_if_new = next(entries, None) is None
-        except OSError:
-            bootstrap_complete_if_new = False
 
-    guard = (
-        _portable_output_publication_guard(
-            job_output_dir.name,
-            bootstrap_complete_if_new=bootstrap_complete_if_new,
-        )
-        if portable
-        else contextlib.nullcontext()
-    )
-    filesystem_guard = (
-        _portable_output_filesystem_guard()
-        if portable
-        else contextlib.nullcontext()
-    )
-    with filesystem_guard, guard:
+    def publish() -> Path:
         job_output_dir.mkdir(parents=True, exist_ok=True)
         _secure_dir(job_output_dir)
-
         timestamp = _hermes_now().strftime("%Y-%m-%d_%H-%M-%S")
         output_file = job_output_dir / f"{timestamp}.md"
-
         fd, tmp_path = tempfile.mkstemp(
             dir=str(job_output_dir), suffix='.tmp', prefix='.output_'
         )
@@ -3153,6 +3419,55 @@ def save_job_output(job_id: str, output: str):
             except OSError:
                 pass
             raise
+        return output_file
+
+    if not portable:
+        output_file = publish()
+    else:
+        pending_marker: Optional[Path] = None
+        try:
+            # The marker precedes publication, closing the crash window when a
+            # bootstrap or another process owns the bounded filesystem guard.
+            pending_marker = _write_portable_output_pending(job_output_dir.name)
+        except Exception as exc:
+            logger.warning(
+                "Portable cron output pending marker unavailable for %s; "
+                "continuing fail-open: %s",
+                job_output_dir.name,
+                exc,
+            )
+
+        with _portable_output_filesystem_guard(
+            timeout=_PORTABLE_OUTPUT_GC_BUSY_TIMEOUT_SECONDS
+        ) as acquired:
+            if acquired:
+                bootstrap_complete_if_new = (
+                    not _portable_output_gc_db_path().exists()
+                    and _portable_output_root_is_empty()
+                )
+                with _portable_output_publication_guard(
+                    job_output_dir.name,
+                    bootstrap_complete_if_new=bootstrap_complete_if_new,
+                ):
+                    output_file = publish()
+            else:
+                output_file = publish()
+
+        # Reconcile after releasing the filesystem guard. During bootstrap this
+        # remains bounded by SQLite's timeout; bootstrap itself consumes the
+        # durable marker before declaring completion.
+        try:
+            _portable_output_gc_enqueue(job_output_dir.name)
+        except Exception as exc:
+            logger.warning(
+                "Portable cron output was published but remains queued for "
+                "retention indexing (%s): %s",
+                job_output_dir.name,
+                exc,
+            )
+        else:
+            if pending_marker is not None:
+                _unlink_portable_output_pending([pending_marker])
 
     # Bound per-job output growth so long-running deploys don't fill the disk (#52383).
     _prune_job_output(job_output_dir, _cron_output_keep())
