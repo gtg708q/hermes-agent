@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from agent.codex_responses_adapter import _format_responses_error
+from agent.errors import TurnWallClockExceeded
 from agent.redact import redact_sensitive_text
 from agent.transports.codex_app_server import (
     CodexAppServerClient,
@@ -312,7 +313,7 @@ class CodexAppServerSession:
 
     # ---------- lifecycle ----------
 
-    def ensure_started(self) -> str:
+    def ensure_started(self, *, deadline_monotonic: float | None = None) -> str:
         """Spawn the subprocess, do the initialize handshake, and start a
         thread. Returns the codex thread id. Idempotent — repeated calls
         return the same thread id."""
@@ -322,10 +323,20 @@ class CodexAppServerSession:
             self._client = self._client_factory(
                 codex_bin=self._codex_bin, codex_home=self._codex_home
             )
+
+        def _remaining(default: float) -> float:
+            if deadline_monotonic is None:
+                return default
+            value = deadline_monotonic - time.monotonic()
+            if value <= 0:
+                raise TurnWallClockExceeded("wall_clock_budget_reached")
+            return min(default, max(0.01, value))
+
         self._client.initialize(
             client_name="hermes",
             client_title="Hermes Agent",
             client_version=_get_hermes_version(),
+            timeout=_remaining(10.0),
         )
         # Permission selection is intentionally NOT sent on thread/start.
         # Two reasons (live-tested against codex 0.130.0):
@@ -343,7 +354,7 @@ class CodexAppServerSession:
         # Users who want a write-capable profile configure it in their
         # ~/.codex/config.toml the same way they would for any codex usage.
         params: dict[str, Any] = {"cwd": self._cwd}
-        result = self._client.request("thread/start", params, timeout=15)
+        result = self._client.request("thread/start", params, timeout=_remaining(15.0))
         # Cross-fill thread.id/sessionId — different codex versions have
         # serialized this under either key. Mirrors openclaw beta.8's
         # tolerance fix so future codex drops/renames don't KeyError us
@@ -372,7 +383,7 @@ class CodexAppServerSession:
         )
         return self._thread_id
 
-    def close(self) -> None:
+    def close(self, timeout: float = 3.0) -> None:
         if self._closed:
             return
         self._closed = True
@@ -380,7 +391,13 @@ class CodexAppServerSession:
             self._active_turn_id = None
         if self._client is not None:
             try:
-                self._client.close()
+                self._client.close(timeout=max(0.0, timeout))
+            except TypeError:
+                # Compatibility for injected/older clients without the timeout
+                # parameter. Never call an unbounded fallback after a hard
+                # deadline has already expired.
+                if timeout > 0:
+                    self._client.close()
             except Exception:  # pragma: no cover - best-effort cleanup
                 pass
             self._client = None
@@ -474,6 +491,7 @@ class CodexAppServerSession:
         turn_timeout: float = 600.0,
         notification_poll_timeout: float = 0.25,
         post_tool_quiet_timeout: float = 90.0,
+        deadline_monotonic: float | None = None,
     ) -> TurnResult:
         """Send a user message and block until turn/completed, while
         forwarding server-initiated approval requests and projecting items
@@ -492,8 +510,12 @@ class CodexAppServerSession:
         # up to AIAgent.run_conversation.
         result = TurnResult()
         try:
-            self.ensure_started()
+            self.ensure_started(deadline_monotonic=deadline_monotonic)
+        except TurnWallClockExceeded:
+            raise
         except (CodexAppServerError, TimeoutError) as exc:
+            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                raise TurnWallClockExceeded("wall_clock_budget_reached") from exc
             result.error = self._format_error_with_stderr(
                 "codex app-server startup failed", exc
             )
@@ -518,6 +540,12 @@ class CodexAppServerSession:
 
         # Send turn/start with the user input. Text-only for now (codex
         # supports rich content but Hermes' text path is the common case).
+        turn_start_timeout = 10.0
+        if deadline_monotonic is not None:
+            remaining = deadline_monotonic - time.monotonic()
+            if remaining <= 0:
+                raise TurnWallClockExceeded("wall_clock_budget_reached")
+            turn_start_timeout = min(turn_start_timeout, max(0.01, remaining))
         try:
             ts = self._client.request(
                 "turn/start",
@@ -525,7 +553,7 @@ class CodexAppServerSession:
                     "threadId": self._thread_id,
                     "input": [{"type": "text", "text": user_input_text}],
                 },
-                timeout=10,
+                timeout=turn_start_timeout,
             )
         except CodexAppServerError as exc:
             # Classify auth/refresh failures so the user gets a clear
@@ -546,6 +574,8 @@ class CodexAppServerSession:
             self._interrupt_event.clear()
             return result
         except TimeoutError as exc:
+            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+                raise TurnWallClockExceeded("wall_clock_budget_reached") from exc
             # turn/start hanging is a strong signal the subprocess is wedged.
             stderr_blob = "\n".join(self._client.stderr_tail(40))
             hint = _classify_oauth_failure(stderr_blob)
@@ -559,7 +589,10 @@ class CodexAppServerSession:
         result.turn_id = (ts.get("turn") or {}).get("id")
         with self._active_turn_lock:
             self._active_turn_id = result.turn_id
-        deadline = time.monotonic() + turn_timeout
+        deadline = min(
+            time.monotonic() + turn_timeout,
+            deadline_monotonic if deadline_monotonic is not None else float("inf"),
+        )
         turn_complete = False
         # Post-tool watchdog state. last_tool_completion_at is set whenever
         # a tool-shaped item completes; if no further notification arrives
@@ -770,12 +803,19 @@ class CodexAppServerSession:
             )
             turn_complete = True
 
+        wall_clock_expired = (
+            deadline_monotonic is not None
+            and time.monotonic() >= deadline_monotonic
+            and not turn_complete
+        )
         if not turn_complete and not result.interrupted:
-            # Hit the deadline. Issue interrupt to stop wasted compute, and
             # tell the caller to retire the session — a turn that never
             # finished is a strong sign codex is wedged in a way the next
-            # turn shouldn't inherit.
-            self._issue_interrupt(result.turn_id)
+            # turn shouldn't inherit. A whole-turn deadline is a hard return
+            # boundary, so skip the blocking interrupt RPC in that case; the
+            # caller retires the subprocess immediately.
+            if not wall_clock_expired:
+                self._issue_interrupt(result.turn_id)
             result.interrupted = True
             if not result.error:
                 result.error = self._format_error_with_stderr(
@@ -786,6 +826,8 @@ class CodexAppServerSession:
         with self._active_turn_lock:
             self._active_turn_id = None
         self._interrupt_event.clear()
+        if wall_clock_expired:
+            raise TurnWallClockExceeded("wall_clock_budget_reached")
         return result
 
     def compact_thread(

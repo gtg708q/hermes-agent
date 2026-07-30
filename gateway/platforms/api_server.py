@@ -52,6 +52,7 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -650,6 +651,7 @@ class ResponseStore:
 
     def __init__(self, max_size: int = MAX_STORED_RESPONSES, db_path: str = None):
         self._max_size = max_size
+        self._lock = threading.RLock()
         if db_path is None:
             try:
                 from hermes_cli.config import get_hermes_home
@@ -657,31 +659,78 @@ class ResponseStore:
             except Exception:
                 db_path = ":memory:"
         self._db_path: Optional[str] = db_path if db_path != ":memory:" else None
+        self._durable_run_store_available = db_path != ":memory:"
         try:
             self._conn = sqlite3.connect(db_path, check_same_thread=False)
         except Exception:
             self._conn = sqlite3.connect(":memory:", check_same_thread=False)
             self._db_path = None
+            self._durable_run_store_available = False
         # Use shared WAL-fallback helper so response_store.db degrades
         # gracefully on NFS/SMB/FUSE-mounted HERMES_HOME (same filesystem
         # issue addressed for state.db/kanban.db — see
         # hermes_state._WAL_INCOMPAT_MARKERS).
         from hermes_state import apply_wal_with_fallback
         apply_wal_with_fallback(self._conn, db_label="response_store.db")
-        self._conn.execute(
-            """CREATE TABLE IF NOT EXISTS responses (
-                response_id TEXT PRIMARY KEY,
-                data TEXT NOT NULL,
-                accessed_at REAL NOT NULL
-            )"""
-        )
-        self._conn.execute(
-            """CREATE TABLE IF NOT EXISTS conversations (
-                name TEXT PRIMARY KEY,
-                response_id TEXT NOT NULL
-            )"""
-        )
-        self._conn.commit()
+        # Serialize the schema read/ALTER sequence across gateway processes.
+        # Without the write transaction, two first-openers can both observe a
+        # missing column and the loser aborts startup with "duplicate column".
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute(
+                    """CREATE TABLE IF NOT EXISTS responses (
+                        response_id TEXT PRIMARY KEY,
+                        data TEXT NOT NULL,
+                        accessed_at REAL NOT NULL
+                    )"""
+                )
+                self._conn.execute(
+                    """CREATE TABLE IF NOT EXISTS conversations (
+                        name TEXT PRIMARY KEY,
+                        response_id TEXT NOT NULL
+                    )"""
+                )
+                self._conn.execute(
+                    """CREATE TABLE IF NOT EXISTS run_idempotency (
+                        run_id TEXT PRIMARY KEY,
+                        request_fingerprint TEXT NOT NULL,
+                        status_json TEXT NOT NULL,
+                        updated_at REAL NOT NULL,
+                        terminal_at REAL,
+                        owner_id TEXT,
+                        lease_expires_at REAL,
+                        profile TEXT NOT NULL DEFAULT 'default'
+                    )"""
+                )
+                # Migrate stores created before leased owners/profile scoping.
+                run_columns = {
+                    row[1]
+                    for row in self._conn.execute(
+                        "PRAGMA table_info(run_idempotency)"
+                    )
+                }
+                if "owner_id" not in run_columns:
+                    self._conn.execute(
+                        "ALTER TABLE run_idempotency ADD COLUMN owner_id TEXT"
+                    )
+                if "lease_expires_at" not in run_columns:
+                    self._conn.execute(
+                        "ALTER TABLE run_idempotency ADD COLUMN lease_expires_at REAL"
+                    )
+                if "profile" not in run_columns:
+                    self._conn.execute(
+                        """ALTER TABLE run_idempotency
+                           ADD COLUMN profile TEXT NOT NULL DEFAULT 'default'"""
+                    )
+                self._conn.execute(
+                    """CREATE INDEX IF NOT EXISTS idx_run_idempotency_terminal_at
+                       ON run_idempotency(terminal_at)"""
+                )
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
         # response_store.db contains conversation history (tool payloads,
         # prompts, results). Tighten to owner-only after creation so other
         # local users on a shared box can't read it. Run once at __init__
@@ -710,98 +759,395 @@ class ResponseStore:
 
     def get(self, response_id: str) -> Optional[Dict[str, Any]]:
         """Retrieve a stored response by ID (updates access time for LRU)."""
-        row = self._conn.execute(
-            "SELECT data FROM responses WHERE response_id = ?", (response_id,)
-        ).fetchone()
-        if row is None:
-            return None
-        self._conn.execute(
-            "UPDATE responses SET accessed_at = ? WHERE response_id = ?",
-            (time.time(), response_id),
-        )
-        self._conn.commit()
-        try:
-            return json.loads(row[0])
-        except (json.JSONDecodeError, TypeError):
-            logger.warning(
-                "Corrupted JSON in response store for id=%s, evicting entry",
-                response_id,
-            )
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT data FROM responses WHERE response_id = ?", (response_id,)
+            ).fetchone()
+            if row is None:
+                return None
             self._conn.execute(
-                "DELETE FROM responses WHERE response_id = ?",
-                (response_id,),
+                "UPDATE responses SET accessed_at = ? WHERE response_id = ?",
+                (time.time(), response_id),
             )
             self._conn.commit()
-            return None
+            try:
+                return json.loads(row[0])
+            except (json.JSONDecodeError, TypeError):
+                logger.warning(
+                    "Corrupted JSON in response store for id=%s, evicting entry",
+                    response_id,
+                )
+                self._conn.execute(
+                    "DELETE FROM responses WHERE response_id = ?",
+                    (response_id,),
+                )
+                self._conn.commit()
+                return None
 
     def put(self, response_id: str, data: Dict[str, Any]) -> None:
         """Store a response, evicting the oldest if at capacity."""
-        self._conn.execute(
-            "INSERT OR REPLACE INTO responses (response_id, data, accessed_at) VALUES (?, ?, ?)",
-            (response_id, json.dumps(data, default=str), time.time()),
-        )
-        # Evict oldest entries beyond max_size
-        count = self._conn.execute("SELECT COUNT(*) FROM responses").fetchone()[0]
-        if count > self._max_size:
-            # Collect IDs that will be evicted
-            evict_ids = [
-                row[0]
-                for row in self._conn.execute(
-                    "SELECT response_id FROM responses ORDER BY accessed_at ASC LIMIT ?",
-                    (count - self._max_size,),
-                ).fetchall()
-            ]
-            if evict_ids:
-                placeholders = ",".join("?" for _ in evict_ids)
-                # Clear conversation mappings pointing to evicted responses
-                self._conn.execute(
-                    f"DELETE FROM conversations WHERE response_id IN ({placeholders})",
-                    evict_ids,
-                )
-                # Delete evicted responses
-                self._conn.execute(
-                    f"DELETE FROM responses WHERE response_id IN ({placeholders})",
-                    evict_ids,
-                )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO responses (response_id, data, accessed_at) VALUES (?, ?, ?)",
+                (response_id, json.dumps(data, default=str), time.time()),
+            )
+            # Evict oldest entries beyond max_size
+            count = self._conn.execute("SELECT COUNT(*) FROM responses").fetchone()[0]
+            if count > self._max_size:
+                # Collect IDs that will be evicted
+                evict_ids = [
+                    row[0]
+                    for row in self._conn.execute(
+                        "SELECT response_id FROM responses ORDER BY accessed_at ASC LIMIT ?",
+                        (count - self._max_size,),
+                    ).fetchall()
+                ]
+                if evict_ids:
+                    placeholders = ",".join("?" for _ in evict_ids)
+                    # Clear conversation mappings pointing to evicted responses
+                    self._conn.execute(
+                        f"DELETE FROM conversations WHERE response_id IN ({placeholders})",
+                        evict_ids,
+                    )
+                    # Delete evicted responses
+                    self._conn.execute(
+                        f"DELETE FROM responses WHERE response_id IN ({placeholders})",
+                        evict_ids,
+                    )
+            self._conn.commit()
 
     def delete(self, response_id: str) -> bool:
         """Remove a response from the store. Returns True if found and deleted."""
-        # Clear conversation mappings pointing to this response
-        self._conn.execute(
-            "DELETE FROM conversations WHERE response_id = ?", (response_id,)
-        )
-        cursor = self._conn.execute(
-            "DELETE FROM responses WHERE response_id = ?", (response_id,)
-        )
-        self._conn.commit()
-        return cursor.rowcount > 0
+        with self._lock:
+            # Clear conversation mappings pointing to this response
+            self._conn.execute(
+                "DELETE FROM conversations WHERE response_id = ?", (response_id,)
+            )
+            cursor = self._conn.execute(
+                "DELETE FROM responses WHERE response_id = ?", (response_id,)
+            )
+            self._conn.commit()
+            return cursor.rowcount > 0
 
     def get_conversation(self, name: str) -> Optional[str]:
         """Get the latest response_id for a conversation name."""
-        row = self._conn.execute(
-            "SELECT response_id FROM conversations WHERE name = ?", (name,)
-        ).fetchone()
-        return row[0] if row else None
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT response_id FROM conversations WHERE name = ?", (name,)
+            ).fetchone()
+            return row[0] if row else None
 
     def set_conversation(self, name: str, response_id: str) -> None:
         """Map a conversation name to its latest response_id."""
-        self._conn.execute(
-            "INSERT OR REPLACE INTO conversations (name, response_id) VALUES (?, ?)",
-            (name, response_id),
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO conversations (name, response_id) VALUES (?, ?)",
+                (name, response_id),
+            )
+            self._conn.commit()
+
+    def claim_run(
+        self,
+        run_id: str,
+        request_fingerprint: str,
+        status: Dict[str, Any],
+        *,
+        profile: str = "default",
+        owner_id: Optional[str] = None,
+        lease_seconds: float = 0,
+        now: Optional[float] = None,
+    ) -> tuple[bool, bool, Dict[str, Any]]:
+        """Cross-process CAS for idempotent run ownership.
+
+        A queued claim can be taken over only after its owner's lease expires.
+        Once an owner durably transitions past ``queued``, expiry fails closed:
+        Python executor threads cannot be forcibly stopped, so allowing a new
+        process to run the same claim could duplicate external side effects.
+        The first observer atomically terminalizes an expired post-start claim
+        as failed and clears its owner, fencing any stale executor from
+        publishing a later result. This preserves safe queued recovery without
+        leaking a permanent nonterminal status.
+        ``owner_id=None`` preserves the legacy insert/replay behavior for
+        callers that do not execute runs.
+        """
+        if not self._durable_run_store_available:
+            raise RuntimeError("durable response store is unavailable")
+        encoded = json.dumps(status, default=str, sort_keys=True)
+        now = time.time() if now is None else float(now)
+        lease_expires_at = now + max(0.0, float(lease_seconds))
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = self._conn.execute(
+                    """INSERT OR IGNORE INTO run_idempotency
+                       (run_id, request_fingerprint, status_json, updated_at,
+                        terminal_at, owner_id, lease_expires_at, profile)
+                       VALUES (?, ?, ?, ?, NULL, ?, ?, ?)""",
+                    (
+                        run_id,
+                        request_fingerprint,
+                        encoded,
+                        now,
+                        owner_id,
+                        lease_expires_at if owner_id is not None else None,
+                        profile,
+                    ),
+                )
+                if cursor.rowcount == 1:
+                    self._conn.commit()
+                    return True, False, status
+                row = self._conn.execute(
+                    """SELECT request_fingerprint, status_json, terminal_at,
+                              owner_id, lease_expires_at, profile
+                       FROM run_idempotency WHERE run_id = ?""",
+                    (run_id,),
+                ).fetchone()
+                try:
+                    existing_status = json.loads(row[1]) if row is not None else {}
+                except (json.JSONDecodeError, TypeError):
+                    existing_status = {}
+                existing_owner_id = row[3] if row is not None else None
+                existing_lease_expires_at = row[4] if row is not None else None
+                matching_claim = (
+                    row is not None
+                    and owner_id is not None
+                    and hmac.compare_digest(str(row[0]), request_fingerprint)
+                    and hmac.compare_digest(str(row[5]), profile)
+                    and row[2] is None
+                )
+                lease_expired = (
+                    row is not None
+                    and (
+                        existing_owner_id is None
+                        or existing_lease_expires_at is None
+                        or float(existing_lease_expires_at) <= now
+                    )
+                )
+                if (
+                    matching_claim
+                    and existing_status.get("status") == "queued"
+                    and lease_expired
+                ):
+                    cursor = self._conn.execute(
+                        """UPDATE run_idempotency
+                           SET status_json = ?, updated_at = ?, terminal_at = NULL,
+                               owner_id = ?, lease_expires_at = ?
+                           WHERE run_id = ? AND request_fingerprint = ? AND profile = ?
+                             AND terminal_at IS NULL
+                             AND (owner_id IS NULL OR lease_expires_at IS NULL
+                                  OR lease_expires_at <= ?)""",
+                        (
+                            encoded,
+                            now,
+                            owner_id,
+                            lease_expires_at,
+                            run_id,
+                            request_fingerprint,
+                            profile,
+                            now,
+                        ),
+                    )
+                    if cursor.rowcount == 1:
+                        self._conn.commit()
+                        return True, False, status
+                if (
+                    matching_claim
+                    and existing_status.get("status")
+                    in {"running", "waiting_for_approval", "stopping"}
+                    and lease_expired
+                ):
+                    failed_status = {
+                        **existing_status,
+                        "status": "failed",
+                        "updated_at": now,
+                        "error": (
+                            "Run failed because its durable owner lease expired after "
+                            "execution started; execution was not restarted to "
+                            "preserve at-most-once safety."
+                        ),
+                        "last_event": "run.failed",
+                    }
+                    failed_encoded = json.dumps(
+                        failed_status, default=str, sort_keys=True
+                    )
+                    cursor = self._conn.execute(
+                        """UPDATE run_idempotency
+                           SET status_json = ?, updated_at = ?, terminal_at = ?,
+                               owner_id = NULL, lease_expires_at = NULL
+                           WHERE run_id = ? AND request_fingerprint = ? AND profile = ?
+                             AND terminal_at IS NULL
+                             AND owner_id IS ?
+                             AND (lease_expires_at IS NULL OR lease_expires_at <= ?)""",
+                        (
+                            failed_encoded,
+                            now,
+                            now,
+                            run_id,
+                            request_fingerprint,
+                            profile,
+                            existing_owner_id,
+                            now,
+                        ),
+                    )
+                    if cursor.rowcount == 1:
+                        self._conn.commit()
+                        return False, False, failed_status
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+        if row is None:  # pragma: no cover - defensive against external DB surgery
+            return False, True, {}
+        conflict = not (
+            hmac.compare_digest(str(row[0]), request_fingerprint)
+            and hmac.compare_digest(str(row[5]), profile)
         )
-        self._conn.commit()
+        try:
+            existing = json.loads(row[1])
+        except (json.JSONDecodeError, TypeError):
+            existing = {}
+        return False, conflict, existing
+
+    def put_run_status(
+        self,
+        run_id: str,
+        status: Dict[str, Any],
+        *,
+        owner_id: Optional[str] = None,
+        lease_seconds: float = 0,
+        now: Optional[float] = None,
+    ) -> bool:
+        encoded = json.dumps(status, default=str, sort_keys=True)
+        now = time.time() if now is None else float(now)
+        terminal_at = (
+            now
+            if status.get("status") in {"completed", "failed", "cancelled"}
+            else None
+        )
+        lease_expires_at = now + max(0.0, float(lease_seconds))
+        with self._lock:
+            owner_clause = "" if owner_id is None else " AND owner_id = ?"
+            params: list[Any] = [
+                encoded,
+                now,
+                terminal_at,
+                terminal_at,
+                lease_expires_at,
+                run_id,
+            ]
+            if owner_id is not None:
+                params.append(owner_id)
+            cursor = self._conn.execute(
+                """UPDATE run_idempotency
+                   SET status_json = ?, updated_at = ?,
+                       terminal_at = CASE WHEN ? IS NULL THEN terminal_at ELSE ? END,
+                       lease_expires_at = ?
+                   WHERE run_id = ?""" + owner_clause,
+                params,
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
+
+    def renew_run_lease(
+        self,
+        run_id: str,
+        owner_id: str,
+        lease_seconds: float,
+        *,
+        now: Optional[float] = None,
+    ) -> bool:
+        """Extend a live claim if this process still owns it."""
+        now = time.time() if now is None else float(now)
+        with self._lock:
+            cursor = self._conn.execute(
+                """UPDATE run_idempotency
+                   SET updated_at = ?, lease_expires_at = ?
+                   WHERE run_id = ? AND owner_id = ? AND terminal_at IS NULL""",
+                (now, now + max(0.0, float(lease_seconds)), run_id, owner_id),
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
+
+    def get_run_status(
+        self, run_id: str, *, profile: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            profile_clause = "" if profile is None else " AND profile = ?"
+            params: tuple[Any, ...] = (run_id,) if profile is None else (run_id, profile)
+            row = self._conn.execute(
+                "SELECT status_json FROM run_idempotency WHERE run_id = ?"
+                + profile_clause,
+                params,
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            return json.loads(row[0])
+        except (json.JSONDecodeError, TypeError):
+            return None
+
+    def get_run_claim_metadata(
+        self, run_id: str, *, profile: Optional[str] = None
+    ) -> Optional[Dict[str, Any]]:
+        """Return one locked snapshot of status and admission lease fields."""
+        with self._lock:
+            profile_clause = "" if profile is None else " AND profile = ?"
+            params: tuple[Any, ...] = (run_id,) if profile is None else (run_id, profile)
+            row = self._conn.execute(
+                """SELECT status_json, terminal_at, lease_expires_at
+                   FROM run_idempotency WHERE run_id = ?""" + profile_clause,
+                params,
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            status = json.loads(row[0])
+        except (json.JSONDecodeError, TypeError):
+            status = {}
+        return {
+            "status": status if isinstance(status, dict) else {},
+            "terminal_at": row[1],
+            "lease_expires_at": row[2],
+        }
+
+    def delete_terminal_run(self, run_id: str, cutoff: float) -> None:
+        with self._lock:
+            self._conn.execute(
+                """DELETE FROM run_idempotency
+                   WHERE run_id = ? AND terminal_at IS NOT NULL AND terminal_at < ?""",
+                (run_id, cutoff),
+            )
+            self._conn.commit()
+
+    def delete_expired_terminal_runs(self, cutoff: float, limit: int = 100) -> int:
+        """Delete one bounded batch of expired durable terminal run rows."""
+        limit = max(1, int(limit))
+        with self._lock:
+            cursor = self._conn.execute(
+                """DELETE FROM run_idempotency
+                   WHERE run_id IN (
+                       SELECT run_id FROM run_idempotency
+                       WHERE terminal_at IS NOT NULL AND terminal_at < ?
+                       ORDER BY terminal_at
+                       LIMIT ?
+                   )""",
+                (cutoff, limit),
+            )
+            self._conn.commit()
+            return max(0, cursor.rowcount)
 
     def close(self) -> None:
         """Close the database connection."""
-        try:
-            self._conn.close()
-        except Exception:
-            pass
+        with self._lock:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
 
     def __len__(self) -> int:
-        row = self._conn.execute("SELECT COUNT(*) FROM responses").fetchone()
-        return row[0] if row else 0
+        with self._lock:
+            row = self._conn.execute("SELECT COUNT(*) FROM responses").fetchone()
+            return row[0] if row else 0
 
 
 # ---------------------------------------------------------------------------
@@ -945,15 +1291,86 @@ def _admit_api_agent_request(handler):
         draining = self._draining_response()
         if draining is not None:
             return draining
-        reservation = {"active": True}
+        # A keyed /v1/runs replay consumes no execution slot. Reserve the
+        # request before the durable lookup is offloaded so shutdown drain can
+        # see it while SQLite is busy. The reservation remains an execution
+        # reservation for queued claims because their lease can expire while
+        # the body is parsed; only claim_run can atomically decide whether this
+        # request must execute/reclaim.
+        durable_replay = False
+        defer_capacity_until_claim = False
+        valid_keyed_run = False
+        idempotency_key = None
+        if handler.__name__ == "_handle_runs":
+            idempotency_key = request.headers.get("Idempotency-Key")
+            valid_keyed_run = bool(
+                idempotency_key
+                and len(idempotency_key) <= 255
+                and all(0x21 <= ord(char) <= 0x7E for char in idempotency_key)
+            )
+
+        # Headerless and malformed-key requests cannot be durable replays, so
+        # reject them before body parsing exactly as before.
+        if not valid_keyed_run:
+            limited = self._concurrency_limited_response()
+            if limited is not None:
+                return limited
+
+        reservation = {"active": True, "replay": False}
         token = _api_agent_request_reservation.set(reservation)
         self._pending_agent_requests += 1
         try:
+            if valid_keyed_run:
+                assert idempotency_key is not None
+                request_profile = _api_request_profile.get()
+                run_id = _derive_idempotent_run_id(idempotency_key, request_profile)
+                try:
+                    claim_metadata = await asyncio.to_thread(
+                        self._response_store.get_run_claim_metadata,
+                        run_id,
+                        profile=_canonical_run_profile(request_profile),
+                    )
+                    if claim_metadata is not None:
+                        durable_status = claim_metadata["status"]
+                        queued_claim = (
+                            claim_metadata["terminal_at"] is None
+                            and durable_status.get("status") == "queued"
+                        )
+                        if queued_claim:
+                            defer_capacity_until_claim = True
+                        else:
+                            durable_replay = True
+                            reservation["replay"] = True
+                            self._pending_replay_requests += 1
+                except Exception as exc:
+                    logger.exception(
+                        "Failed to inspect durable run ownership for %s", run_id
+                    )
+                    return web.json_response(
+                        _openai_error(
+                            f"Unable to persist idempotent run ownership: {exc}",
+                            code="idempotency_store_unavailable",
+                        ),
+                        status=503,
+                    )
+
+            # Admission and reservation have no intervening await after the
+            # durable classification. New claims still have exactly one winner
+            # for the last slot. A queued claim proceeds to claim_run even when
+            # full so a live lease can return its durable queued replay.
+            if not durable_replay and not defer_capacity_until_claim:
+                limited = self._concurrency_limited_response()
+                if limited is not None:
+                    return limited
             return await handler(self, request, *args, **kwargs)
         finally:
             if reservation["active"]:
                 reservation["active"] = False
                 self._pending_agent_requests = max(0, self._pending_agent_requests - 1)
+                if reservation["replay"]:
+                    self._pending_replay_requests = max(
+                        0, self._pending_replay_requests - 1
+                    )
             _api_agent_request_reservation.reset(token)
 
     return _wrapped
@@ -1084,6 +1501,25 @@ def _make_request_fingerprint(body: Dict[str, Any], keys: List[str]) -> str:
     return sha256(repr(subset).encode("utf-8")).hexdigest()
 
 
+def _canonical_run_profile(profile: Optional[str]) -> str:
+    """Return the profile namespace used by durable run idempotency.
+
+    The unprefixed multiplex route selects the default profile, so it must be
+    identical to ``/p/default``.  Named prefixes remain distinct namespaces.
+    """
+    return profile or "default"
+
+
+def _derive_idempotent_run_id(idempotency_key: str, profile: Optional[str]) -> str:
+    """Hash an opaque client key together with its canonical profile scope."""
+    seed = json.dumps(
+        [_canonical_run_profile(profile), idempotency_key],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return "run_" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32]
+
+
 def _derive_chat_session_id(
     system_prompt: Optional[str],
     first_user_message: str,
@@ -1147,6 +1583,10 @@ try:
     from tools.cronjob_tools import _scan_cron_prompt as _scan_cron_prompt
 except Exception:  # pragma: no cover - scanner is optional hardening
     _scan_cron_prompt = None
+
+
+class _RunOwnershipLost(RuntimeError):
+    """Terminal status cannot be written because another owner holds the run."""
 
 
 class _ProviderAuthResolutionError(RuntimeError):
@@ -1235,6 +1675,9 @@ class APIServerAdapter(BasePlatformAdapter):
         self._runner: Optional["web.AppRunner"] = None
         self._site: Optional["web.TCPSite"] = None
         self._response_store = ResponseStore()
+        # A unique fencing token for durable /v1/runs claims.  Status writes
+        # from an old process are ignored after a stale lease is reclaimed.
+        self._run_owner_id = uuid.uuid4().hex
         # Active run streams: run_id -> asyncio.Queue of SSE event dicts
         self._run_streams: Dict[str, "asyncio.Queue[Optional[Dict]]"] = {}
         # Creation timestamps for orphaned-run TTL sweep
@@ -1248,6 +1691,18 @@ class APIServerAdapter(BasePlatformAdapter):
         self._stopping_run_ids: set[str] = set()
         # Pollable run status for dashboards and external control-plane UIs.
         self._run_statuses: Dict[str, Dict[str, Any]] = {}
+        # Profile namespace for every in-memory run. Durable fallbacks carry
+        # the same owner column so a known run_id cannot cross profile islands.
+        self._run_profiles: Dict[str, str] = {}
+        # Immutable owner generation associated with each live profile guard.
+        # Unlike _run_owner_generations this survives lease loss until every
+        # transport/control reference from that generation has been cleaned up.
+        self._run_profile_generations: Dict[str, str] = {}
+        self._run_owner_state_lock = threading.RLock()
+        # Process-local generation tokens fence cache eviction: a stale
+        # heartbeat may evict only the cache entries created by its own claim,
+        # never a newer local re-claim of the same deterministic run_id.
+        self._run_owner_generations: Dict[str, str] = {}
         # Active approval session key for each run_id.  The approval core
         # resolves requests by session key, while API clients address the
         # in-flight run by run_id.
@@ -1279,6 +1734,9 @@ class APIServerAdapter(BasePlatformAdapter):
         # Shutdown counts this reservation so the request cannot slip through
         # the drain between its first await and _run_agent()/task registration.
         self._pending_agent_requests: int = 0
+        # Idempotent replay parsing remains drain-visible above, but it cannot
+        # launch an executor and therefore must not consume execution capacity.
+        self._pending_replay_requests: int = 0
 
     def active_agent_work_count(self) -> int:
         """Return all live agent work owned by this API adapter.
@@ -1333,6 +1791,10 @@ class APIServerAdapter(BasePlatformAdapter):
         if reservation and reservation["active"]:
             reservation["active"] = False
             self._pending_agent_requests = max(0, self._pending_agent_requests - 1)
+            if reservation.get("replay"):
+                self._pending_replay_requests = max(
+                    0, self._pending_replay_requests - 1
+                )
 
     def _readiness_work_counts(self) -> tuple[int, int, int]:
         """Return bounded work counts from each subsystem's public state."""
@@ -5649,12 +6111,18 @@ class APIServerAdapter(BasePlatformAdapter):
         limit = self._max_concurrent_runs
         if limit <= 0:
             return None
-        inflight = self.active_agent_work_count()
+        inflight = self.active_agent_work_count() - int(
+            getattr(self, "_pending_replay_requests", 0)
+        )
         # The current request owns one reservation until it hands off to
         # _run_agent() or /v1/runs task registration. It must not consume its
         # own last available slot; other admitted requests remain counted.
         reservation = _api_agent_request_reservation.get()
-        if reservation and reservation["active"]:
+        if (
+            reservation
+            and reservation["active"]
+            and not reservation.get("replay", False)
+        ):
             inflight -= 1
         if inflight >= limit:
             return web.json_response(
@@ -5916,12 +6384,25 @@ class APIServerAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     _RUN_STREAM_TTL = 300  # seconds before orphaned runs are swept
-    _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
+    # Keep terminal replay long enough for at least five hourly client retries.
+    _RUN_STATUS_TTL = 6 * 3600
+    _RUN_STATUS_GC_BATCH = 100
+    _RUN_OWNER_LEASE_SECONDS = 30.0
+    _RUN_OWNER_HEARTBEAT_SECONDS = 10.0
+    _RUN_TERMINAL_WRITE_RETRY_SECONDS = 0.1
+    _RUN_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 
-    def _set_run_status(self, run_id: str, status: str, **fields: Any) -> Dict[str, Any]:
+    def _set_run_status(
+        self,
+        run_id: str,
+        status: str,
+        *,
+        _require_persisted: bool = False,
+        **fields: Any,
+    ) -> Dict[str, Any]:
         """Update pollable run status without exposing private agent objects."""
         now = time.time()
-        current = self._run_statuses.get(run_id, {})
+        current = dict(self._run_statuses.get(run_id, {}))
         current.update({
             "object": "hermes.run",
             "run_id": run_id,
@@ -5930,24 +6411,144 @@ class APIServerAdapter(BasePlatformAdapter):
         })
         current.setdefault("created_at", fields.pop("created_at", now))
         current.update(fields)
+        try:
+            persisted = self._response_store.put_run_status(
+                run_id,
+                current,
+                owner_id=self._run_owner_id,
+                lease_seconds=self._RUN_OWNER_LEASE_SECONDS,
+            )
+            if _require_persisted and not persisted:
+                raise RuntimeError("durable run ownership was lost")
+        except Exception:
+            logger.exception("Failed to persist durable run status for %s", run_id)
+            if _require_persisted:
+                raise
         self._run_statuses[run_id] = current
         return current
 
-    def _make_run_event_callback(self, run_id: str, loop: "asyncio.AbstractEventLoop"):
-        """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
-        def _push(event: Dict[str, Any]) -> None:
-            self._set_run_status(
-                run_id,
-                self._run_statuses.get(run_id, {}).get("status", "running"),
-                last_event=event.get("event"),
-            )
-            q = self._run_streams.get(run_id)
-            if q is None:
-                return
+    def _evict_lost_run_owner_cache(self, run_id: str, generation: str) -> bool:
+        """Evict only cache state belonging to the owner generation that lost."""
+        with self._run_owner_state_lock:
+            if self._run_owner_generations.get(run_id) != generation:
+                return False
+            if run_id in self._run_profiles:
+                self._run_profile_generations.setdefault(run_id, generation)
+            self._run_statuses.pop(run_id, None)
+            self._run_owner_generations.pop(run_id, None)
+            self._cleanup_run_profile_if_inactive(run_id, generation)
+            return True
+
+    def _cleanup_run_profile_if_inactive(
+        self, run_id: str, owner_generation: str
+    ) -> bool:
+        """Remove a generation's profile guard only after all local state is gone."""
+        if self._run_profile_generations.get(run_id) != owner_generation:
+            return False
+        if (
+            run_id in self._run_statuses
+            or run_id in self._run_streams
+            or run_id in self._active_run_agents
+            or run_id in self._active_run_tasks
+            or run_id in self._run_approval_sessions
+            or run_id in self._stopping_run_ids
+        ):
+            return False
+        self._run_profiles.pop(run_id, None)
+        self._run_profile_generations.pop(run_id, None)
+        return True
+
+    async def _set_terminal_run_status(
+        self,
+        run_id: str,
+        status: str,
+        *,
+        _owner_generation: Optional[str] = None,
+        **fields: Any,
+    ) -> Dict[str, Any]:
+        """Persist terminal state before allowing the owner lease to stop.
+
+        A completed executor must remain fenced if SQLite is temporarily
+        unavailable; otherwise lease expiry lets a retry execute side effects a
+        second time. Keep retrying while the heartbeat remains alive, and renew
+        explicitly for terminal writes performed outside the background task.
+        """
+        while True:
             try:
-                loop.call_soon_threadsafe(q.put_nowait, event)
+                with self._run_owner_state_lock:
+                    if (
+                        _owner_generation is not None
+                        and self._run_owner_generations.get(run_id)
+                        != _owner_generation
+                    ):
+                        raise _RunOwnershipLost(
+                            f"durable run ownership was lost for {run_id}"
+                        )
+                    return self._set_run_status(
+                        run_id,
+                        status,
+                        _require_persisted=True,
+                        **fields,
+                    )
+            except _RunOwnershipLost:
+                raise
             except Exception:
-                pass
+                try:
+                    renewed = await asyncio.to_thread(
+                        self._response_store.renew_run_lease,
+                        run_id,
+                        self._run_owner_id,
+                        self._RUN_OWNER_LEASE_SECONDS,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to retain run-owner lease after terminal write failure for %s",
+                        run_id,
+                    )
+                else:
+                    if not renewed:
+                        if _owner_generation is not None:
+                            self._evict_lost_run_owner_cache(
+                                run_id, _owner_generation
+                            )
+                        raise _RunOwnershipLost(
+                            f"durable run ownership was lost for {run_id}"
+                        )
+                await asyncio.sleep(self._RUN_TERMINAL_WRITE_RETRY_SECONDS)
+
+    def _make_run_event_callback(
+        self,
+        run_id: str,
+        loop: "asyncio.AbstractEventLoop",
+        owner_generation: str,
+    ):
+        """Return a tool_progress_callback that pushes structured events to the run's SSE queue."""
+        def _enqueue_if_owned(
+            queue: "asyncio.Queue[Optional[Dict]]", event: Dict[str, Any]
+        ) -> None:
+            with self._run_owner_state_lock:
+                if (
+                    self._run_owner_generations.get(run_id) == owner_generation
+                    and self._run_streams.get(run_id) is queue
+                ):
+                    queue.put_nowait(event)
+
+        def _push(event: Dict[str, Any]) -> None:
+            with self._run_owner_state_lock:
+                if self._run_owner_generations.get(run_id) != owner_generation:
+                    return
+                self._set_run_status(
+                    run_id,
+                    self._run_statuses.get(run_id, {}).get("status", "running"),
+                    last_event=event.get("event"),
+                )
+                q = self._run_streams.get(run_id)
+                if q is None:
+                    return
+                try:
+                    loop.call_soon_threadsafe(_enqueue_if_owned, q, event)
+                except Exception:
+                    pass
 
         def _callback(event_type: str, tool_name: str = None, preview: str = None, args=None, **kwargs):
             ts = time.time()
@@ -6034,16 +6635,38 @@ class APIServerAdapter(BasePlatformAdapter):
         if key_err is not None:
             return key_err
 
-        # Enforce concurrency limit (shared across all agent-serving
-        # endpoints; configurable via gateway.api_server.max_concurrent_runs).
-        limited = self._concurrency_limited_response()
-        if limited is not None:
-            return limited
+        # A run submission is retryable across network failures only when its
+        # identity is fixed before any work is admitted. Hash the exact header
+        # value received (no case-folding or whitespace normalization) so every
+        # process derives the same opaque run ID without retaining the raw key.
+        idempotency_key = request.headers.get("Idempotency-Key")
+        if idempotency_key is None:
+            # Backward compatibility: the Runs API predates durable
+            # idempotency and documented this header as optional. Headerless
+            # calls retain one-shot UUID identity; supplied keys gain replay.
+            idempotency_key = uuid.uuid4().hex
+        elif (
+            not idempotency_key
+            or len(idempotency_key) > 255
+            or any(ord(char) < 0x21 or ord(char) > 0x7E for char in idempotency_key)
+        ):
+            return web.json_response(
+                _openai_error(
+                    "Idempotency-Key, when supplied, must contain 1-255 visible ASCII characters.",
+                    code="invalid_idempotency_key",
+                ),
+                status=400,
+            )
+        request_profile = _api_request_profile.get()
+        canonical_profile = _canonical_run_profile(request_profile)
+        run_id = _derive_idempotent_run_id(idempotency_key, request_profile)
 
-        try:
-            body = await request.json()
-        except Exception:
-            return web.json_response(_openai_error("Invalid JSON"), status=400)
+        # Durable ownership is claimed only after the request body has been
+        # parsed and validated, so malformed requests cannot reserve a key.
+
+        body, body_error = await self._read_json_body(request)
+        if body_error is not None:
+            return body_error
 
         raw_input = body.get("input")
         if not raw_input:
@@ -6078,7 +6701,9 @@ class APIServerAdapter(BasePlatformAdapter):
 
         stored_session_id = None
         if not conversation_history and previous_response_id:
-            stored = self._response_store.get(previous_response_id)
+            stored = await asyncio.to_thread(
+                self._response_store.get, previous_response_id
+            )
             if stored:
                 conversation_history = list(stored.get("conversation_history", []))
                 stored_session_id = stored.get("session_id")
@@ -6113,7 +6738,104 @@ class APIServerAdapter(BasePlatformAdapter):
         if selection_error:
             return web.json_response(_openai_error(selection_error), status=400)
 
-        run_id = f"run_{uuid.uuid4().hex}"
+        created_at = time.time()
+        initial_status = {
+            "object": "hermes.run",
+            "run_id": run_id,
+            "status": "queued",
+            "created_at": created_at,
+            "updated_at": created_at,
+            "session_id": session_id or run_id,
+            "model": body.get("model", self._model_name),
+        }
+        fingerprint_payload = {
+            "body": body,
+            "gateway_session_key": gateway_session_key,
+            "profile": canonical_profile,
+        }
+        request_fingerprint = hashlib.sha256(
+            json.dumps(
+                fingerprint_payload,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        try:
+            owned, conflict, durable_status = await asyncio.to_thread(
+                self._response_store.claim_run,
+                run_id,
+                request_fingerprint,
+                initial_status,
+                profile=canonical_profile,
+                owner_id=self._run_owner_id,
+                lease_seconds=self._RUN_OWNER_LEASE_SECONDS,
+            )
+        except Exception as exc:
+            logger.exception("Failed to claim durable run ownership for %s", run_id)
+            return web.json_response(
+                _openai_error(
+                    f"Unable to persist idempotent run ownership: {exc}",
+                    code="idempotency_store_unavailable",
+                ),
+                status=503,
+            )
+        response_headers = (
+            {"X-Hermes-Session-Key": gateway_session_key}
+            if gateway_session_key
+            else {}
+        )
+        if conflict:
+            return web.json_response(
+                _openai_error(
+                    "Idempotency-Key was already used with a different request payload.",
+                    code="idempotency_key_conflict",
+                ),
+                status=409,
+                headers=response_headers,
+            )
+        if not owned:
+            self._run_profiles[run_id] = canonical_profile
+            # A sibling gateway owns nonterminal state and can advance it at
+            # any time. Caching that snapshot would make subsequent polls stale.
+            # Terminal rows are immutable and safe to retain locally.
+            if durable_status.get("status") in self._RUN_TERMINAL_STATUSES:
+                self._run_statuses[run_id] = durable_status
+            else:
+                self._run_statuses.pop(run_id, None)
+            return web.json_response(durable_status, headers=response_headers)
+
+        # Only the durable CAS winner consumes an execution slot.
+        local_owner_generation = uuid.uuid4().hex
+        with self._run_owner_state_lock:
+            self._run_owner_generations[run_id] = local_owner_generation
+            self._run_profiles[run_id] = canonical_profile
+            self._run_profile_generations[run_id] = local_owner_generation
+
+        async def _set_owned_terminal(
+            owned_run_id: str, status: str, **fields: Any
+        ) -> Dict[str, Any]:
+            return await self._set_terminal_run_status(
+                owned_run_id,
+                status,
+                _owner_generation=local_owner_generation,
+                **fields,
+            )
+
+        limited = self._concurrency_limited_response()
+        if limited is not None:
+            await _set_owned_terminal(
+                run_id,
+                "failed",
+                error="Run concurrency limit reached before dispatch; retry with a new Idempotency-Key.",
+                last_event="run.failed",
+            )
+            if self._run_owner_generations.get(run_id) == local_owner_generation:
+                self._run_owner_generations.pop(run_id, None)
+            return limited
+
+        self._run_statuses[run_id] = initial_status
         session_id = session_id or run_id
         # Approval queues gate host-side tool execution and must be isolated
         # per API run.  Client-provided session IDs and memory session keys are
@@ -6124,17 +6846,29 @@ class APIServerAdapter(BasePlatformAdapter):
         ephemeral_system_prompt = instructions
         loop = asyncio.get_running_loop()
         q: "asyncio.Queue[Optional[Dict]]" = asyncio.Queue()
-        created_at = time.time()
         self._run_streams[run_id] = q
         self._run_streams_created[run_id] = created_at
         self._run_approval_sessions[run_id] = approval_session_key
 
-        event_cb = self._make_run_event_callback(run_id, loop)
+        event_cb = self._make_run_event_callback(
+            run_id, loop, local_owner_generation
+        )
 
         def _put_event_if_active(event: Optional[Dict]) -> None:
             """Enqueue only while this run still owns live transport state."""
-            if self._run_streams.get(run_id) is q:
-                q.put_nowait(event)
+            with self._run_owner_state_lock:
+                if (
+                    self._run_owner_generations.get(run_id)
+                    == local_owner_generation
+                    and self._run_streams.get(run_id) is q
+                ):
+                    q.put_nowait(event)
+
+        def _close_stream_if_current() -> None:
+            """Close this generation's queue even after durable ownership loss."""
+            with self._run_owner_state_lock:
+                if self._run_streams.get(run_id) is q:
+                    q.put_nowait(None)
 
         # Also wire stream_delta_callback so message.delta events flow through.
         def _text_cb(delta: Optional[str]) -> None:
@@ -6162,22 +6896,62 @@ class APIServerAdapter(BasePlatformAdapter):
 
         # Background task outlives the HTTP response (and thus the middleware
         # profile scope). Capture now and re-enter inside the task/executor.
-        request_profile = _api_request_profile.get()
-
         async def _run_and_close():
+            lease_heartbeat: Optional[asyncio.Task[Any]] = None
+            ownership_lost = False
+
+            async def _renew_owner_lease() -> None:
+                nonlocal ownership_lost
+                while True:
+                    await asyncio.sleep(self._RUN_OWNER_HEARTBEAT_SECONDS)
+                    try:
+                        renewed = await asyncio.to_thread(
+                            self._response_store.renew_run_lease,
+                            run_id,
+                            self._run_owner_id,
+                            self._RUN_OWNER_LEASE_SECONDS,
+                        )
+                    except Exception:
+                        # A transient store failure must not tear down the run
+                        # or bypass the main task's cleanup. Retry on the next
+                        # heartbeat; claimers still require the lease to age out.
+                        logger.exception("Failed to renew run-owner lease for %s", run_id)
+                        continue
+                    if not renewed:
+                        ownership_lost = True
+                        self._evict_lost_run_owner_cache(
+                            run_id, local_owner_generation
+                        )
+                        active_agent = self._active_run_agents.get(run_id)
+                        if active_agent is not None:
+                            try:
+                                active_agent.interrupt(
+                                    "Durable run lease ownership was lost"
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "Failed to interrupt run %s after lease loss",
+                                    run_id,
+                                )
+                        # Cancelling the asyncio wrapper cannot terminate its
+                        # executor thread. Keep task/agent bookkeeping alive
+                        # until the actual worker exits.
+                        return
+
             try:
-                self._set_run_status(run_id, "running")
+                lease_heartbeat = asyncio.get_running_loop().create_task(_renew_owner_lease())
+                self._set_run_status(run_id, "running", _require_persisted=True)
                 if run_id in self._stopping_run_ids:
+                    await _set_owned_terminal(
+                        run_id,
+                        "cancelled",
+                        last_event="run.cancelled",
+                    )
                     _put_event_if_active({
                         "event": "run.cancelled",
                         "run_id": run_id,
                         "timestamp": time.time(),
                     })
-                    self._set_run_status(
-                        run_id,
-                        "cancelled",
-                        last_event="run.cancelled",
-                    )
                     return
                 with self._profile_scope(request_profile):
                     agent = self._create_agent(
@@ -6194,33 +6968,41 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_agents[run_id] = agent
 
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
-                    event = dict(approval_data or {})
-                    # Redact credentials from the command before it enters the
-                    # SSE/API event stream — same egress bug as #48456, second
-                    # transport: API/desktop clients would otherwise receive the
-                    # raw command Tirith flagged. Reuse the gateway seam.
-                    if "command" in event:
-                        from gateway.run import _redact_approval_command
+                    with self._run_owner_state_lock:
+                        if (
+                            self._run_owner_generations.get(run_id)
+                            != local_owner_generation
+                        ):
+                            return
+                        event = dict(approval_data or {})
+                        # Redact credentials from the command before it enters the
+                        # SSE/API event stream — same egress bug as #48456, second
+                        # transport: API/desktop clients would otherwise receive the
+                        # raw command Tirith flagged. Reuse the gateway seam.
+                        if "command" in event:
+                            from gateway.run import _redact_approval_command
 
-                        event["command"] = _redact_approval_command(event.get("command"))
-                    event.update({
-                        "event": "approval.request",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                        "choices": _approval_event_choices(
-                            smart_denied=bool(event.get("smart_denied")),
-                            allow_permanent=event.get("allow_permanent") is not False,
-                        ),
-                    })
-                    self._set_run_status(
-                        run_id,
-                        "waiting_for_approval",
-                        last_event="approval.request",
-                    )
-                    try:
-                        loop.call_soon_threadsafe(q.put_nowait, event)
-                    except Exception:
-                        pass
+                            event["command"] = _redact_approval_command(
+                                event.get("command")
+                            )
+                        event.update({
+                            "event": "approval.request",
+                            "run_id": run_id,
+                            "timestamp": time.time(),
+                            "choices": _approval_event_choices(
+                                smart_denied=bool(event.get("smart_denied")),
+                                allow_permanent=event.get("allow_permanent") is not False,
+                            ),
+                        })
+                        self._set_run_status(
+                            run_id,
+                            "waiting_for_approval",
+                            last_event="approval.request",
+                        )
+                        try:
+                            loop.call_soon_threadsafe(_put_event_if_active, event)
+                        except Exception:
+                            pass
 
                 def _run_sync():
                     from gateway.session_context import clear_session_vars
@@ -6280,37 +7062,63 @@ class APIServerAdapter(BasePlatformAdapter):
                         }
                         return r, u
 
-                result, usage = await asyncio.get_running_loop().run_in_executor(None, _run_sync)
+                executor = asyncio.get_running_loop().run_in_executor(None, _run_sync)
+                try:
+                    result, usage = await asyncio.shield(executor)
+                except asyncio.CancelledError:
+                    # Task cancellation is not executor termination. Ask for a
+                    # cooperative stop, then retain active bookkeeping until
+                    # the non-cooperative thread really returns.
+                    try:
+                        agent.interrupt("Run task cancellation requested")
+                    except Exception:
+                        pass
+                    try:
+                        await asyncio.shield(executor)
+                    except Exception:
+                        pass
+                    raise
+                if ownership_lost:
+                    # A stale executor may finish after external revocation,
+                    # but it must emit no terminal event or status write.
+                    return
                 if run_id in self._stopping_run_ids:
+                    await _set_owned_terminal(
+                        run_id,
+                        "cancelled",
+                        last_event="run.cancelled",
+                    )
                     _put_event_if_active({
                         "event": "run.cancelled",
                         "run_id": run_id,
                         "timestamp": time.time(),
                     })
-                    self._set_run_status(
-                        run_id,
-                        "cancelled",
-                        last_event="run.cancelled",
-                    )
                 # Check for structured failure (non-retryable client errors like
                 # 401/400 return failed=True instead of raising, so the except
                 # block below never fires — issue #15561).
                 elif isinstance(result, dict) and result.get("failed"):
                     error_msg = _redact_api_error_text(result.get("error") or "agent run failed")
+                    await _set_owned_terminal(
+                        run_id,
+                        "failed",
+                        error=error_msg,
+                        last_event="run.failed",
+                    )
                     _put_event_if_active({
                         "event": "run.failed",
                         "run_id": run_id,
                         "timestamp": time.time(),
                         "error": error_msg,
                     })
-                    self._set_run_status(
-                        run_id,
-                        "failed",
-                        error=error_msg,
-                        last_event="run.failed",
-                    )
                 else:
                     final_response = result.get("final_response", "") if isinstance(result, dict) else ""
+                    await _set_owned_terminal(
+                        run_id,
+                        "completed",
+                        output=final_response,
+                        usage=usage,
+                        last_event="run.completed",
+                    )
                     _put_event_if_active({
                         "event": "run.completed",
                         "run_id": run_id,
@@ -6318,15 +7126,13 @@ class APIServerAdapter(BasePlatformAdapter):
                         "output": final_response,
                         "usage": usage,
                     })
-                    self._set_run_status(
-                        run_id,
-                        "completed",
-                        output=final_response,
-                        usage=usage,
-                        last_event="run.completed",
-                    )
             except asyncio.CancelledError:
-                self._set_run_status(
+                if ownership_lost:
+                    # The heartbeat proved this executor no longer owns the
+                    # durable row. Its interrupt is cooperative, and no
+                    # terminal status may be written under the lost lease.
+                    return
+                await _set_owned_terminal(
                     run_id,
                     "cancelled",
                     last_event="run.cancelled",
@@ -6340,6 +7146,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
                 raise
+            except _RunOwnershipLost:
+                # Another process reclaimed the lease. Any further terminal
+                # write would target state this executor no longer owns.
+                ownership_lost = True
+                self._evict_lost_run_owner_cache(run_id, local_owner_generation)
+                logger.warning("Stopping run %s after durable lease ownership loss", run_id)
             except _ProviderAuthResolutionError as exc:
                 # /v1/runs builds its own agent via _create_agent() and does
                 # not route through _run_agent() (see that method's own
@@ -6350,7 +7162,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 # except-Exception branch below.
                 logger.warning("Provider authentication failed for run=%s: %s", run_id, exc)
                 error_msg = f"⚠️ Provider authentication failed: {exc}"
-                self._set_run_status(
+                await _set_owned_terminal(
                     run_id,
                     "failed",
                     error=error_msg,
@@ -6367,7 +7179,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     pass
             except Exception as exc:
                 logger.exception("[api_server] run %s failed", run_id)
-                self._set_run_status(
+                await _set_owned_terminal(
                     run_id,
                     "failed",
                     error=_redact_api_error_text(exc),
@@ -6383,6 +7195,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 except Exception:
                     pass
             finally:
+                if lease_heartbeat is not None:
+                    lease_heartbeat.cancel()
+                    try:
+                        await lease_heartbeat
+                    except asyncio.CancelledError:
+                        pass
                 # If the asyncio wrapper is cancelled (for example via
                 # /stop), the executor thread can still be blocked waiting
                 # on an approval Event.  Unregistering here releases those
@@ -6396,13 +7214,19 @@ class APIServerAdapter(BasePlatformAdapter):
                     pass
                 # Sentinel: signal SSE stream to close
                 try:
-                    _put_event_if_active(None)
+                    _close_stream_if_current()
                 except Exception:
                     pass
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
+                with self._run_owner_state_lock:
+                    if self._run_owner_generations.get(run_id) == local_owner_generation:
+                        self._run_owner_generations.pop(run_id, None)
+                self._cleanup_run_profile_if_inactive(
+                    run_id, local_owner_generation
+                )
 
         self._activate_admitted_request()
         task = asyncio.create_task(_run_and_close())
@@ -6430,7 +7254,28 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         run_id = request.match_info["run_id"]
+        request_profile = _canonical_run_profile(_api_request_profile.get())
+        known_profile = self._run_profiles.get(run_id)
+        if known_profile is not None and not hmac.compare_digest(
+            known_profile, request_profile
+        ):
+            return web.json_response(
+                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                status=404,
+            )
         status = self._run_statuses.get(run_id)
+        if status is None:
+            status = await asyncio.to_thread(
+                self._response_store.get_run_status,
+                run_id,
+                profile=request_profile,
+            )
+            if status is not None:
+                self._run_profiles[run_id] = request_profile
+                # A non-owner must re-read mutable durable state on every poll.
+                # Terminal rows are immutable and safe to cache locally.
+                if status.get("status") in self._RUN_TERMINAL_STATUSES:
+                    self._run_statuses[run_id] = status
         if status is None:
             return web.json_response(
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),
@@ -6445,6 +7290,16 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         run_id = request.match_info["run_id"]
+
+        known_profile = self._run_profiles.get(run_id)
+        request_profile = _canonical_run_profile(_api_request_profile.get())
+        if known_profile is not None and not hmac.compare_digest(
+            known_profile, request_profile
+        ):
+            return web.json_response(
+                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                status=404,
+            )
 
         # Allow subscribing slightly before the run is registered (race condition window)
         for _ in range(20):
@@ -6486,6 +7341,11 @@ class APIServerAdapter(BasePlatformAdapter):
             self._run_stream_subscribers.discard(run_id)
             self._run_streams.pop(run_id, None)
             self._run_streams_created.pop(run_id, None)
+            profile_generation = self._run_profile_generations.get(run_id)
+            if profile_generation is not None:
+                self._cleanup_run_profile_if_inactive(
+                    run_id, profile_generation
+                )
 
         return response
 
@@ -6497,6 +7357,15 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         run_id = request.match_info["run_id"]
+        known_profile = self._run_profiles.get(run_id)
+        request_profile = _canonical_run_profile(_api_request_profile.get())
+        if known_profile is not None and not hmac.compare_digest(
+            known_profile, request_profile
+        ):
+            return web.json_response(
+                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                status=404,
+            )
         status = self._run_statuses.get(run_id)
         if status is None:
             return web.json_response(
@@ -6585,14 +7454,86 @@ class APIServerAdapter(BasePlatformAdapter):
             return auth_err
 
         run_id = request.match_info["run_id"]
-        agent = self._active_run_agents.get(run_id)
-        task = self._active_run_tasks.get(run_id)
+        known_profile = self._run_profiles.get(run_id)
+        request_profile = _canonical_run_profile(_api_request_profile.get())
+        if known_profile is not None and not hmac.compare_digest(
+            known_profile, request_profile
+        ):
+            return web.json_response(
+                _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                status=404,
+            )
+        with self._run_owner_state_lock:
+            local_status = self._run_statuses.get(run_id)
+            try:
+                durable_status = self._response_store.get_run_status(
+                    run_id, profile=request_profile
+                )
+            except Exception as exc:
+                logger.exception("Failed to read durable run status before stopping %s", run_id)
+                if (
+                    local_status is not None
+                    and local_status.get("status") in self._RUN_TERMINAL_STATUSES
+                ):
+                    durable_status = None
+                else:
+                    return web.json_response(
+                        _openai_error(
+                            f"Unable to verify run state before stopping: {exc}",
+                            code="run_store_unavailable",
+                        ),
+                        status=503,
+                    )
 
-        if agent is None and task is None:
-            return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
+            terminal_status = next(
+                (
+                    status
+                    for status in (durable_status, local_status)
+                    if status is not None
+                    and status.get("status") in self._RUN_TERMINAL_STATUSES
+                ),
+                None,
+            )
+            if terminal_status is not None:
+                self._run_statuses[run_id] = terminal_status
+                return web.json_response(terminal_status)
 
-        self._set_run_status(run_id, "stopping", last_event="run.stopping")
-        self._stopping_run_ids.add(run_id)
+            agent = self._active_run_agents.get(run_id)
+            task = self._active_run_tasks.get(run_id)
+            owner_generation = self._run_owner_generations.get(run_id)
+            if agent is None and task is None:
+                return web.json_response(
+                    _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                    status=404,
+                )
+
+            if owner_generation is not None:
+                try:
+                    self._set_run_status(
+                        run_id,
+                        "stopping",
+                        _require_persisted=True,
+                        last_event="run.stopping",
+                    )
+                except Exception:
+                    authoritative = self._response_store.get_run_status(
+                        run_id, profile=request_profile
+                    )
+                    if (
+                        authoritative is not None
+                        and authoritative.get("status") in self._RUN_TERMINAL_STATUSES
+                    ):
+                        self._run_statuses[run_id] = authoritative
+                        return web.json_response(authoritative)
+                    self._evict_lost_run_owner_cache(run_id, owner_generation)
+                    return web.json_response(
+                        _openai_error(
+                            "Run ownership was lost before the stop transition.",
+                            code="run_ownership_lost",
+                        ),
+                        status=409,
+                    )
+                self._stopping_run_ids.add(run_id)
 
         if agent is not None:
             try:
@@ -6640,6 +7581,11 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
                 self._stopping_run_ids.discard(run_id)
+                profile_generation = self._run_profile_generations.get(run_id)
+                if profile_generation is not None:
+                    self._cleanup_run_profile_if_inactive(
+                        run_id, profile_generation
+                    )
 
         stale_statuses = [
             run_id
@@ -6649,6 +7595,20 @@ class APIServerAdapter(BasePlatformAdapter):
         ]
         for run_id in stale_statuses:
             self._run_statuses.pop(run_id, None)
+            profile_generation = self._run_profile_generations.get(run_id)
+            if profile_generation is None:
+                self._run_profiles.pop(run_id, None)
+            else:
+                self._cleanup_run_profile_if_inactive(
+                    run_id, profile_generation
+                )
+        try:
+            cutoff = now - self._RUN_STATUS_TTL
+            self._response_store.delete_expired_terminal_runs(
+                cutoff, limit=self._RUN_STATUS_GC_BATCH
+            )
+        except Exception:
+            logger.exception("Failed to sweep expired durable run statuses")
 
     # ------------------------------------------------------------------
     # BasePlatformAdapter interface

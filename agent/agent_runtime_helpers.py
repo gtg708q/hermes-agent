@@ -23,12 +23,18 @@ Methods covered:
 from __future__ import annotations
 
 import copy
+import errno
+import hashlib
 import json
 import logging
+import math
+import os
 import re
 import threading
 import time
+from contextlib import contextmanager
 from datetime import datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -1702,6 +1708,245 @@ def extract_reasoning(agent, assistant_message) -> Optional[str]:
 
 
 
+_REQUEST_DUMP_THREAD_LOCK = threading.Lock()
+_REQUEST_DUMP_SCAN_STATES: Dict[str, Any] = {}
+_REQUEST_DUMP_SCAN_LIMIT_DEFAULT = 256
+_REQUEST_DUMP_SCAN_LIMIT_MAX = 4096
+_REQUEST_DUMP_LOCK_TIMEOUT_SECONDS = 0.25
+_REQUEST_DUMP_LOCK_POLL_SECONDS = 0.01
+
+
+@contextmanager
+def _request_dump_lock(
+    logs_dir: Path,
+    *,
+    timeout_seconds: float = _REQUEST_DUMP_LOCK_TIMEOUT_SECONDS,
+    poll_seconds: float = _REQUEST_DUMP_LOCK_POLL_SECONDS,
+):
+    """Try to serialize request-dump retention across threads and processes."""
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    thread_acquired = _REQUEST_DUMP_THREAD_LOCK.acquire(
+        timeout=max(0.0, deadline - time.monotonic())
+    )
+    if not thread_acquired:
+        yield False
+        return
+
+    try:
+        lock_path = logs_dir / ".request_dump.lock"
+        handle = lock_path.open("a+")
+        process_acquired = False
+        try:
+            while True:
+                try:
+                    if os.name == "posix":
+                        import fcntl
+
+                        fcntl.flock(
+                            handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
+                        )
+                    elif os.name == "nt":
+                        import msvcrt
+
+                        handle.seek(0, os.SEEK_END)
+                        if handle.tell() == 0:
+                            handle.write("0")
+                            handle.flush()
+                        handle.seek(0)
+                        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                    process_acquired = True
+                    break
+                except OSError as lock_error:
+                    if os.name == "posix" and lock_error.errno not in {
+                        errno.EACCES,
+                        errno.EAGAIN,
+                    }:
+                        raise
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(max(0.0, poll_seconds), remaining))
+
+            yield process_acquired
+        finally:
+            if process_acquired and os.name == "posix":
+                try:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            elif process_acquired and os.name == "nt":
+                try:
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+            handle.close()
+    finally:
+        _REQUEST_DUMP_THREAD_LOCK.release()
+
+
+def _write_bounded_request_dump(
+    *,
+    logs_dir: Path,
+    dump_file: Path,
+    payload: Dict[str, Any],
+    max_files: int,
+    max_bytes: int = 1_000_000,
+    ttl_days: float,
+    dedup_seconds: float,
+    scan_limit: int = _REQUEST_DUMP_SCAN_LIMIT_DEFAULT,
+) -> bool:
+    """Enforce global retention using one bounded, resumable scan page."""
+    with _request_dump_lock(logs_dir) as acquired:
+        if not acquired:
+            return False
+        scan_limit = min(
+            _REQUEST_DUMP_SCAN_LIMIT_MAX,
+            max(max_files + 1, 1, int(scan_limit)),
+        )
+        scan_key = str(logs_dir.resolve())
+        state = _REQUEST_DUMP_SCAN_STATES.get(scan_key)
+        if state is None:
+            state = {
+                "scanner": os.scandir(logs_dir),
+                "survivors": [],
+            }
+            _REQUEST_DUMP_SCAN_STATES[scan_key] = state
+        scanner = state["scanner"]
+
+        def _finish_scan() -> None:
+            _REQUEST_DUMP_SCAN_STATES.pop(scan_key, None)
+            try:
+                scanner.close()
+            except Exception:
+                pass
+
+        try:
+            # Each item is (path, mtime, fingerprint).  Only the globally newest
+            # max_files items survive between pages, so state remains bounded
+            # independently of the directory backlog.
+            candidates: List[Tuple[Path, float, Optional[str]]] = list(
+                state["survivors"]
+            )
+            now = time.time()
+            exhausted = False
+            for _ in range(scan_limit):
+                try:
+                    entry = next(scanner)
+                except StopIteration:
+                    exhausted = True
+                    break
+                except OSError:
+                    exhausted = True
+                    break
+                if (
+                    not entry.name.startswith("request_dump_")
+                    or not entry.name.endswith(".json")
+                ):
+                    continue
+                try:
+                    if entry.is_symlink() or not entry.is_file(follow_symlinks=False):
+                        continue
+                    existing = Path(entry.path)
+                    mtime = entry.stat(follow_symlinks=False).st_mtime
+                    age = now - mtime
+                    if ttl_days > 0 and age > ttl_days * 86400:
+                        existing.unlink()
+                        continue
+                    fingerprint = None
+                    if dedup_seconds > 0 and age <= dedup_seconds:
+                        try:
+                            prior = json.loads(existing.read_text(encoding="utf-8"))
+                            value = prior.get("fingerprint")
+                            if isinstance(value, str):
+                                fingerprint = value
+                        except (OSError, ValueError, TypeError, AttributeError):
+                            pass
+                    candidates.append((existing, mtime, fingerprint))
+                except (OSError, ValueError, TypeError):
+                    continue
+
+            # A scanner may observe a file written during an earlier page.  Fold
+            # repeated paths before applying fingerprint and count retention.
+            newest_by_path: Dict[Path, Tuple[Path, float, Optional[str]]] = {}
+            for candidate in candidates:
+                prior = newest_by_path.get(candidate[0])
+                if prior is None or candidate[1] > prior[1]:
+                    newest_by_path[candidate[0]] = candidate
+            ordered = sorted(
+                newest_by_path.values(), key=lambda item: item[1], reverse=True
+            )
+
+            payload_fingerprint = payload.get("fingerprint")
+            duplicate = False
+            seen_fingerprints = set()
+            retained: List[Tuple[Path, float, Optional[str]]] = []
+            discarded: List[Tuple[Path, float, Optional[str]]] = []
+            for candidate in ordered:
+                _path, mtime, fingerprint = candidate
+                fingerprint_is_fresh = (
+                    dedup_seconds > 0
+                    and now - mtime <= dedup_seconds
+                    and fingerprint is not None
+                )
+                if fingerprint_is_fresh and fingerprint == payload_fingerprint:
+                    duplicate = True
+                if fingerprint_is_fresh and fingerprint in seen_fingerprints:
+                    discarded.append(candidate)
+                    continue
+                if fingerprint_is_fresh:
+                    seen_fingerprints.add(fingerprint)
+                retained.append(candidate)
+
+            if max_files > 0 and not duplicate:
+                encoded = json.dumps(
+                    payload, ensure_ascii=False, indent=2, default=str
+                ).encode("utf-8")
+                if len(encoded) > max_bytes:
+                    raise ValueError("request dump exceeds configured max_bytes")
+                atomic_json_write(dump_file, payload, default=str)
+                retained = [
+                    candidate for candidate in retained if candidate[0] != dump_file
+                ]
+                retained.append(
+                    (
+                        dump_file,
+                        now,
+                        payload_fingerprint
+                        if isinstance(payload_fingerprint, str)
+                        else None,
+                    )
+                )
+                retained.sort(key=lambda item: item[1], reverse=True)
+
+            keep_count = max_files if max_files > 0 else 0
+            discarded.extend(retained[keep_count:])
+            retained = retained[:keep_count]
+            retained_paths = {candidate[0] for candidate in retained}
+            deleted_paths = set()
+            for stale, _mtime, _fingerprint in discarded:
+                if stale in retained_paths or stale in deleted_paths:
+                    continue
+                deleted_paths.add(stale)
+                try:
+                    stale.unlink()
+                except OSError:
+                    pass
+
+            state["survivors"] = retained
+            if exhausted:
+                _finish_scan()
+            return not duplicate and max_files > 0
+        except Exception:
+            _finish_scan()
+            raise
+
+
 def dump_api_request_debug(
     agent,
     api_kwargs: Dict[str, Any],
@@ -1721,12 +1966,6 @@ def dump_api_request_debug(
         body.pop("timeout", None)
         body = {k: v for k, v in body.items() if v is not None}
 
-        api_key = None
-        try:
-            api_key = getattr(agent.client, "api_key", None)
-        except Exception as e:
-            _ra().logger.debug("Could not extract API key for debug dump: %s", e)
-
         dump_payload: Dict[str, Any] = {
             "timestamp": datetime.now().isoformat(),
             "session_id": agent.session_id,
@@ -1735,7 +1974,8 @@ def dump_api_request_debug(
                 "method": "POST",
                 "url": f"{agent.base_url.rstrip('/')}{'/responses' if agent.api_mode == 'codex_responses' else '/chat/completions'}",
                 "headers": {
-                    "Authorization": f"Bearer {agent._mask_api_key_for_logs(api_key)}",
+                    # Persist no stable credential fingerprint at all.
+                    "Authorization": "[REDACTED]",
                     "Content-Type": "application/json",
                 },
                 "body": body,
@@ -1782,8 +2022,112 @@ def dump_api_request_debug(
         # JSON writer so request dumps keep the same write semantics as before.
         from agent.redact import redact_sensitive_text
         _serialized = json.dumps(dump_payload, ensure_ascii=False, indent=2, default=str)
-        _redacted_payload = json.loads(redact_sensitive_text(_serialized, force=True))
-        atomic_json_write(dump_file, _redacted_payload, default=str)
+        _redacted_payload = json.loads(
+            redact_sensitive_text(
+                _serialized,
+                force=True,
+                redact_url_credentials=True,
+                nonreusable=True,
+            )
+        )
+        error_info = _redacted_payload.get("error") or {}
+        # Hash only the failure shape, not the request body: enough to suppress
+        # quota storms without creating a content fingerprint in support dumps.
+        fingerprint_material = json.dumps({
+            "reason": reason,
+            "url": _redacted_payload["request"]["url"],
+            "status": error_info.get("status_code") or error_info.get("response_status"),
+            "code": error_info.get("code"),
+            "type": error_info.get("type"),
+            "message": error_info.get("message"),
+        }, sort_keys=True, default=str)
+        _redacted_payload["fingerprint"] = hashlib.sha256(
+            fingerprint_material.encode("utf-8")
+        ).hexdigest()
+
+        try:
+            from hermes_cli.config import load_config
+            dump_cfg = ((load_config() or {}).get("sessions") or {}).get("request_dumps") or {}
+            max_files = min(max(0, int(dump_cfg.get("max_files", 20))), 1000)
+            max_bytes = int(dump_cfg.get("max_bytes", 1_000_000))
+            if max_bytes < 4096 or max_bytes > 10_000_000:
+                raise ValueError("request dump max_bytes is outside safe bounds")
+            ttl_days = float(dump_cfg.get("ttl_days", 7))
+            dedup_seconds = float(dump_cfg.get("deduplicate_seconds", 3600))
+            cleanup_scan_limit = int(dump_cfg.get(
+                "cleanup_scan_limit", _REQUEST_DUMP_SCAN_LIMIT_DEFAULT
+            ))
+            if cleanup_scan_limit <= 0:
+                raise ValueError("request dump cleanup_scan_limit must be positive")
+            cleanup_scan_limit = min(
+                cleanup_scan_limit, _REQUEST_DUMP_SCAN_LIMIT_MAX
+            )
+            if not math.isfinite(ttl_days) or not math.isfinite(dedup_seconds):
+                raise ValueError("request dump retention values must be finite")
+            ttl_days = max(0.0, ttl_days)
+            dedup_seconds = max(0.0, dedup_seconds)
+        except Exception:
+            max_files, max_bytes, ttl_days, dedup_seconds, cleanup_scan_limit = (
+                20, 1_000_000, 7.0, 3600.0, _REQUEST_DUMP_SCAN_LIMIT_DEFAULT
+            )
+
+        def _encoded_size(payload: Dict[str, Any]) -> int:
+            # Match atomic_json_write's exact on-disk representation.
+            return len(json.dumps(
+                payload, ensure_ascii=False, indent=2, default=str
+            ).encode("utf-8"))
+
+        redacted_size = _encoded_size(_redacted_payload)
+        if redacted_size > max_bytes:
+            compact_error = {
+                key: error_info.get(key)
+                for key in (
+                    "type", "status_code", "response_status", "request_id", "code", "param"
+                )
+                if error_info.get(key) is not None
+            }
+            message = error_info.get("message")
+            if message is not None:
+                compact_error["message"] = str(message)[:512]
+            _redacted_payload = {
+                "timestamp": str(_redacted_payload.get("timestamp", ""))[:64],
+                "session_id": str(_redacted_payload.get("session_id", ""))[:256],
+                "reason": str(_redacted_payload.get("reason", ""))[:256],
+                "request": {
+                    "method": str(_redacted_payload["request"].get("method", ""))[:16],
+                    "url": str(_redacted_payload["request"].get("url", ""))[:512],
+                    "headers": _redacted_payload["request"].get("headers"),
+                    "body": {
+                        "truncated": True,
+                        "original_serialized_bytes": redacted_size,
+                    },
+                },
+                "error": compact_error,
+                "fingerprint": _redacted_payload["fingerprint"],
+            }
+        # Recheck the exact encoded file. Even compact metadata is untrusted;
+        # if it still cannot fit, use a deterministic minimal schema.
+        if _encoded_size(_redacted_payload) > max_bytes:
+            _redacted_payload = {
+                "timestamp": str(_redacted_payload.get("timestamp", ""))[:64],
+                "truncated": True,
+                "fingerprint": str(_redacted_payload.get("fingerprint", ""))[:64],
+            }
+        if _encoded_size(_redacted_payload) > max_bytes:
+            return None
+
+        wrote_dump = _write_bounded_request_dump(
+            logs_dir=agent.logs_dir,
+            dump_file=dump_file,
+            payload=_redacted_payload,
+            max_files=max_files,
+            max_bytes=max_bytes,
+            ttl_days=ttl_days,
+            dedup_seconds=dedup_seconds,
+            scan_limit=cleanup_scan_limit,
+        )
+        if not wrote_dump:
+            return None
 
         agent._vprint(f"{agent.log_prefix}🧾 Request debug dump written to: {dump_file}")
 
@@ -3412,7 +3756,15 @@ def extract_api_error_context(error: Exception) -> Dict[str, Any]:
             try:
                 context["reset_at"] = time.time() + float(retry_after)
             except (TypeError, ValueError):
-                pass
+                try:
+                    # RFC 9110 permits Retry-After as an HTTP-date in addition
+                    # to delta-seconds. Preserve the absolute reset so the
+                    # credential-pool circuit breaker survives process restarts.
+                    context["reset_at"] = parsedate_to_datetime(
+                        str(retry_after)
+                    ).timestamp()
+                except (TypeError, ValueError, OverflowError):
+                    pass
         ratelimit_reset = headers.get("x-ratelimit-reset")
         if ratelimit_reset and "reset_at" not in context:
             context["reset_at"] = ratelimit_reset

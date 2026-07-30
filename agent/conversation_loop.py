@@ -16,6 +16,8 @@ resolved through :func:`_ra` so those patches keep working.
 
 from __future__ import annotations
 
+import contextvars
+import hashlib
 import json
 import logging
 import os
@@ -1050,7 +1052,113 @@ def _notify_context_engine_turn_complete(
         )
 
 
-def run_conversation(
+def _loop_guard_reason(agent: Any, messages: List[Dict[str, Any]], started_at: float) -> Optional[str]:
+    """Return a configured hard-stop reason for a stuck tool loop."""
+    wall_clock = max(0.0, float(getattr(agent, "max_wall_clock_seconds", 0) or 0))
+    if wall_clock and time.monotonic() - started_at >= wall_clock:
+        return "wall_clock_budget_reached"
+
+    error_limit = max(0, int(getattr(agent, "repeated_tool_error_limit", 0) or 0))
+    if error_limit:
+        error_signatures: List[str] = []
+        for message in reversed(messages):
+            if not isinstance(message, dict):
+                continue
+            if message.get("role") == "user":
+                break
+            if message.get("role") != "tool":
+                continue
+            if message.get("_tool_execution_status") not in {
+                "error",
+                "timeout",
+                "blocked",
+            }:
+                break
+            signature = message.get("_tool_execution_signature")
+            if not isinstance(signature, str) or not signature:
+                content = str(message.get("content") or "")
+                signature = hashlib.sha256(content.encode("utf-8")).hexdigest()
+            error_signatures.append(signature)
+            if len(error_signatures) >= error_limit:
+                if len(set(error_signatures[:error_limit])) == 1:
+                    return "repeated_tool_error_limit_reached"
+                break
+
+    no_progress_limit = max(0, int(getattr(agent, "no_progress_tool_limit", 0) or 0))
+    if no_progress_limit:
+        # A repeated request is not itself evidence of a stuck loop. Polling
+        # tools deliberately issue the same call while their result changes.
+        # Hash each assistant batch together with its paired tool results so the
+        # guard only fires when both the request and observed state repeat.
+        turn_start = 0
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            if isinstance(message, dict) and message.get("role") == "user":
+                turn_start = index + 1
+                break
+
+        call_signatures: List[str] = []
+        index = turn_start
+        while index < len(messages):
+            message = messages[index]
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                index += 1
+                continue
+            calls = message.get("tool_calls") or []
+            if not calls:
+                index += 1
+                continue
+
+            tool_results: List[Dict[str, Any]] = []
+            result_index = index + 1
+            while result_index < len(messages):
+                result = messages[result_index]
+                if not isinstance(result, dict) or result.get("role") != "tool":
+                    break
+                tool_results.append(result)
+                result_index += 1
+            results_by_id = {
+                result.get("tool_call_id"): result
+                for result in tool_results
+                if result.get("tool_call_id")
+            }
+
+            normalized_calls = []
+            for call_index, call in enumerate(calls):
+                if not isinstance(call, dict):
+                    normalized_calls.append(str(call))
+                    continue
+                raw_function = call.get("function")
+                function = raw_function if isinstance(raw_function, dict) else {}
+                result = results_by_id.get(call.get("id"))
+                if result is None and call_index < len(tool_results):
+                    result = tool_results[call_index]
+                normalized_calls.append({
+                    "name": function.get("name") or call.get("name"),
+                    "arguments": function.get("arguments") or call.get("arguments"),
+                    "result": (
+                        {
+                            "content": result.get("content"),
+                            "status": result.get("_tool_execution_status"),
+                            "effect_disposition": result.get("effect_disposition"),
+                        }
+                        if result is not None
+                        else None
+                    ),
+                })
+            normalized = json.dumps(normalized_calls, sort_keys=True, default=str)
+            call_signatures.append(hashlib.sha256(normalized.encode("utf-8")).hexdigest())
+            index = max(index + 1, result_index)
+
+        if (
+            len(call_signatures) >= no_progress_limit
+            and len(set(call_signatures[-no_progress_limit:])) == 1
+        ):
+            return "no_progress_tool_limit_reached"
+    return None
+
+
+def _run_conversation_inner(
     agent,
     user_message: Any,
     system_message: str = None,
@@ -1082,6 +1190,23 @@ def run_conversation(
     Returns:
         Dict: Complete conversation result with final response and message history
     """
+    # Start the whole-turn clock at the public turn entry, before decoding,
+    # prompt construction, compression, plugins, persistence, or prefetch.
+    _turn_started_at = getattr(agent, "_turn_started_monotonic", None)
+    if not isinstance(_turn_started_at, (int, float)):
+        _turn_started_at = time.monotonic()
+    _wall_clock_limit = max(
+        0.0, float(getattr(agent, "max_wall_clock_seconds", 0) or 0)
+    )
+    _preassigned_deadline = getattr(agent, "_turn_deadline_monotonic", None)
+    agent._turn_deadline_monotonic = (
+        float(_preassigned_deadline)
+        if isinstance(_preassigned_deadline, (int, float)) and _wall_clock_limit
+        else _turn_started_at + _wall_clock_limit
+        if _wall_clock_limit
+        else None
+    )
+
     if moa_config is None:
         try:
             from hermes_cli.moa_config import decode_moa_turn
@@ -1184,7 +1309,6 @@ def run_conversation(
     # retain that ephemeral output and rebase it onto the compacted transcript
     # on the next loop iteration. This prevents a second advisor fan-out.
     pending_moa_prepared_request = None
-
     # Per-turn tally of consecutive successful credential-pool token refreshes,
     # keyed by (provider, pool-entry-id). A persistent upstream 401 lets
     # ``try_refresh_current()`` "succeed" forever on a single-entry OAuth pool,
@@ -1199,12 +1323,23 @@ def run_conversation(
     # stale prior turn's usage.
     agent._last_turn_usage = None
 
+    # Turn setup itself can consume the absolute deadline. Carry that stop
+    # through normal finalization so the delivered closure is appended and
+    # persisted as an assistant row instead of leaving replayable user input.
+    if _loop_guard_reason(agent, messages, _turn_started_at) == "wall_clock_budget_reached":
+        final_response = (
+            "Stopped this run because the configured whole-turn wall-clock "
+            "budget was reached (wall_clock_budget_reached)."
+        )
+        failed = True
+        _turn_exit_reason = "wall_clock_budget_reached"
+
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
     # all run inside Codex). Default Hermes path is bypassed entirely.
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
-    if agent.api_mode == "codex_app_server":
+    if final_response is None and agent.api_mode == "codex_app_server":
         return agent._run_codex_app_server_turn(
             user_message=user_message,
             original_user_message=original_user_message,
@@ -1213,7 +1348,19 @@ def run_conversation(
             should_review_memory=_should_review_memory,
         )
 
-    while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
+    while final_response is None and (
+        (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0)
+        or agent._budget_grace_call
+    ):
+        _guard_reason = _loop_guard_reason(agent, messages, _turn_started_at)
+        if _guard_reason:
+            _turn_exit_reason = _guard_reason
+            final_response = (
+                "Stopped this run because a configured worker safety limit was reached "
+                f"({_guard_reason}). Review the latest tool output before continuing."
+            )
+            failed = True
+            break
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:
             _apply_active_turn_redirect(agent, messages, _redirect_text)
@@ -3237,6 +3384,21 @@ def run_conversation(
                 break
 
             except Exception as api_error:
+                from agent.errors import TurnWallClockExceeded
+
+                if isinstance(api_error, TurnWallClockExceeded):
+                    if thinking_spinner:
+                        thinking_spinner.stop("")
+                        thinking_spinner = None
+                    if agent.thinking_callback:
+                        agent.thinking_callback("")
+                    _turn_exit_reason = "wall_clock_budget_reached"
+                    final_response = (
+                        "Stopped this run because the configured whole-turn wall-clock "
+                        "budget was reached (wall_clock_budget_reached)."
+                    )
+                    failed = True
+                    break
                 # Stop spinner silently — retry status is buffered and
                 # only flushed when every retry+fallback is exhausted.
                 if thinking_spinner:
@@ -5286,6 +5448,11 @@ def run_conversation(
             agent._ephemeral_max_output_tokens = min(_boost, _boost_cap)
             continue
 
+        # A retry-phase safety exit already supplied a final closure. Leave the
+        # outer loop without rewriting it as a generic exhausted-retries error.
+        if final_response is not None:
+            break
+
         # Guard: if all retries exhausted without a successful response
         # (e.g. repeated context-length errors that exhausted retry_count),
         # the `response` variable is still None. Break out cleanly.
@@ -6884,6 +7051,140 @@ def run_conversation(
         _pending_verification_response_previewed=_pending_verification_response_previewed,
     )
 
+
+_DEADLINE_FINALIZATION_HANDOFF_SECONDS = 0.25
+
+
+def run_conversation(agent, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    """Run one turn behind an absolute boundary that includes finalization.
+
+    A timed-out daemon may still unwind a blocking SQLite/filesystem call, so a
+    cached agent refuses a new turn until that worker exits. This preserves
+    session ordering instead of allowing a late prior-turn write to race the
+    next user message. After interrupting at the deadline, allow only a small,
+    fixed handoff window for an already-running canonical finalizer to publish
+    its persisted result; genuinely blocked finalization remains bounded.
+    """
+    wall_clock_limit = max(
+        0.0, float(getattr(agent, "max_wall_clock_seconds", 0) or 0)
+    )
+    if not wall_clock_limit:
+        return _run_conversation_inner(agent, *args, **kwargs)
+
+    prior_worker = getattr(agent, "_deadline_turn_worker", None)
+    if isinstance(prior_worker, threading.Thread) and prior_worker.is_alive():
+        text = (
+            "Cannot start this turn because the previous timed-out turn is still "
+            "finalizing its session state. Please retry shortly."
+        )
+        return {
+            "final_response": text,
+            "messages": [],
+            "api_calls": 0,
+            "completed": False,
+            "failed": True,
+            "partial": True,
+            "error": text,
+        }
+
+    started_at = time.monotonic()
+    deadline = started_at + wall_clock_limit
+    agent._turn_started_monotonic = started_at
+    agent._turn_deadline_monotonic = deadline
+    finished = threading.Event()
+    outcome: Dict[str, Any] = {}
+    run_context = contextvars.copy_context()
+
+    def _run() -> None:
+        try:
+            outcome["result"] = run_context.run(
+                _run_conversation_inner, agent, *args, **kwargs
+            )
+        except BaseException as exc:
+            outcome["error"] = exc
+        finally:
+            outcome["finished_at"] = time.monotonic()
+            finished.set()
+
+    worker = threading.Thread(
+        target=_run,
+        name="hermes-whole-turn-deadline",
+        daemon=True,
+    )
+    agent._deadline_turn_worker = worker
+    worker.start()
+    finished.wait(timeout=max(0.0, deadline - time.monotonic()))
+
+    def _finished_on_time() -> bool:
+        finished_at = outcome.get("finished_at")
+        return bool(
+            finished.is_set()
+            and isinstance(finished_at, (int, float))
+            and finished_at <= deadline
+        )
+
+    if _finished_on_time():
+        # The inner loop may itself cross the fence and synchronously persist a
+        # deadline result just as the wait expires. Accept only a result whose
+        # worker-recorded completion timestamp stayed inside the absolute bound.
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["result"]
+
+    agent._wall_clock_expired = True
+    try:
+        # AIAgent.interrupt targets its bound execution thread and fans out to
+        # tool workers.  Do not lazily import run_agent on this expired path:
+        # import time itself would sit outside the bound, and turn startup
+        # already records a pending thread signal if binding is not complete.
+        agent.interrupt("whole-turn wall-clock budget reached")
+    except Exception:
+        pass
+
+    # The inner loop owns transcript closure and persistence.  At the exact
+    # deadline it may already be in that canonical finalizer, so give it one
+    # short, monotonic-clock-independent handoff window after the interrupt.
+    # Do not join indefinitely: a wedged filesystem/SQLite call must not hold
+    # the caller forever, and the live worker remains recorded to fence turns.
+    finished.wait(timeout=_DEADLINE_FINALIZATION_HANDOFF_SECONDS)
+    if _finished_on_time():
+        if "error" in outcome:
+            raise outcome["error"]
+        return outcome["result"]
+
+    # A canonical inner finalizer that completed after the absolute timestamp
+    # fence may still have durably closed the user/assistant boundary. Never
+    # accept a late successful result, but preserve an already-persisted
+    # deadline failure instead of replacing it with an empty transcript that
+    # makes the user turn replayable on resume.
+    late_result = outcome.get("result")
+    if (
+        finished.is_set()
+        and isinstance(late_result, dict)
+        and late_result.get("turn_exit_reason") == "wall_clock_budget_reached"
+        and late_result.get("failed") is True
+        and isinstance(late_result.get("messages"), list)
+        and late_result["messages"]
+        and late_result["messages"][-1].get("role") == "assistant"
+        and late_result["messages"][-1].get("content")
+        == late_result.get("final_response")
+    ):
+        return late_result
+
+    text = (
+        "Stopped this run because the configured whole-turn wall-clock budget "
+        "was reached (wall_clock_budget_reached)."
+    )
+    return {
+        "final_response": text,
+        "messages": [],
+        "api_calls": int(getattr(agent, "_api_call_count", 0) or 0),
+        "completed": False,
+        "failed": True,
+        "partial": True,
+        "turn_exit_reason": "wall_clock_budget_reached",
+        "error": text,
+    }
 
 
 __all__ = ["run_conversation"]

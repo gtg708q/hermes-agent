@@ -7,6 +7,10 @@ covered by a separate live test gated on `codex --version`.
 
 from __future__ import annotations
 
+import os
+import signal
+import time
+
 import pytest
 
 from hermes_cli.runtime_provider import (
@@ -141,6 +145,65 @@ class TestCodexAppServerModule:
         assert isinstance(err, RuntimeError)
         assert "boom" in str(err)
         assert "-32600" in str(err)
+
+    @pytest.mark.skipif(os.name == "nt", reason="Requires POSIX fork and signals")
+    @pytest.mark.live_system_guard_bypass
+    def test_zero_timeout_close_kills_and_eventually_reaps_real_subprocess(
+        self, tmp_path
+    ) -> None:
+        """A pipe-holding descendant must not prevent reaping the killed parent."""
+        from agent.transports.codex_app_server import CodexAppServerClient
+
+        descendant_pid_file = tmp_path / "descendant.pid"
+        fake_codex = tmp_path / "fake-codex"
+        fake_codex.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, signal, time\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "child = os.fork()\n"
+            "if child == 0:\n"
+            "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "    while True: time.sleep(1)\n"
+            "with open(os.environ['DESCENDANT_PID_FILE'], 'w') as handle:\n"
+            "    handle.write(str(child))\n"
+            "while True: time.sleep(1)\n",
+            encoding="utf-8",
+        )
+        fake_codex.chmod(0o755)
+        client = CodexAppServerClient(
+            codex_bin=str(fake_codex),
+            env={"DESCENDANT_PID_FILE": str(descendant_pid_file)},
+        )
+        deadline = time.monotonic() + 2
+        while not descendant_pid_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert descendant_pid_file.exists()
+        descendant_pid = int(descendant_pid_file.read_text(encoding="utf-8"))
+
+        try:
+            started = time.monotonic()
+            client.close(timeout=0)
+            assert time.monotonic() - started < 0.5
+
+            deadline = time.monotonic() + 2
+            while (
+                client._proc.returncode is None or client._reaper_thread is not None
+            ) and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert client._proc.returncode is not None
+            assert client._reaper_thread is None
+            with pytest.raises(ChildProcessError):
+                os.waitpid(client._proc.pid, os.WNOHANG)
+        finally:
+            if client._proc.returncode is None:
+                client._proc.kill()
+                client._proc.wait(timeout=1)
+            try:
+                os.kill(descendant_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            client._reader.join(timeout=1)
+            client._stderr_reader.join(timeout=1)
 
 
 class TestSpawnEnvIsolation:

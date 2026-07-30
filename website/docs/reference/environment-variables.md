@@ -731,6 +731,10 @@ Advanced per-platform knobs for throttling the outbound message batcher. Most us
 
 ## Agent Behavior
 
+Configure behavioral loop guards such as `agent.max_wall_clock_seconds`,
+`agent.repeated_tool_error_limit`, and `agent.no_progress_tool_limit` in
+`config.yaml`; they intentionally do not have public environment overrides.
+
 | Variable | Description |
 |----------|-------------|
 | `HERMES_MAX_ITERATIONS` | Max tool-calling iterations per conversation (default: 500) |

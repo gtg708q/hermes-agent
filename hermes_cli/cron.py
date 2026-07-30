@@ -473,6 +473,20 @@ def cron_command(args):
         cron_tick()
         return 0
 
+    if subcmd == "gc-bootstrap":
+        from cron.jobs import bootstrap_output_gc_index
+
+        report = bootstrap_output_gc_index()
+        if report["already_complete"]:
+            print("Portable cron output GC index is already initialized.")
+        else:
+            noun = "directory" if report["indexed"] == 1 else "directories"
+            print(
+                "Portable cron output GC index initialized: "
+                f"{report['indexed']} {noun} indexed."
+            )
+        return 0
+
     if subcmd in {"runs", "history"}:
         cron_runs(getattr(args, "job_id", None), getattr(args, "limit", 20))
         return 0
@@ -496,5 +510,5 @@ def cron_command(args):
         return _job_action("remove", args.job_id, "Removed")
 
     print(f"Unknown cron command: {subcmd}")
-    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|tick]")
+    print("Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|tick|gc-bootstrap]")
     sys.exit(1)

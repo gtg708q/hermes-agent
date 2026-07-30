@@ -306,6 +306,45 @@ Note: The agent cannot see this message, and therefore cannot respond to it.
 
 To deliver the raw agent output without the wrapper, set `cron.wrap_response` to `false`:
 
+Cron run artifacts are bounded independently of chat delivery. Hermes keeps the
+newest 50 output files per job and removes orphaned job-output directories after
+a seven-day grace period on scheduler ticks. Both are configurable:
+
+```yaml
+cron:
+  output_retention: 50
+  output_orphan_retention_days: 7
+  output_gc_interval_seconds: 3600  # at most one orphan-GC pass per hour
+  output_gc_max_directories: 500    # bound scheduler work per pass
+```
+
+Set `output_orphan_retention_days` to a negative value to disable orphan GC.
+
+Orphan GC is profile-safe: it only compares directories under the active
+profile's `cron/output` store with that profile's `jobs.json`, and never follows
+symlinks.
+
+:::caution One-time macOS/Windows upgrade step
+Existing macOS and Windows profiles that already contain cron output directories
+must initialize the portable retention index once after upgrading:
+
+```bash
+hermes cron gc-bootstrap
+```
+
+The command scans only the active profile. Run it separately for every named
+profile that has existing output, for example:
+
+```bash
+hermes --profile work cron gc-bootstrap
+```
+
+Until that one-time bootstrap succeeds, scheduler orphan cleanup fails closed so
+legacy output cannot be deleted without first being indexed. A genuinely fresh
+profile whose `cron/output` directory is empty is detected with a bounded check
+and initialized automatically; it does not require this command.
+:::
+
 ```yaml
 # ~/.hermes/config.yaml
 cron:

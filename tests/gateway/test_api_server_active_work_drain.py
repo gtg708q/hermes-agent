@@ -185,7 +185,11 @@ class TestDrainWaitsForApiWork:
             side_effect=delayed_create_task,
         ), patch.object(api, "_create_agent", return_value=mock_agent):
             async with TestClient(TestServer(app)) as client:
-                response = await client.post("/v1/runs", json={"input": "hello"})
+                response = await client.post(
+                    "/v1/runs",
+                    json={"input": "hello"},
+                    headers={"Idempotency-Key": "drain-queued-run"},
+                )
                 assert response.status == 202
                 await task_started.wait()
 

@@ -946,6 +946,11 @@ DEFAULT_CONFIG = {
     "max_live_sessions": 16,
     "agent": {
         "max_turns": 500,
+        # Whole-turn safety guards. 0 disables. These behavioral settings are
+        # configured here rather than through public environment overrides.
+        "max_wall_clock_seconds": 0,
+        "repeated_tool_error_limit": 0,
+        "no_progress_tool_limit": 0,
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has
@@ -2946,6 +2951,13 @@ DEFAULT_CONFIG = {
         # recent .md files and prunes older ones. 0 or negative disables
         # pruning (for operators who manage cleanup externally). Default 50.
         "output_retention": 50,
+        # Remove output directories for jobs no longer present after this many
+        # days. Negative disables orphan GC; zero removes them next tick.
+        "output_orphan_retention_days": 7,
+        # Orphan-output GC runs at most this often and examines at most this
+        # many job directories per pass, bounding scheduler tick work.
+        "output_gc_interval_seconds": 3600,
+        "output_gc_max_directories": 500,
         # Timeout (seconds) for SessionDB() init inside cron jobs.
         # SessionDB opens/migrates state.db synchronously and has no timeout
         # of its own against a wedged sqlite3.connect. An unbounded hang here
@@ -3330,6 +3342,17 @@ DEFAULT_CONFIG = {
         # How many inactive days of ended-session history to keep. Matches
         # the default of ``hermes sessions prune``.
         "retention_days": 90,
+        # Per-source overrides let high-volume automation expire sooner while
+        # preserving longer-lived interactive history, e.g. {"cron": 14}.
+        "retention_by_source": {},
+        # Persisted inference request diagnostics. Authorization is always
+        # fully redacted; duplicate failure shapes inside the window are skipped.
+        "request_dumps": {
+            "max_files": 20,
+            "max_bytes": 1000000,
+            "ttl_days": 7,
+            "deduplicate_seconds": 3600,
+        },
         # When true, auto-archive (soft-hide, never delete) sessions that
         # haven't been touched in ``auto_archive_days`` days, once per
         # (roughly) min_interval_hours.  "Touched" is last activity, not

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
 from types import SimpleNamespace
@@ -26,6 +27,26 @@ from typing import Any, Callable, Dict, List
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 
 logger = logging.getLogger(__name__)
+
+def _persist_codex_deadline_closure(agent, messages, text: str) -> bool:
+    """Close and durably flush an expired Codex turn without duplicate rows.
+
+    This runs synchronously inside the whole-turn deadline worker. The caller
+    remains bounded by ``conversation_loop.run_conversation`` while the worker
+    stays alive as the next-turn fence until persistence actually returns.
+    """
+    closure = {"role": "assistant", "content": text}
+    if not messages or messages[-1] != closure:
+        messages.append(closure)
+
+    if getattr(agent, "_session_db", None) is None:
+        return False
+
+    try:
+        return agent._flush_messages_to_session_db(messages) is not False
+    except Exception:
+        logger.warning("codex app-server deadline-closure flush failed", exc_info=True)
+        return False
 
 
 def _coerce_usage_int(value: Any) -> int:
@@ -691,14 +712,43 @@ def run_codex_app_server_turn(
     # standard run_conversation() flow (line ~11823) before the early
     # return reaches us. Do NOT append again — that would duplicate.
 
+    _deadline = None
     try:
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        _raw_deadline = getattr(agent, "_turn_deadline_monotonic", None)
+        _deadline = _raw_deadline if isinstance(_raw_deadline, (int, float)) and math.isfinite(_raw_deadline) else None
+        _remaining = (
+            max(0.0, _deadline - time.monotonic())
+            if _deadline is not None
+            else 600.0
+        )
+        if _deadline is not None and _remaining <= 0:
+            from agent.errors import TurnWallClockExceeded
+
+            raise TurnWallClockExceeded("wall_clock_budget_reached")
+        turn = agent._codex_session.run_turn(
+            user_input=user_message,
+            turn_timeout=max(0.01, _remaining),
+            notification_poll_timeout=min(0.25, max(0.01, _remaining)),
+            deadline_monotonic=_deadline,
+        )
     except Exception as exc:
-        logger.exception("codex app-server turn failed")
+        from agent.errors import TurnWallClockExceeded
+
+        _wall_clock_stopped = isinstance(exc, TurnWallClockExceeded)
+        if _wall_clock_stopped:
+            logger.info("codex app-server turn stopped by whole-turn deadline")
+        else:
+            logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn
-        # respawns from scratch instead of reusing a dead client.
+        # respawns from scratch instead of reusing a dead client. Cleanup is
+        # itself capped by the remaining whole-turn budget.
         try:
-            agent._codex_session.close()
+            cleanup_timeout = (
+                max(0.0, _deadline - time.monotonic())
+                if _wall_clock_stopped and _deadline is not None
+                else 3.0
+            )
+            agent._codex_session.close(timeout=cleanup_timeout)
         except Exception:
             pass
         agent._codex_session = None
@@ -712,11 +762,22 @@ def run_codex_app_server_turn(
         )
         if _user_interrupted:
             agent.clear_interrupt()
-        return {
-            "final_response": (
+        _final_response = (
+            "Stopped this run because the configured whole-turn wall-clock "
+            "budget was reached (wall_clock_budget_reached)."
+            if _wall_clock_stopped
+            else (
                 f"Codex app-server turn failed: {exc}. "
                 f"Fall back to default runtime with `/codex-runtime auto`."
-            ),
+            )
+        )
+        _deadline_persisted = (
+            _persist_codex_deadline_closure(agent, messages, _final_response)
+            if _wall_clock_stopped
+            else False
+        )
+        return {
+            "final_response": _final_response,
             "messages": messages,
             "api_calls": 0,
             "completed": False,
@@ -727,7 +788,16 @@ def run_codex_app_server_turn(
                 if _interrupt_message
                 else {}
             ),
-            "error": str(exc),
+            "error": "wall_clock_budget_reached" if _wall_clock_stopped else str(exc),
+            **(
+                {
+                    "failed": True,
+                    "turn_exit_reason": "wall_clock_budget_reached",
+                }
+                if _wall_clock_stopped
+                else {}
+            ),
+            **({"agent_persisted": True} if _deadline_persisted else {}),
         }
 
     # This runtime bypasses the normal conversation-loop finalizer. Mirror its

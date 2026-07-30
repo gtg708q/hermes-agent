@@ -9,5 +9,9 @@ class EmptyStreamError(RuntimeError):
     pass
 
 
+class TurnWallClockExceeded(TimeoutError):
+    """The configured whole-turn monotonic deadline was exhausted."""
+
+
 class MoAPresetNotFoundError(ValueError):
     """Raised when a persisted MoA preset no longer exists in config."""

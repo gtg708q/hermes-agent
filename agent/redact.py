@@ -626,6 +626,7 @@ def redact_sensitive_text(
     code_file: bool = False,
     file_read: bool = False,
     redact_url_credentials: bool = False,
+    nonreusable: bool = False,
 ) -> str:
     """Apply all redaction patterns to a block of text.
 
@@ -633,6 +634,9 @@ def redact_sensitive_text(
     Enabled by default. Disable via security.redact_secrets: false in config.yaml.
     Set force=True for safety boundaries that must never return raw secrets
     regardless of the user's global logging redaction preference.
+
+    Set nonreusable=True for persistence boundaries where even a stable
+    credential prefix/suffix fingerprint must not be retained.
 
     Set redact_url_credentials=True at non-navigation egress boundaries to
     additionally redact credential-named query parameters and ``user:pass@``
@@ -678,10 +682,11 @@ def redact_sensitive_text(
     if file_read:
         code_file = True
 
+    masker = _mask_token_nonreusable if (file_read or nonreusable) else _mask_token
+
     # Known prefixes (sk-, ghp_, etc.) — gate on substring presence
     if _has_known_prefix_substring(text):
-        _prefix_sub = _mask_token_nonreusable if file_read else _mask_token
-        text = _PREFIX_RE.sub(lambda m: _prefix_sub(m.group(1)), text)
+        text = _PREFIX_RE.sub(lambda m: masker(m.group(1)), text)
 
     # ENV assignments: OPENAI_API_KEY=***  (skip for code files — false positives)
     if not code_file:
@@ -700,7 +705,7 @@ def redact_sensitive_text(
                 # embedded matching inside the helper.
                 if not _key_has_secret_keyword(name):
                     return m.group(0)
-                return f"{name}={quote}{_mask_token(value)}{quote}"
+                return f"{name}={quote}{masker(value)}{quote}"
             text = _ENV_ASSIGN_RE.sub(_redact_env, text)
             # Lowercase/dotted config keys (issue #16413). Skip URLs entirely —
             # web-URL query params are intentionally passed through (see note
@@ -719,7 +724,7 @@ def redact_sensitive_text(
                 # not a leaked secret value.
                 if _ENV_LOOKUP_VALUE_RE.match(value):
                     return m.group(0)
-                return f'{key}: "{_mask_token(value)}"'
+                return f'{key}: "{masker(value)}"'
             text = _JSON_FIELD_RE.sub(_redact_json, text)
 
         # Unquoted YAML / colon config: password: ***  (after JSON so quoted
@@ -738,7 +743,7 @@ def redact_sensitive_text(
                 # document text, not credentials (nearai/ironclaw#6129).
                 if not _key_has_secret_keyword(key):
                     return m.group(0)
-                return f"{key}{sep}{_mask_token(value)}"
+                return f"{key}{sep}{masker(value)}"
             text = _YAML_ASSIGN_RE.sub(_redact_yaml, text)
 
     # Authorization headers — _AUTH_HEADER_RE matches any scheme after
@@ -746,7 +751,7 @@ def redact_sensitive_text(
     # cheapest substring gate that covers every casing without a casefold().
     if "uthorization" in text or "UTHORIZATION" in text:
         text = _AUTH_HEADER_RE.sub(
-            lambda m: m.group(1) + (m.group(2) or "") + _mask_token(m.group(3)),
+            lambda m: m.group(1) + (m.group(2) or "") + masker(m.group(3)),
             text,
         )
 
@@ -754,7 +759,7 @@ def redact_sensitive_text(
     # colon-separated, so gate on ":" — the regex itself is the precise filter.
     if ":" in text:
         text = _SECRET_HEADER_RE.sub(
-            lambda m: m.group(1) + _mask_token(m.group(2)),
+            lambda m: m.group(1) + masker(m.group(2)),
             text,
         )
 
@@ -793,13 +798,13 @@ def redact_sensitive_text(
         # query-string tokens are left to pass through (see the web-URL note
         # below). See _URL_BARE_TOKEN_RE for the false-positive guards.
         text = _URL_BARE_TOKEN_RE.sub(
-            lambda m: f"{m.group(1)}{_mask_token(m.group(2))}{m.group(3)}",
+            lambda m: f"{m.group(1)}{masker(m.group(2))}{m.group(3)}",
             text,
         )
 
     # JWT tokens (eyJ... — base64-encoded JSON headers)
     if "eyJ" in text:
-        text = _JWT_RE.sub(lambda m: _mask_token(m.group(0)), text)
+        text = _JWT_RE.sub(lambda m: masker(m.group(0)), text)
 
     # NOTE: Web-URL redaction (query params + userinfo + HTTP access-log
     # request targets) is intentionally OFF. Many legitimate workflows pass

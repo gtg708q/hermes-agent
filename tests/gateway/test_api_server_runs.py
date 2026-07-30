@@ -9,22 +9,39 @@ Covers:
 """
 
 import asyncio
+import hashlib
+import json
 import threading
 import time
-from unittest.mock import MagicMock, patch
+import uuid
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from aiohttp import web
-from aiohttp.test_utils import TestClient, TestServer
+from aiohttp.test_utils import TestClient as _AiohttpTestClient, TestServer
 
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
+    ResponseStore,
+    _api_request_profile,
     _approval_event_choices,
+    _derive_idempotent_run_id,
     cors_middleware,
     security_headers_middleware,
 )
 from tools import approval as approval_mod
+
+
+class TestClient(_AiohttpTestClient):
+    """Give legacy run tests a unique key unless they explicitly test headers."""
+
+    def post(self, path, *, headers=None, **kwargs):
+        if headers is None:
+            headers = _idempotency_headers()
+        elif "Idempotency-Key" not in headers and headers:
+            headers = {**headers, **_idempotency_headers()}
+        return super().post(path, headers=headers, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +88,50 @@ def _create_runs_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/v1/runs/{run_id}/approval", adapter._handle_run_approval)
     app.router.add_post("/v1/runs/{run_id}/stop", adapter._handle_stop_run)
     return app
+
+
+def _create_profiled_runs_app(adapter: APIServerAdapter) -> web.Application:
+    """Create a minimal multiplex app that drives the real profile context."""
+    @web.middleware
+    async def _profile_context(request, handler):
+        token = _api_request_profile.set(request.match_info["profile"])
+        try:
+            return await handler(request)
+        finally:
+            _api_request_profile.reset(token)
+
+    app = web.Application(middlewares=[_profile_context])
+    app["api_server_adapter"] = adapter
+    app.router.add_post("/p/{profile}/v1/runs", adapter._handle_runs)
+    app.router.add_get("/p/{profile}/v1/runs/{run_id}", adapter._handle_get_run)
+    app.router.add_get(
+        "/p/{profile}/v1/runs/{run_id}/events", adapter._handle_run_events
+    )
+    app.router.add_post(
+        "/p/{profile}/v1/runs/{run_id}/stop", adapter._handle_stop_run
+    )
+    return app
+
+
+def _idempotency_headers(key: str | None = None) -> dict[str, str]:
+    return {"Idempotency-Key": key if key is not None else uuid.uuid4().hex}
+
+
+def _run_fingerprint(body: dict, *, profile: str = "default") -> str:
+    payload = {
+        "body": body,
+        "gateway_session_key": None,
+        "profile": profile,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=False,
+            default=str,
+        ).encode("utf-8")
+    ).hexdigest()
 
 
 def _make_slow_agent(**kwargs):
@@ -120,6 +181,1018 @@ def auth_adapter():
 
 
 class TestStartRun:
+    @pytest.mark.asyncio
+    async def test_idempotent_run_fails_closed_after_response_store_disk_fallback(
+        self, adapter
+    ):
+        import sqlite3
+
+        real_connect = sqlite3.connect
+        calls = 0
+
+        def _fail_disk_once(path, *args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError("disk unavailable")
+            return real_connect(path, *args, **kwargs)
+
+        adapter._response_store.close()
+        with patch("sqlite3.connect", side_effect=_fail_disk_once):
+            adapter._response_store = ResponseStore(db_path="/unavailable/response_store.db")
+
+        app = _create_runs_app(adapter)
+        with patch.object(adapter, "_create_agent") as create_agent:
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post("/v1/runs", json={"input": "hello"})
+                payload = await response.json()
+
+        assert response.status == 503
+        assert payload["error"]["code"] == "idempotency_store_unavailable"
+        create_agent.assert_not_called()
+
+    def test_idempotent_run_id_scopes_key_by_canonical_profile(self):
+        key = "same-client-key"
+
+        unprefixed = _derive_idempotent_run_id(key, None)
+        explicit_default = _derive_idempotent_run_id(key, "default")
+        secondary = _derive_idempotent_run_id(key, "research")
+
+        assert unprefixed == explicit_default
+        assert secondary != unprefixed
+
+    @pytest.mark.asyncio
+    async def test_start_preserves_headerless_contract_and_validates_supplied_key(self, adapter):
+        app = _create_runs_app(adapter)
+        with patch.object(adapter, "_create_agent") as create_agent:
+            agent = MagicMock()
+            agent.run_conversation.return_value = {"final_response": "done"}
+            agent.session_prompt_tokens = 0
+            agent.session_completion_tokens = 0
+            agent.session_total_tokens = 0
+            create_agent.return_value = agent
+            async with TestClient(TestServer(app)) as cli:
+                missing = await cli.post(
+                    "/v1/runs", json={"input": "hello"}, headers={}
+                )
+                empty = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello"},
+                    headers={"Idempotency-Key": ""},
+                )
+                oversized = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello"},
+                    headers={"Idempotency-Key": "x" * 256},
+                )
+
+        assert missing.status == 202
+        assert empty.status == 400
+        assert oversized.status == 400
+        assert len(adapter._run_statuses) == 1
+
+    @pytest.mark.asyncio
+    async def test_idempotency_key_derives_exact_run_id_and_replay_returns_status(self, adapter):
+        key = "sc15:conversation:42:turn:7"
+        expected = _derive_idempotent_run_id(key, None)
+        app = _create_runs_app(adapter)
+        release = threading.Event()
+        started = threading.Event()
+
+        with patch.object(adapter, "_create_agent") as mock_create:
+            mock_agent = MagicMock()
+
+            def _run(**_kwargs):
+                started.set()
+                release.wait(timeout=5)
+                return {"final_response": "done"}
+
+            mock_agent.run_conversation.side_effect = _run
+            mock_agent.session_prompt_tokens = 0
+            mock_agent.session_completion_tokens = 0
+            mock_agent.session_total_tokens = 0
+            mock_create.return_value = mock_agent
+
+            async with TestClient(TestServer(app)) as cli:
+                first = await cli.post(
+                    "/v1/runs", json={"input": "hello"}, headers=_idempotency_headers(key)
+                )
+                assert first.status == 202
+                first_body = await first.json()
+                assert first_body["run_id"] == expected
+                assert await asyncio.to_thread(started.wait, 2)
+
+                replay = await cli.post(
+                    "/v1/runs", json={"input": "hello"}, headers=_idempotency_headers(key)
+                )
+                replay_body = await replay.json()
+                assert replay.status == 200
+                assert replay_body["run_id"] == expected
+                assert replay_body["status"] in {"queued", "running"}
+                assert mock_create.call_count == 1
+                release.set()
+
+    @pytest.mark.asyncio
+    async def test_idempotency_key_conflicting_payload_is_rejected(self, adapter):
+        key = "same-key-different-payload"
+        app = _create_runs_app(adapter)
+        release = threading.Event()
+        with patch.object(adapter, "_create_agent") as mock_create:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.side_effect = lambda **_kwargs: (
+                release.wait(timeout=5) or {"final_response": "done"}
+            )
+            mock_agent.session_prompt_tokens = 0
+            mock_agent.session_completion_tokens = 0
+            mock_agent.session_total_tokens = 0
+            mock_create.return_value = mock_agent
+            async with TestClient(TestServer(app)) as cli:
+                first = await cli.post(
+                    "/v1/runs", json={"input": "first"}, headers=_idempotency_headers(key)
+                )
+                conflict = await cli.post(
+                    "/v1/runs", json={"input": "second"}, headers=_idempotency_headers(key)
+                )
+                payload = await conflict.json()
+                release.set()
+
+        assert first.status == 202
+        assert conflict.status == 409
+        assert payload["error"]["code"] == "idempotency_key_conflict"
+        assert mock_create.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_idempotency_ownership_replays_across_adapter_restart(self, adapter):
+        key = "durable-owner-across-restart"
+        app = _create_runs_app(adapter)
+        release = threading.Event()
+        with patch.object(adapter, "_create_agent") as first_create:
+            first_agent = MagicMock()
+            first_agent.run_conversation.side_effect = lambda **_kwargs: (
+                release.wait(timeout=5) or {"final_response": "done"}
+            )
+            first_agent.session_prompt_tokens = 0
+            first_agent.session_completion_tokens = 0
+            first_agent.session_total_tokens = 0
+            first_create.return_value = first_agent
+            async with TestClient(TestServer(app)) as cli:
+                first = await cli.post(
+                    "/v1/runs", json={"input": "hello"}, headers=_idempotency_headers(key)
+                )
+                assert first.status == 202
+
+                restarted = _make_adapter()
+                restarted_app = _create_runs_app(restarted)
+                with patch.object(restarted, "_create_agent") as restarted_create:
+                    async with TestClient(TestServer(restarted_app)) as restarted_cli:
+                        replay = await restarted_cli.post(
+                            "/v1/runs",
+                            json={"input": "hello"},
+                            headers=_idempotency_headers(key),
+                        )
+                        replay_payload = await replay.json()
+                    restarted_create.assert_not_called()
+                release.set()
+
+        assert replay.status == 200
+        assert replay_payload["status"] in {"queued", "running"}
+
+    def test_expired_queued_claim_is_reclaimed_across_stores(self, tmp_path):
+        db_path = tmp_path / "response-store.db"
+        first = ResponseStore(db_path=str(db_path))
+        second = ResponseStore(db_path=str(db_path))
+        initial = {"run_id": "run_queued_reclaim", "status": "queued"}
+
+        assert first.claim_run(
+            "run_queued_reclaim",
+            "fingerprint",
+            initial,
+            owner_id="owner-a",
+            lease_seconds=30,
+            now=100,
+        )[0] is True
+        still_owned = second.claim_run(
+            "run_queued_reclaim",
+            "fingerprint",
+            initial,
+            owner_id="owner-b",
+            lease_seconds=30,
+            now=129,
+        )
+        reclaimed = second.claim_run(
+            "run_queued_reclaim",
+            "fingerprint",
+            initial,
+            owner_id="owner-b",
+            lease_seconds=30,
+            now=131,
+        )
+
+        assert still_owned[0] is False
+        assert still_owned[1] is False
+        assert reclaimed[0] is True
+        assert reclaimed[1] is False
+        first.close()
+        second.close()
+
+    @pytest.mark.parametrize(
+        "active_status", ["running", "waiting_for_approval", "stopping"]
+    )
+    def test_active_post_start_claim_is_replay_only_across_stores(
+        self, tmp_path, active_status
+    ):
+        db_path = tmp_path / "response-store.db"
+        first = ResponseStore(db_path=str(db_path))
+        second = ResponseStore(db_path=str(db_path))
+        active = {"run_id": "run_active", "status": active_status}
+
+        assert first.claim_run(
+            "run_active",
+            "fingerprint",
+            active,
+            owner_id="owner-a",
+            lease_seconds=30,
+            now=100,
+        )[0] is True
+
+        owned, conflict, replay = second.claim_run(
+            "run_active",
+            "fingerprint",
+            {**active, "status": "queued"},
+            owner_id="owner-b",
+            lease_seconds=30,
+            now=129,
+        )
+
+        assert owned is False
+        assert conflict is False
+        assert replay == active
+        first.close()
+        second.close()
+
+    @pytest.mark.parametrize(
+        "expired_status", ["running", "waiting_for_approval", "stopping"]
+    )
+    def test_expired_post_start_claim_fails_closed_fences_owner_and_is_gc_eligible(
+        self, tmp_path, expired_status
+    ):
+        db_path = tmp_path / "response-store.db"
+        first = ResponseStore(db_path=str(db_path))
+        second = ResponseStore(db_path=str(db_path))
+        active = {
+            "object": "hermes.run",
+            "run_id": "run_expired",
+            "status": expired_status,
+            "created_at": 90,
+            "updated_at": 100,
+        }
+        assert first.claim_run(
+            "run_expired",
+            "fingerprint",
+            active,
+            owner_id="owner-a",
+            lease_seconds=30,
+            now=100,
+        )[0] is True
+
+        owned, conflict, failed = second.claim_run(
+            "run_expired",
+            "fingerprint",
+            {**active, "status": "queued"},
+            owner_id="owner-b",
+            lease_seconds=30,
+            now=131,
+        )
+
+        assert owned is False
+        assert conflict is False
+        assert failed["status"] == "failed"
+        assert failed["updated_at"] == 131
+        assert "owner lease expired" in failed["error"].lower()
+        assert failed["last_event"] == "run.failed"
+        terminal_at = second._conn.execute(
+            "SELECT terminal_at FROM run_idempotency WHERE run_id = ?",
+            ("run_expired",),
+        ).fetchone()[0]
+        assert terminal_at == 131
+
+        assert first.put_run_status(
+            "run_expired",
+            {**active, "status": "completed", "output": "stale"},
+            owner_id="owner-a",
+            lease_seconds=30,
+            now=132,
+        ) is False
+        assert second.get_run_status("run_expired") == failed
+        assert second.delete_expired_terminal_runs(132) == 1
+        assert second.get_run_status("run_expired") is None
+        first.close()
+        second.close()
+
+    def test_terminal_failed_claim_replay_is_stable_across_stores(self, tmp_path):
+        db_path = tmp_path / "response-store.db"
+        first = ResponseStore(db_path=str(db_path))
+        second = ResponseStore(db_path=str(db_path))
+        running = {"run_id": "run_stable_failed", "status": "running"}
+        first.claim_run(
+            "run_stable_failed",
+            "fingerprint",
+            running,
+            owner_id="owner-a",
+            lease_seconds=30,
+            now=100,
+        )
+        failed = second.claim_run(
+            "run_stable_failed",
+            "fingerprint",
+            {**running, "status": "queued"},
+            owner_id="owner-b",
+            lease_seconds=30,
+            now=131,
+        )[2]
+
+        replay = first.claim_run(
+            "run_stable_failed",
+            "fingerprint",
+            {**running, "status": "queued"},
+            owner_id="owner-c",
+            lease_seconds=30,
+            now=500,
+        )
+
+        assert replay == (False, False, failed)
+        terminal_at = first._conn.execute(
+            "SELECT terminal_at FROM run_idempotency WHERE run_id = ?",
+            ("run_stable_failed",),
+        ).fetchone()[0]
+        assert terminal_at == 131
+        first.close()
+        second.close()
+
+    def test_reclaimed_claim_fences_stale_owner_status_writes(self, tmp_path):
+        store = ResponseStore(db_path=str(tmp_path / "response-store.db"))
+        initial = {"run_id": "run_fenced", "status": "queued"}
+        store.claim_run(
+            "run_fenced",
+            "fingerprint",
+            initial,
+            owner_id="owner-a",
+            lease_seconds=30,
+            now=100,
+        )
+        assert store.claim_run(
+            "run_fenced",
+            "fingerprint",
+            initial,
+            owner_id="owner-b",
+            lease_seconds=30,
+            now=131,
+        )[0] is True
+
+        assert store.put_run_status(
+            "run_fenced",
+            {**initial, "status": "completed", "output": "stale"},
+            owner_id="owner-a",
+            lease_seconds=30,
+            now=132,
+        ) is False
+        assert store.get_run_status("run_fenced")["status"] == "queued"
+        store.close()
+
+    def test_heartbeat_keeps_active_owner_from_being_reclaimed(self, tmp_path):
+        store = ResponseStore(db_path=str(tmp_path / "response-store.db"))
+        initial = {"run_id": "run_heartbeat", "status": "running"}
+        store.claim_run(
+            "run_heartbeat",
+            "fingerprint",
+            initial,
+            owner_id="owner-a",
+            lease_seconds=30,
+            now=100,
+        )
+        assert store.renew_run_lease(
+            "run_heartbeat", "owner-a", 30, now=125
+        ) is True
+
+        owned, conflict, existing = store.claim_run(
+            "run_heartbeat",
+            "fingerprint",
+            initial,
+            owner_id="owner-b",
+            lease_seconds=30,
+            now=131,
+        )
+
+        assert owned is False
+        assert conflict is False
+        assert existing["status"] == "running"
+        store.close()
+
+    @pytest.mark.asyncio
+    async def test_stale_queued_claim_is_restarted_and_executes(self, tmp_path):
+        key = "replay-after-owner-crash"
+        body = {"input": "hello"}
+        run_id = _derive_idempotent_run_id(key, None)
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                {
+                    "body": body,
+                    "gateway_session_key": None,
+                    "profile": "default",
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        store = ResponseStore(db_path=str(tmp_path / "response-store.db"))
+        store.claim_run(
+            run_id,
+            fingerprint,
+            {"run_id": run_id, "status": "queued"},
+            owner_id="crashed-owner",
+            lease_seconds=30,
+            now=time.time() - 31,
+        )
+        adapter = _make_adapter()
+        adapter._response_store.close()
+        adapter._response_store = store
+        app = _create_runs_app(adapter)
+
+        with patch.object(adapter, "_create_agent") as create_agent:
+            agent = MagicMock()
+            agent.run_conversation.return_value = {"final_response": "recovered"}
+            agent.session_prompt_tokens = 0
+            agent.session_completion_tokens = 0
+            agent.session_total_tokens = 0
+            create_agent.return_value = agent
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(
+                    "/v1/runs", json=body, headers=_idempotency_headers(key)
+                )
+                payload = await response.json()
+                for _ in range(20):
+                    if create_agent.called:
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert response.status == 202
+        assert payload["run_id"] == run_id
+        create_agent.assert_called_once()
+        store.close()
+
+    @pytest.mark.asyncio
+    async def test_stale_queued_recovery_reserves_capacity_before_body_parse(
+        self, tmp_path
+    ):
+        """A reclaimable queued row is execution work, not a replay-only drain."""
+        stale_key = "stale-queued-capacity"
+        new_key = "new-while-stale-parses"
+        stale_body = {"input": "recover me"}
+        stale_run_id = _derive_idempotent_run_id(stale_key, None)
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                {"body": stale_body, "gateway_session_key": None, "profile": "default"},
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        store = ResponseStore(db_path=str(tmp_path / "response-store.db"))
+        store.claim_run(
+            stale_run_id,
+            fingerprint,
+            {"run_id": stale_run_id, "status": "queued"},
+            owner_id="crashed-owner",
+            lease_seconds=30,
+            now=time.time() - 31,
+        )
+        metadata = store.get_run_claim_metadata(stale_run_id, profile="default")
+        assert metadata is not None
+        assert metadata["status"]["status"] == "queued"
+        assert metadata["lease_expires_at"] <= time.time()
+
+        adapter = _make_adapter()
+        adapter._response_store.close()
+        adapter._response_store = store
+        adapter._max_concurrent_runs = 1
+        app = _create_runs_app(adapter)
+        parse_started = asyncio.Event()
+        release_parse = asyncio.Event()
+        original_read = adapter._read_json_body
+
+        async def _blocked_stale_read(request):
+            if request.headers.get("Idempotency-Key") == stale_key:
+                parse_started.set()
+                await release_parse.wait()
+            return await original_read(request)
+
+        with patch.object(adapter, "_read_json_body", side_effect=_blocked_stale_read), \
+             patch.object(adapter, "_create_agent") as create_agent:
+            agent = MagicMock()
+            agent.run_conversation.return_value = {"final_response": "recovered"}
+            agent.session_prompt_tokens = 0
+            agent.session_completion_tokens = 0
+            agent.session_total_tokens = 0
+            create_agent.return_value = agent
+            async with TestClient(TestServer(app)) as cli:
+                stale_task = asyncio.create_task(cli.post(
+                    "/v1/runs", json=stale_body, headers=_idempotency_headers(stale_key)
+                ))
+                await asyncio.wait_for(parse_started.wait(), timeout=1)
+                new_response = await cli.post(
+                    "/v1/runs",
+                    json={"input": "new work"},
+                    headers=_idempotency_headers(new_key),
+                )
+                release_parse.set()
+                stale_response = await stale_task
+                for _ in range(20):
+                    if create_agent.called:
+                        break
+                    await asyncio.sleep(0.02)
+
+        assert new_response.status == 429
+        assert stale_response.status == 202
+        create_agent.assert_called_once()
+        durable = store.get_run_status(stale_run_id)
+        assert durable is not None
+        assert durable["status"] in {"queued", "running", "completed"}
+        store.close()
+
+    @pytest.mark.asyncio
+    async def test_live_queued_lease_expiring_during_parse_keeps_execution_slot(
+        self, tmp_path, monkeypatch
+    ):
+        """Queued rows stay execution-reserved until their parsed claim is known."""
+        stale_key = "lease-expires-during-parse"
+        new_key = "new-while-lease-expires"
+        stale_body = {"input": "recover after parse"}
+        stale_run_id = _derive_idempotent_run_id(stale_key, None)
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                {"body": stale_body, "gateway_session_key": None, "profile": "default"},
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        clock = [10_000.0]
+        monkeypatch.setattr("gateway.platforms.api_server.time.time", lambda: clock[0])
+        store = ResponseStore(db_path=str(tmp_path / "response-store.db"))
+        store.claim_run(
+            stale_run_id,
+            fingerprint,
+            {"run_id": stale_run_id, "status": "queued"},
+            owner_id="slow-owner",
+            lease_seconds=1,
+            now=clock[0],
+        )
+        metadata = store.get_run_claim_metadata(stale_run_id, profile="default")
+        assert metadata is not None
+        assert metadata["lease_expires_at"] > clock[0]
+
+        adapter = _make_adapter()
+        adapter._response_store.close()
+        adapter._response_store = store
+        adapter._max_concurrent_runs = 1
+        app = _create_runs_app(adapter)
+        parse_started = asyncio.Event()
+        release_parse = asyncio.Event()
+        original_read = adapter._read_json_body
+
+        async def _blocked_stale_read(request):
+            if request.headers.get("Idempotency-Key") == stale_key:
+                parse_started.set()
+                await release_parse.wait()
+            return await original_read(request)
+
+        with patch.object(adapter, "_read_json_body", side_effect=_blocked_stale_read), \
+             patch.object(adapter, "_create_agent") as create_agent:
+            agent = MagicMock()
+            agent.run_conversation.return_value = {"final_response": "recovered"}
+            agent.session_prompt_tokens = 0
+            agent.session_completion_tokens = 0
+            agent.session_total_tokens = 0
+            create_agent.return_value = agent
+            async with TestClient(TestServer(app)) as cli:
+                stale_task = asyncio.create_task(
+                    cli.post(
+                        "/v1/runs",
+                        json=stale_body,
+                        headers=_idempotency_headers(stale_key),
+                    )
+                )
+                await asyncio.wait_for(parse_started.wait(), timeout=1)
+                clock[0] += 2
+                new_response = await cli.post(
+                    "/v1/runs",
+                    json={"input": "new work"},
+                    headers=_idempotency_headers(new_key),
+                )
+                release_parse.set()
+                stale_response = await stale_task
+                for _ in range(20):
+                    if create_agent.called:
+                        break
+                    await asyncio.sleep(0.02)
+
+        assert new_response.status == 429
+        assert stale_response.status == 202
+        create_agent.assert_called_once()
+        durable = store.get_run_status(stale_run_id)
+        assert durable is not None
+        assert durable["status"] in {"queued", "running", "completed"}
+        assert durable.get("error") is None
+        store.close()
+
+    @pytest.mark.asyncio
+    async def test_expired_running_claim_resolves_failed_without_execution(
+        self, tmp_path
+    ):
+        key = "expired-running-fails-closed"
+        body = {"input": "hello"}
+        run_id = _derive_idempotent_run_id(key, None)
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                {
+                    "body": body,
+                    "gateway_session_key": None,
+                    "profile": "default",
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()
+        db_path = tmp_path / "response-store.db"
+        crashed_store = ResponseStore(db_path=str(db_path))
+        replay_store = ResponseStore(db_path=str(db_path))
+        crashed_store.claim_run(
+            run_id,
+            fingerprint,
+            {"object": "hermes.run", "run_id": run_id, "status": "running"},
+            owner_id="crashed-owner",
+            lease_seconds=30,
+            now=time.time() - 31,
+        )
+        adapter = _make_adapter()
+        adapter._response_store.close()
+        adapter._response_store = replay_store
+        app = _create_runs_app(adapter)
+
+        with patch.object(adapter, "_create_agent") as create_agent:
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(
+                    "/v1/runs", json=body, headers=_idempotency_headers(key)
+                )
+                payload = await response.json()
+
+        assert response.status == 200
+        assert payload["run_id"] == run_id
+        assert payload["status"] == "failed"
+        assert "owner lease expired" in payload["error"].lower()
+        create_agent.assert_not_called()
+        crashed_store.close()
+        replay_store.close()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_same_key_launches_exactly_one_run(self, adapter):
+        key = "same-key-after-client-response-loss"
+        app = _create_runs_app(adapter)
+        release = threading.Event()
+
+        with patch.object(adapter, "_create_agent") as mock_create:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.side_effect = lambda **_kwargs: (
+                release.wait(timeout=5) or {"final_response": "done"}
+            )
+            mock_agent.session_prompt_tokens = 0
+            mock_agent.session_completion_tokens = 0
+            mock_agent.session_total_tokens = 0
+            mock_create.return_value = mock_agent
+
+            async with TestClient(TestServer(app)) as cli:
+                responses = await asyncio.gather(*[
+                    cli.post(
+                        "/v1/runs",
+                        json={"input": "hello"},
+                        headers=_idempotency_headers(key),
+                    )
+                    for _ in range(8)
+                ])
+                bodies = [await response.json() for response in responses]
+                assert {body["run_id"] for body in bodies} == {
+                    _derive_idempotent_run_id(key, None)
+                }
+                assert sum(response.status == 202 for response in responses) == 1
+                assert sum(response.status == 200 for response in responses) == 7
+                assert len(adapter._active_run_tasks) == 1
+                release.set()
+
+    def test_ttl_sweep_retains_active_idempotent_run_status(self, adapter):
+        run_id = "run_active"
+        adapter._run_statuses[run_id] = {
+            "object": "hermes.run",
+            "run_id": run_id,
+            "status": "running",
+            "updated_at": 1.0,
+        }
+
+        adapter._sweep_orphaned_runs_once(now=1.0 + adapter._RUN_STATUS_TTL + 1)
+
+        assert adapter._run_statuses[run_id]["status"] == "running"
+
+    def test_ttl_sweep_deletes_expired_terminal_rows_after_restart(self, tmp_path):
+        db_path = tmp_path / "response-store.db"
+        before_restart = ResponseStore(db_path=str(db_path))
+        now = time.time()
+        initial = {
+            "object": "hermes.run",
+            "run_id": "run_expired_after_restart",
+            "status": "queued",
+            "created_at": now - 100_000,
+            "updated_at": now - 100_000,
+        }
+        before_restart.claim_run("run_expired_after_restart", "fingerprint", initial)
+        before_restart.put_run_status(
+            "run_expired_after_restart", {**initial, "status": "completed"}
+        )
+        before_restart._conn.execute(
+            "UPDATE run_idempotency SET terminal_at = ? WHERE run_id = ?",
+            (now - APIServerAdapter._RUN_STATUS_TTL - 1, "run_expired_after_restart"),
+        )
+        before_restart._conn.commit()
+        before_restart.close()
+
+        restarted = _make_adapter()
+        restarted._response_store.close()
+        restarted._response_store = ResponseStore(db_path=str(db_path))
+        assert restarted._run_statuses == {}
+
+        restarted._sweep_orphaned_runs_once(now=now)
+
+        assert restarted._response_store.get_run_status(
+            "run_expired_after_restart"
+        ) is None
+        restarted._response_store.close()
+
+    def test_expired_terminal_sql_gc_honors_batch_limit(self, tmp_path):
+        store = ResponseStore(db_path=str(tmp_path / "bounded-response-store.db"))
+        now = time.time()
+        for index in range(3):
+            run_id = f"run_expired_{index}"
+            status = {"run_id": run_id, "status": "queued"}
+            store.claim_run(run_id, f"fingerprint-{index}", status)
+            store.put_run_status(run_id, {**status, "status": "completed"})
+        store._conn.execute(
+            "UPDATE run_idempotency SET terminal_at = ?",
+            (now - 100,),
+        )
+        store._conn.commit()
+
+        assert store.delete_expired_terminal_runs(now, limit=2) == 2
+        remaining = store._conn.execute(
+            "SELECT COUNT(*) FROM run_idempotency"
+        ).fetchone()[0]
+
+        assert remaining == 1
+        store.close()
+
+    def test_each_sweep_deletes_one_expired_sql_batch_and_repeated_ticks_converge(
+        self, tmp_path
+    ):
+        store = ResponseStore(db_path=str(tmp_path / "catch-up-response-store.db"))
+        now = time.time()
+        expired_count = 2048
+        with store._lock:
+            store._conn.executemany(
+                """INSERT INTO run_idempotency
+                   (run_id, request_fingerprint, status_json, updated_at, terminal_at, profile)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        f"run_backlog_{index}",
+                        f"fingerprint-{index}",
+                        json.dumps({"run_id": f"run_backlog_{index}", "status": "completed"}),
+                        now - 100,
+                        now - 100,
+                        "default",
+                    )
+                    for index in range(expired_count)
+                ]
+            )
+            store._conn.executemany(
+                """INSERT INTO run_idempotency
+                   (run_id, request_fingerprint, status_json, updated_at, terminal_at, profile)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        "run_active",
+                        "active",
+                        json.dumps({"status": "running"}),
+                        now,
+                        None,
+                        "default",
+                    ),
+                    (
+                        "run_fresh",
+                        "fresh",
+                        json.dumps({"status": "completed"}),
+                        now,
+                        now + APIServerAdapter._RUN_STATUS_TTL,
+                        "default",
+                    ),
+                ],
+            )
+            store._conn.commit()
+
+        restarted = _make_adapter()
+        restarted._response_store.close()
+        restarted._response_store = store
+        sweep_now = now + restarted._RUN_STATUS_TTL
+        restarted._sweep_orphaned_runs_once(now=sweep_now)
+
+        with store._lock:
+            remaining = store._conn.execute(
+                "SELECT COUNT(*) FROM run_idempotency"
+            ).fetchone()[0]
+        assert remaining == expired_count + 2 - restarted._RUN_STATUS_GC_BATCH
+        assert store.get_run_status("run_active") is not None
+        assert store.get_run_status("run_fresh") is not None
+
+        ticks = 1
+        while remaining > 2:
+            restarted._sweep_orphaned_runs_once(now=sweep_now)
+            ticks += 1
+            with store._lock:
+                next_remaining = store._conn.execute(
+                    "SELECT COUNT(*) FROM run_idempotency"
+                ).fetchone()[0]
+            assert 0 < remaining - next_remaining <= restarted._RUN_STATUS_GC_BATCH
+            remaining = next_remaining
+
+        assert ticks > 1
+        assert remaining == 2
+        assert store.get_run_status("run_active") is not None
+        assert store.get_run_status("run_fresh") is not None
+        store.close()
+
+    @pytest.mark.asyncio
+    async def test_durable_status_sweeper_yields_between_batches(self, adapter):
+        real_sleep = asyncio.sleep
+        sleep_calls = 0
+
+        async def _yield_then_stop(_delay):
+            nonlocal sleep_calls
+            sleep_calls += 1
+            await real_sleep(0)
+            if sleep_calls == 2:
+                raise asyncio.CancelledError
+
+        with (
+            patch("gateway.platforms.api_server.asyncio.sleep", side_effect=_yield_then_stop),
+            patch.object(
+                adapter._response_store,
+                "delete_expired_terminal_runs",
+                return_value=adapter._RUN_STATUS_GC_BATCH,
+            ) as delete_batch,
+            pytest.raises(asyncio.CancelledError),
+        ):
+            await adapter._sweep_orphaned_runs()
+
+        assert sleep_calls == 2
+        delete_batch.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_terminal_status_write_retries_before_run_releases_ownership(
+        self, adapter
+    ):
+        app = _create_runs_app(adapter)
+        original_put = adapter._response_store.put_run_status
+        terminal_attempts = 0
+        durable = None
+
+        def _flaky_put(run_id, status, **kwargs):
+            nonlocal terminal_attempts
+            if status.get("status") == "completed":
+                terminal_attempts += 1
+                if terminal_attempts == 1:
+                    raise OSError("transient terminal write failure")
+            return original_put(run_id, status, **kwargs)
+
+        with (
+            patch.object(adapter._response_store, "put_run_status", side_effect=_flaky_put),
+            patch.object(adapter, "_create_agent") as create_agent,
+        ):
+            agent = MagicMock()
+            agent.run_conversation.return_value = {"final_response": "done"}
+            agent.session_prompt_tokens = 0
+            agent.session_completion_tokens = 0
+            agent.session_total_tokens = 0
+            create_agent.return_value = agent
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await response.json())["run_id"]
+                for _ in range(50):
+                    durable = adapter._response_store.get_run_status(run_id)
+                    if durable and durable.get("status") == "completed":
+                        break
+                    await asyncio.sleep(0.02)
+
+        assert terminal_attempts >= 2
+        assert durable is not None
+        assert durable["status"] == "completed"
+
+    @pytest.mark.asyncio
+    async def test_terminal_status_retry_stops_and_cleans_up_after_lease_loss(
+        self, adapter
+    ):
+        app = _create_runs_app(adapter)
+        original_put = adapter._response_store.put_run_status
+        terminal_attempts = 0
+        successor_error = "successor durably failed"
+
+        def _lose_terminal_write(run_id, status, **kwargs):
+            nonlocal terminal_attempts
+            if status.get("status") == "completed":
+                terminal_attempts += 1
+                return False
+            return original_put(run_id, status, **kwargs)
+
+        def _successor_terminalizes(run_id, *_args, **_kwargs):
+            store = adapter._response_store
+            successor_status = {
+                **store.get_run_status(run_id),
+                "status": "failed",
+                "error": successor_error,
+                "last_event": "run.failed",
+            }
+            now = time.time()
+            with store._lock:
+                store._conn.execute(
+                    """UPDATE run_idempotency
+                       SET status_json = ?, updated_at = ?, terminal_at = ?,
+                           owner_id = ?, lease_expires_at = NULL
+                       WHERE run_id = ?""",
+                    (
+                        json.dumps(successor_status, sort_keys=True),
+                        now,
+                        now,
+                        "successor-owner",
+                        run_id,
+                    ),
+                )
+                store._conn.commit()
+            return False
+
+        with (
+            patch.object(
+                adapter._response_store,
+                "put_run_status",
+                side_effect=_lose_terminal_write,
+            ),
+            patch.object(
+                adapter._response_store,
+                "renew_run_lease",
+                side_effect=_successor_terminalizes,
+            ) as renew_lease,
+            patch.object(adapter, "_create_agent") as create_agent,
+        ):
+            agent = MagicMock()
+            agent.run_conversation.return_value = {"final_response": "done"}
+            agent.session_prompt_tokens = 0
+            agent.session_completion_tokens = 0
+            agent.session_total_tokens = 0
+            create_agent.return_value = agent
+
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await response.json())["run_id"]
+                queue = adapter._run_streams[run_id]
+                task = adapter._active_run_tasks[run_id]
+                await asyncio.wait_for(task, timeout=1)
+
+                status_response = await cli.get(f"/v1/runs/{run_id}")
+                status_payload = await status_response.json()
+
+        assert terminal_attempts == 1
+        renew_lease.assert_called_once()
+        assert status_response.status == 200
+        assert status_payload["status"] == "failed"
+        assert status_payload["error"] == successor_error
+        queued = []
+        while not queue.empty():
+            queued.append(queue.get_nowait())
+        assert queued == [None]
+        assert run_id not in adapter._active_run_tasks
+        assert run_id not in adapter._active_run_agents
+        assert run_id not in adapter._run_approval_sessions
+
     @pytest.mark.asyncio
     async def test_start_returns_202(self, adapter):
         app = _create_runs_app(adapter)
@@ -323,12 +1396,847 @@ class TestStartRun:
         assert kwargs["model_options"] == model_options
 
 
+    @pytest.mark.asyncio
+    async def test_overlapping_capacity_admission_selects_one_before_body_await(
+        self, adapter
+    ):
+        adapter._max_concurrent_runs = 1
+        app = _create_runs_app(adapter)
+        first_parse_entered = asyncio.Event()
+        release_parse = asyncio.Event()
+        original_read = adapter._read_json_body
+        parse_calls = 0
+
+        async def _blocked_read(request):
+            nonlocal parse_calls
+            parse_calls += 1
+            first_parse_entered.set()
+            await release_parse.wait()
+            return await original_read(request)
+
+        first_key = "capacity-first"
+        second_key = "capacity-second"
+        with patch.object(adapter, "_read_json_body", side_effect=_blocked_read), \
+             patch.object(adapter, "_create_agent") as create_agent:
+            agent = MagicMock()
+            agent.run_conversation.return_value = {"final_response": "done"}
+            agent.session_prompt_tokens = 0
+            agent.session_completion_tokens = 0
+            agent.session_total_tokens = 0
+            create_agent.return_value = agent
+            async with TestClient(TestServer(app)) as cli:
+                first_task = asyncio.create_task(
+                    cli.post(
+                        "/v1/runs",
+                        json={"input": "first"},
+                        headers=_idempotency_headers(first_key),
+                    )
+                )
+                await asyncio.wait_for(first_parse_entered.wait(), timeout=1)
+                second_task = asyncio.create_task(
+                    cli.post(
+                        "/v1/runs",
+                        json={"input": "second"},
+                        headers=_idempotency_headers(second_key),
+                    )
+                )
+                await asyncio.sleep(0.05)
+                second_finished_before_release = second_task.done()
+                release_parse.set()
+                first, second = await asyncio.gather(first_task, second_task)
+
+        assert second_finished_before_release is True
+        assert parse_calls == 1
+        assert first.status == 202
+        assert second.status == 429
+        assert adapter._response_store.get_run_status(
+            _derive_idempotent_run_id(second_key, None)
+        ) is None
+
+    @pytest.mark.asyncio
+    async def test_idempotent_replay_bypasses_full_execution_capacity(self, adapter):
+        adapter._max_concurrent_runs = 1
+        app = _create_runs_app(adapter)
+        key = "capacity-replay"
+        release = threading.Event()
+        started = threading.Event()
+
+        with patch.object(adapter, "_create_agent") as create_agent:
+            agent = MagicMock()
+
+            def _run(**_kwargs):
+                started.set()
+                release.wait(timeout=5)
+                return {"final_response": "done"}
+
+            agent.run_conversation.side_effect = _run
+            agent.session_prompt_tokens = 0
+            agent.session_completion_tokens = 0
+            agent.session_total_tokens = 0
+            create_agent.return_value = agent
+            async with TestClient(TestServer(app)) as cli:
+                first = await cli.post(
+                    "/v1/runs", json={"input": "hello"}, headers=_idempotency_headers(key)
+                )
+                assert first.status == 202
+                assert await asyncio.to_thread(started.wait, 1)
+
+                replay = await cli.post(
+                    "/v1/runs", json={"input": "hello"}, headers=_idempotency_headers(key)
+                )
+                replay_body = await replay.json()
+                release.set()
+
+        assert replay.status == 200
+        assert replay_body["run_id"] == _derive_idempotent_run_id(key, None)
+        assert replay_body["status"] == "running"
+        assert create_agent.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_non_owner_poll_refreshes_nonterminal_replay_until_owner_completes(
+        self, tmp_path
+    ):
+        db_path = tmp_path / "cross-gateway-replay.db"
+        owner = _make_adapter()
+        observer = _make_adapter()
+        owner._response_store.close()
+        observer._response_store.close()
+        owner._response_store = ResponseStore(db_path=str(db_path))
+        observer._response_store = ResponseStore(db_path=str(db_path))
+        owner_app = _create_runs_app(owner)
+        observer_app = _create_runs_app(observer)
+        release = threading.Event()
+        started = threading.Event()
+        key = "cross-gateway-fresh-replay"
+        body = {"input": "hello"}
+
+        with (
+            patch.object(owner, "_create_agent") as owner_create,
+            patch.object(observer, "_create_agent") as observer_create,
+        ):
+            agent = MagicMock()
+
+            def _run(**_kwargs):
+                started.set()
+                release.wait(timeout=5)
+                return {"final_response": "owner completed"}
+
+            agent.run_conversation.side_effect = _run
+            agent.session_prompt_tokens = 0
+            agent.session_completion_tokens = 0
+            agent.session_total_tokens = 0
+            owner_create.return_value = agent
+
+            async with TestClient(TestServer(owner_app)) as owner_cli, TestClient(
+                TestServer(observer_app)
+            ) as observer_cli:
+                accepted = await owner_cli.post(
+                    "/v1/runs", json=body, headers=_idempotency_headers(key)
+                )
+                run_id = (await accepted.json())["run_id"]
+                assert await asyncio.to_thread(started.wait, 1)
+
+                replay = await observer_cli.post(
+                    "/v1/runs", json=body, headers=_idempotency_headers(key)
+                )
+                assert replay.status == 200
+                assert (await replay.json())["status"] == "running"
+                assert run_id not in observer._run_owner_generations
+
+                running_poll = await observer_cli.get(f"/v1/runs/{run_id}")
+                assert running_poll.status == 200
+                assert (await running_poll.json())["status"] == "running"
+                assert run_id not in observer._run_statuses
+
+                release.set()
+                for _ in range(100):
+                    durable = await asyncio.to_thread(
+                        owner._response_store.get_run_status, run_id
+                    )
+                    if durable and durable.get("status") == "completed":
+                        break
+                    await asyncio.sleep(0.01)
+
+                polled = await observer_cli.get(f"/v1/runs/{run_id}")
+                polled_body = await polled.json()
+
+        assert polled.status == 200
+        assert polled_body["status"] == "completed"
+        assert polled_body["output"] == "owner completed"
+        assert observer._run_statuses[run_id]["status"] == "completed"
+        observer_create.assert_not_called()
+        owner._response_store.close()
+        observer._response_store.close()
+
+    @pytest.mark.asyncio
+    async def test_live_queued_replay_bypasses_full_execution_capacity(
+        self, adapter
+    ):
+        adapter._max_concurrent_runs = 1
+        adapter._inflight_agent_runs = 1
+        app = _create_runs_app(adapter)
+        key = "capacity-live-queued-replay"
+        body = {"input": "hello"}
+        run_id = _derive_idempotent_run_id(key, None)
+        queued = {
+            "object": "hermes.run",
+            "run_id": run_id,
+            "status": "queued",
+            "created_at": time.time(),
+            "updated_at": time.time(),
+            "session_id": run_id,
+            "model": adapter._model_name,
+        }
+        owned, conflict, _status = adapter._response_store.claim_run(
+            run_id,
+            _run_fingerprint(body),
+            queued,
+            owner_id="other-gateway",
+            lease_seconds=60,
+        )
+        assert owned is True
+        assert conflict is False
+
+        with patch.object(adapter, "_create_agent") as create_agent:
+            async with TestClient(TestServer(app)) as cli:
+                replay = await cli.post(
+                    "/v1/runs", json=body, headers=_idempotency_headers(key)
+                )
+                replay_body = await replay.json()
+
+        assert replay.status == 200
+        assert replay_body["status"] == "queued"
+        assert run_id not in adapter._run_statuses
+        create_agent.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stale_queued_reclaim_is_rejected_when_capacity_is_full(
+        self, adapter
+    ):
+        adapter._max_concurrent_runs = 1
+        adapter._inflight_agent_runs = 1
+        app = _create_runs_app(adapter)
+        key = "capacity-stale-queued-reclaim"
+        body = {"input": "hello"}
+        run_id = _derive_idempotent_run_id(key, None)
+        queued = {
+            "object": "hermes.run",
+            "run_id": run_id,
+            "status": "queued",
+            "created_at": time.time(),
+            "updated_at": time.time(),
+            "session_id": run_id,
+            "model": adapter._model_name,
+        }
+        adapter._response_store.claim_run(
+            run_id,
+            _run_fingerprint(body),
+            queued,
+            owner_id="expired-gateway",
+            lease_seconds=0,
+            now=0,
+        )
+
+        with patch.object(adapter, "_create_agent") as create_agent:
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(
+                    "/v1/runs", json=body, headers=_idempotency_headers(key)
+                )
+
+        assert response.status == 429
+        assert adapter._response_store.get_run_status(run_id)["status"] == "failed"
+        create_agent.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_claim_run_does_not_block_the_aiohttp_event_loop(self, adapter):
+        adapter._max_concurrent_runs = 0
+        app = _create_runs_app(adapter)
+        release_claim = threading.Event()
+        release_time = []
+        heartbeat_time = []
+        original_claim = adapter._response_store.claim_run
+
+        def _slow_claim(*args, **kwargs):
+            assert release_claim.wait(timeout=2)
+            return original_claim(*args, **kwargs)
+
+        def _release_claim():
+            release_time.append(time.monotonic())
+            release_claim.set()
+
+        async def _heartbeat():
+            await asyncio.sleep(0.01)
+            heartbeat_time.append(time.monotonic())
+
+        timer = threading.Timer(0.2, _release_claim)
+        timer.start()
+        try:
+            with (
+                patch.object(
+                    adapter._response_store, "claim_run", side_effect=_slow_claim
+                ),
+                patch.object(adapter, "_create_agent") as create_agent,
+            ):
+                agent = MagicMock()
+                agent.run_conversation.return_value = {"final_response": "done"}
+                agent.session_prompt_tokens = 0
+                agent.session_completion_tokens = 0
+                agent.session_total_tokens = 0
+                create_agent.return_value = agent
+                async with TestClient(TestServer(app)) as cli:
+                    heartbeat = asyncio.create_task(_heartbeat())
+                    response = await cli.post(
+                        "/v1/runs",
+                        json={"input": "hello"},
+                        headers=_idempotency_headers("slow-durable-claim"),
+                    )
+                    await heartbeat
+        finally:
+            timer.cancel()
+
+        assert response.status == 202
+        assert heartbeat_time[0] < release_time[0]
+
+    @pytest.mark.asyncio
+    async def test_non_owner_status_lookup_does_not_block_the_aiohttp_event_loop(
+        self, adapter
+    ):
+        app = _create_runs_app(adapter)
+        run_id = "run_owned_by_another_gateway"
+        release_lookup = threading.Event()
+        release_time = []
+        heartbeat_time = []
+
+        def _slow_lookup(*args, **kwargs):
+            assert release_lookup.wait(timeout=2)
+            return {
+                "object": "hermes.run",
+                "run_id": run_id,
+                "status": "running",
+            }
+
+        def _release_lookup():
+            release_time.append(time.monotonic())
+            release_lookup.set()
+
+        async def _heartbeat():
+            await asyncio.sleep(0.01)
+            heartbeat_time.append(time.monotonic())
+
+        timer = threading.Timer(0.2, _release_lookup)
+        timer.start()
+        try:
+            with patch.object(
+                adapter._response_store,
+                "get_run_status",
+                side_effect=_slow_lookup,
+            ):
+                async with TestClient(TestServer(app)) as cli:
+                    heartbeat = asyncio.create_task(_heartbeat())
+                    response = await cli.get(f"/v1/runs/{run_id}")
+                    await heartbeat
+        finally:
+            timer.cancel()
+
+        assert response.status == 200
+        assert heartbeat_time[0] < release_time[0]
+        assert run_id not in adapter._run_statuses
+
+    @pytest.mark.asyncio
+    async def test_slow_replay_parse_is_drain_visible_but_does_not_consume_capacity(
+        self, adapter
+    ):
+        adapter._max_concurrent_runs = 1
+        app = _create_runs_app(adapter)
+        replay_key = "slow-replay-reservation"
+        replay_body = {"input": "replay"}
+
+        with patch.object(adapter, "_create_agent") as create_agent:
+            agent = MagicMock()
+            agent.run_conversation.return_value = {"final_response": "done"}
+            agent.session_prompt_tokens = 0
+            agent.session_completion_tokens = 0
+            agent.session_total_tokens = 0
+            create_agent.return_value = agent
+
+            async with TestClient(TestServer(app)) as cli:
+                original = await cli.post(
+                    "/v1/runs",
+                    json=replay_body,
+                    headers=_idempotency_headers(replay_key),
+                )
+                original_run_id = (await original.json())["run_id"]
+                status = None
+                for _ in range(50):
+                    status = adapter._response_store.get_run_status(original_run_id)
+                    if status and status.get("status") == "completed":
+                        break
+                    await asyncio.sleep(0.02)
+                assert status is not None
+                assert status["status"] == "completed"
+
+                replay_parse_started = asyncio.Event()
+                release_replay_parse = asyncio.Event()
+                original_read = adapter._read_json_body
+
+                async def _slow_replay_read(request):
+                    if request.headers.get("Idempotency-Key") == replay_key:
+                        replay_parse_started.set()
+                        await release_replay_parse.wait()
+                    return await original_read(request)
+
+                with patch.object(
+                    adapter, "_read_json_body", side_effect=_slow_replay_read
+                ):
+                    replay_task = asyncio.create_task(
+                        cli.post(
+                            "/v1/runs",
+                            json=replay_body,
+                            headers=_idempotency_headers(replay_key),
+                        )
+                    )
+                    await asyncio.wait_for(replay_parse_started.wait(), timeout=1)
+                    assert adapter.active_agent_work_count() == 1
+
+                    new_response = await cli.post(
+                        "/v1/runs",
+                        json={"input": "new execution"},
+                        headers=_idempotency_headers("new-execution-during-replay"),
+                    )
+                    release_replay_parse.set()
+                    replay_response = await replay_task
+
+        assert new_response.status == 202
+        assert replay_response.status == 200
+        assert create_agent.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_replay_preflight_store_failure_returns_controlled_503(self, adapter):
+        adapter._max_concurrent_runs = 1
+        app = _create_runs_app(adapter)
+
+        with patch.object(
+            adapter._response_store,
+            "get_run_claim_metadata",
+            side_effect=OSError("response store read failed"),
+        ), patch.object(adapter, "_read_json_body", new_callable=AsyncMock) as read_body:
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello"},
+                    headers=_idempotency_headers("lookup-io-failure"),
+                )
+                payload = await response.json()
+
+        assert response.status == 503
+        assert payload["error"]["code"] == "idempotency_store_unavailable"
+        assert "persist idempotent run ownership" in payload["error"]["message"].lower()
+        read_body.assert_not_awaited()
+        assert adapter.active_agent_work_count() == 0
+
+    @pytest.mark.asyncio
+    async def test_expired_running_owner_terminalizes_while_executor_stays_tracked(
+        self, tmp_path
+    ):
+        db_path = tmp_path / "response-store.db"
+        first_store = ResponseStore(db_path=str(db_path))
+        second_store = ResponseStore(db_path=str(db_path))
+        first = _make_adapter()
+        second = _make_adapter()
+        first._response_store.close()
+        second._response_store.close()
+        first._response_store = first_store
+        second._response_store = second_store
+        first._RUN_OWNER_LEASE_SECONDS = 0.05
+        first._RUN_OWNER_HEARTBEAT_SECONDS = 0.01
+        second._RUN_OWNER_LEASE_SECONDS = 0.05
+        release = threading.Event()
+        started = threading.Event()
+        force_first_owner_loss = threading.Event()
+        key = "running-owner-must-not-be-taken-over"
+        first_app = _create_runs_app(first)
+        second_app = _create_runs_app(second)
+
+        real_renew_run_lease = first_store.renew_run_lease
+
+        def _controlled_first_renewal(*args, **kwargs):
+            if force_first_owner_loss.is_set():
+                return False
+            return real_renew_run_lease(*args, **kwargs)
+
+        with (
+            patch.object(first, "_create_agent") as first_create,
+            patch.object(second, "_create_agent") as second_create,
+            patch.object(
+                first_store,
+                "renew_run_lease",
+                side_effect=_controlled_first_renewal,
+            ),
+        ):
+            first_agent = MagicMock()
+
+            def _noncooperative_run(**_kwargs):
+                started.set()
+                release.wait(timeout=5)
+                return {"final_response": "old-owner-finished"}
+
+            first_agent.run_conversation.side_effect = _noncooperative_run
+            first_agent.session_prompt_tokens = 0
+            first_agent.session_completion_tokens = 0
+            first_agent.session_total_tokens = 0
+            first_create.return_value = first_agent
+
+            async with TestClient(TestServer(first_app)) as first_cli, TestClient(
+                TestServer(second_app)
+            ) as second_cli:
+                accepted = await first_cli.post(
+                    "/v1/runs", json={"input": "hello"}, headers=_idempotency_headers(key)
+                )
+                run_id = (await accepted.json())["run_id"]
+                assert await asyncio.to_thread(started.wait, 1)
+                # Prevent gateway A's heartbeat from winning the race between
+                # forced expiry and gateway B's deterministic takeover.
+                force_first_owner_loss.set()
+                with second_store._lock:
+                    second_store._conn.execute(
+                        "UPDATE run_idempotency SET lease_expires_at = 0 WHERE run_id = ?",
+                        (run_id,),
+                    )
+                    second_store._conn.commit()
+
+                replay = await second_cli.post(
+                    "/v1/runs", json={"input": "hello"}, headers=_idempotency_headers(key)
+                )
+                replay_body = await replay.json()
+
+                assert replay.status == 200
+                assert replay_body["status"] == "failed"
+                assert "owner lease expired" in replay_body["error"].lower()
+                second_create.assert_not_called()
+                assert run_id in first._active_run_tasks
+                assert not first._active_run_tasks[run_id].done()
+
+                # Gateway A must evict only its stale owner generation when its
+                # heartbeat observes B's terminalization. Its next poll must
+                # reload authoritative durable failure, not stale local running.
+                for _ in range(100):
+                    if run_id not in first._run_statuses:
+                        break
+                    await asyncio.sleep(0.01)
+                polled = await first_cli.get(f"/v1/runs/{run_id}")
+                polled_body = await polled.json()
+                assert polled.status == 200
+                assert polled_body["status"] == "failed"
+                assert "owner lease expired" in polled_body["error"].lower()
+
+                release.set()
+                await asyncio.wait_for(first._active_run_tasks[run_id], timeout=1)
+
+        durable = first_store.get_run_status(run_id)
+        assert durable is not None
+        assert durable["status"] == "failed"
+        assert "output" not in durable
+        first_store.close()
+        second_store.close()
+
+    def test_lease_loss_does_not_evict_newer_local_owner_generation(self):
+        adapter = _make_adapter()
+        run_id = "run_generation_fence"
+        adapter._run_statuses[run_id] = {"run_id": run_id, "status": "queued"}
+        adapter._run_profiles[run_id] = "default"
+        adapter._run_owner_generations[run_id] = "new-generation"
+
+        assert adapter._evict_lost_run_owner_cache(run_id, "old-generation") is False
+        assert adapter._run_statuses[run_id]["status"] == "queued"
+        assert adapter._run_profiles[run_id] == "default"
+        assert adapter._run_owner_generations[run_id] == "new-generation"
+        adapter._response_store.close()
+
+    def test_lease_loss_keeps_profile_tombstone_while_control_state_is_live(self):
+        adapter = _make_adapter()
+        run_id = "run_profile_tombstone"
+        generation = "owner-generation"
+        adapter._run_statuses[run_id] = {"run_id": run_id, "status": "running"}
+        adapter._run_profiles[run_id] = "profile-b"
+        adapter._run_owner_generations[run_id] = generation
+        adapter._run_streams[run_id] = asyncio.Queue()
+
+        assert adapter._evict_lost_run_owner_cache(run_id, generation) is True
+        assert run_id not in adapter._run_statuses
+        assert adapter._run_profiles[run_id] == "profile-b"
+
+        adapter._run_streams.pop(run_id)
+        adapter._cleanup_run_profile_if_inactive(run_id, generation)
+        assert run_id not in adapter._run_profiles
+        adapter._response_store.close()
+
+    @pytest.mark.asyncio
+    async def test_late_callbacks_are_fenced_and_foreign_profile_stays_denied_after_lease_loss(
+        self, tmp_path
+    ):
+        db_path = tmp_path / "response-store.db"
+        owner_store = ResponseStore(db_path=str(db_path))
+        successor_store = ResponseStore(db_path=str(db_path))
+        adapter = _make_adapter()
+        adapter._response_store.close()
+        adapter._response_store = owner_store
+        adapter._RUN_OWNER_HEARTBEAT_SECONDS = 0.01
+        adapter._RUN_OWNER_LEASE_SECONDS = 1.0
+        app = _create_profiled_runs_app(adapter)
+        release = threading.Event()
+        started = threading.Event()
+        callbacks = {}
+
+        agent = MagicMock()
+
+        def _noncooperative_run(**_kwargs):
+            with approval_mod._lock:
+                callbacks["approval"] = approval_mod._gateway_notify_cbs[
+                    _kwargs["task_id"]
+                ]
+            started.set()
+            release.wait(timeout=5)
+            return {"final_response": "stale-owner-output"}
+
+        agent.run_conversation.side_effect = _noncooperative_run
+        agent.session_prompt_tokens = 0
+        agent.session_completion_tokens = 0
+        agent.session_total_tokens = 0
+
+        def _create_agent(**kwargs):
+            callbacks["progress"] = kwargs["tool_progress_callback"]
+            return agent
+
+        with patch.object(adapter, "_create_agent", side_effect=_create_agent):
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post(
+                    "/p/profile-b/v1/runs",
+                    json={"input": "hello"},
+                    headers=_idempotency_headers("lost-owner-callbacks"),
+                )
+                run_id = (await response.json())["run_id"]
+                assert await asyncio.to_thread(started.wait, 1)
+
+                with successor_store._lock:
+                    successor_store._conn.execute(
+                        "UPDATE run_idempotency SET owner_id = ? WHERE run_id = ?",
+                        ("successor-owner", run_id),
+                    )
+                    successor_store._conn.commit()
+                successor_status = {
+                    **successor_store.get_run_status(run_id),
+                    "status": "failed",
+                    "error": "successor failed",
+                    "last_event": "run.failed",
+                }
+                assert successor_store.put_run_status(
+                    run_id,
+                    successor_status,
+                    owner_id="successor-owner",
+                    lease_seconds=1,
+                ) is True
+
+                for _ in range(100):
+                    if run_id not in adapter._run_owner_generations:
+                        break
+                    await asyncio.sleep(0.01)
+                assert run_id not in adapter._run_statuses
+                assert adapter._run_profiles[run_id] == "profile-b"
+                queue = adapter._run_streams[run_id]
+                queued_before = queue.qsize()
+
+                callbacks["progress"]("tool.started", tool_name="terminal")
+                callbacks["approval"]({"command": "pwd"})
+                await asyncio.sleep(0.02)
+
+                assert run_id not in adapter._run_statuses
+                assert queue.qsize() == queued_before
+                foreign_events = await cli.get(
+                    f"/p/profile-a/v1/runs/{run_id}/events"
+                )
+                foreign_stop = await cli.post(
+                    f"/p/profile-a/v1/runs/{run_id}/stop", json={}
+                )
+                assert foreign_events.status == 404
+                assert foreign_stop.status == 404
+                agent.interrupt.assert_called_once_with(
+                    "Durable run lease ownership was lost"
+                )
+
+                polled = await cli.get(f"/p/profile-b/v1/runs/{run_id}")
+                assert polled.status == 200
+                assert (await polled.json())["status"] == "failed"
+                assert adapter._run_statuses[run_id]["status"] == "failed"
+
+                release.set()
+                await asyncio.wait_for(adapter._active_run_tasks[run_id], timeout=1)
+
+        owner_store.close()
+        successor_store.close()
+
+    @pytest.mark.asyncio
+    async def test_real_lease_loss_tracks_noncooperative_executor_and_fences_terminal(
+        self, tmp_path
+    ):
+        db_path = tmp_path / "response-store.db"
+        owner_store = ResponseStore(db_path=str(db_path))
+        successor_store = ResponseStore(db_path=str(db_path))
+        adapter = _make_adapter()
+        adapter._response_store.close()
+        adapter._response_store = owner_store
+        adapter._RUN_OWNER_HEARTBEAT_SECONDS = 0.01
+        adapter._RUN_OWNER_LEASE_SECONDS = 1.0
+        app = _create_runs_app(adapter)
+        release = threading.Event()
+        started = threading.Event()
+        interrupted = threading.Event()
+
+        agent = MagicMock()
+
+        def _interrupt(_message=None):
+            interrupted.set()
+
+        def _noncooperative_run(**_kwargs):
+            started.set()
+            release.wait(timeout=5)
+            return {"final_response": "stale-owner-output"}
+
+        agent.interrupt.side_effect = _interrupt
+        agent.run_conversation.side_effect = _noncooperative_run
+        agent.session_prompt_tokens = 0
+        agent.session_completion_tokens = 0
+        agent.session_total_tokens = 0
+
+        with patch.object(adapter, "_create_agent", return_value=agent):
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await response.json())["run_id"]
+                assert await asyncio.to_thread(started.wait, 1)
+
+                with successor_store._lock:
+                    successor_store._conn.execute(
+                        "UPDATE run_idempotency SET owner_id = ? WHERE run_id = ?",
+                        ("successor-owner", run_id),
+                    )
+                    successor_store._conn.commit()
+
+                assert await asyncio.to_thread(interrupted.wait, 1)
+                assert run_id in adapter._active_run_tasks
+                assert not adapter._active_run_tasks[run_id].done()
+                assert run_id in adapter._active_run_agents
+
+                current_status = successor_store.get_run_status(run_id)
+                assert current_status is not None
+                successor_status = {
+                    **current_status,
+                    "status": "completed",
+                    "output": "successor-output",
+                }
+                assert successor_store.put_run_status(
+                    run_id,
+                    successor_status,
+                    owner_id="successor-owner",
+                    lease_seconds=1,
+                ) is True
+
+                release.set()
+                await asyncio.wait_for(adapter._active_run_tasks[run_id], timeout=1)
+
+        durable = successor_store.get_run_status(run_id)
+        assert durable is not None
+        assert durable["status"] == "completed"
+        assert durable["output"] == "successor-output"
+        assert run_id not in adapter._active_run_tasks
+        assert run_id not in adapter._active_run_agents
+        owner_store.close()
+        successor_store.close()
+
+    @pytest.mark.asyncio
+    async def test_lease_heartbeat_loss_interrupts_agent_without_terminal_write(
+        self, adapter
+    ):
+        adapter._RUN_OWNER_HEARTBEAT_SECONDS = 0.01
+        app = _create_runs_app(adapter)
+        agent, ready, interrupted = _make_slow_agent()
+
+        with patch.object(adapter, "_create_agent", return_value=agent), \
+             patch.object(
+                 adapter._response_store, "renew_run_lease", return_value=False
+             ) as renew, \
+             patch.object(
+                 adapter, "_set_terminal_run_status", new_callable=AsyncMock
+             ) as terminal_write:
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await response.json())["run_id"]
+                assert await asyncio.to_thread(ready.wait, 1)
+                for _ in range(50):
+                    if interrupted.is_set() and run_id not in adapter._active_run_tasks:
+                        break
+                    await asyncio.sleep(0.01)
+
+        renew.assert_called()
+        agent.interrupt.assert_called_once_with(
+            "Durable run lease ownership was lost"
+        )
+        terminal_write.assert_not_awaited()
+        assert run_id not in adapter._active_run_tasks
+        assert run_id not in adapter._active_run_agents
+
+
 # ---------------------------------------------------------------------------
 # GET /v1/runs/{run_id} — poll run status
 # ---------------------------------------------------------------------------
 
 
 class TestRunStatus:
+    @pytest.mark.asyncio
+    async def test_durable_status_is_not_visible_across_profiles(self, adapter):
+        app = _create_profiled_runs_app(adapter)
+        owner_response = None
+        owner_payload = {}
+        with patch.object(adapter, "_create_agent") as create_agent:
+            agent = MagicMock()
+            agent.run_conversation.return_value = {"final_response": "private-b-output"}
+            agent.session_prompt_tokens = 0
+            agent.session_completion_tokens = 0
+            agent.session_total_tokens = 0
+            create_agent.return_value = agent
+            async with TestClient(TestServer(app)) as cli:
+                started = await cli.post(
+                    "/p/profile-b/v1/runs",
+                    json={"input": "hello"},
+                    headers=_idempotency_headers("profile-private-run"),
+                )
+                run_id = (await started.json())["run_id"]
+                for _ in range(50):
+                    owner_response = await cli.get(
+                        f"/p/profile-b/v1/runs/{run_id}"
+                    )
+                    owner_payload = await owner_response.json()
+                    if owner_payload.get("status") == "completed":
+                        break
+                    await asyncio.sleep(0.02)
+
+                # Simulate a gateway restart: force both requests through the
+                # adapter-wide durable fallback rather than the in-memory map.
+                adapter._run_statuses.clear()
+                adapter._run_profiles.clear()
+                foreign_response = await cli.get(
+                    f"/p/profile-a/v1/runs/{run_id}"
+                )
+                foreign_payload = await foreign_response.json()
+                owner_response = await cli.get(
+                    f"/p/profile-b/v1/runs/{run_id}"
+                )
+                owner_payload = await owner_response.json()
+
+        assert owner_response is not None
+        assert owner_response.status == 200
+        assert owner_payload["output"] == "private-b-output"
+        assert foreign_response.status == 404
+        assert "private-b-output" not in json.dumps(foreign_payload)
+
     @pytest.mark.asyncio
     async def test_status_completed_run_includes_output_and_usage(self, adapter):
         app = _create_runs_app(adapter)
@@ -716,6 +2624,67 @@ class TestRunLifecycleSweep:
 
 class TestStopRun:
     @pytest.mark.asyncio
+    async def test_stop_cannot_overwrite_terminal_status_during_cleanup(self, adapter):
+        app = _create_runs_app(adapter)
+        terminal_persisted = asyncio.Event()
+        allow_cleanup = asyncio.Event()
+        original_set_terminal = adapter._set_terminal_run_status
+
+        async def _pause_after_terminal_persistence(*args, **kwargs):
+            status = await original_set_terminal(*args, **kwargs)
+            terminal_persisted.set()
+            await allow_cleanup.wait()
+            return status
+
+        with (
+            patch.object(
+                adapter,
+                "_set_terminal_run_status",
+                side_effect=_pause_after_terminal_persistence,
+            ),
+            patch.object(adapter, "_create_agent") as create_agent,
+        ):
+            agent = MagicMock()
+            agent.run_conversation.return_value = {"final_response": "done"}
+            agent.session_prompt_tokens = 0
+            agent.session_completion_tokens = 0
+            agent.session_total_tokens = 0
+            create_agent.return_value = agent
+
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await response.json())["run_id"]
+                queue = adapter._run_streams[run_id]
+                await asyncio.wait_for(terminal_persisted.wait(), timeout=1)
+
+                assert run_id in adapter._active_run_tasks
+                assert queue.empty()
+                stop_response = await cli.post(f"/v1/runs/{run_id}/stop")
+                stop_payload = await stop_response.json()
+                status_response = await cli.get(f"/v1/runs/{run_id}")
+                status_payload = await status_response.json()
+
+                assert stop_response.status == 200
+                assert stop_payload["status"] == "completed"
+                assert status_payload["status"] == "completed"
+                agent.interrupt.assert_not_called()
+
+                allow_cleanup.set()
+                await asyncio.wait_for(adapter._active_run_tasks[run_id], timeout=1)
+
+        terminal_events = []
+        while not queue.empty():
+            event = queue.get_nowait()
+            if event is not None and event["event"] in {
+                "run.completed",
+                "run.failed",
+                "run.cancelled",
+            }:
+                terminal_events.append(event)
+        assert [event["event"] for event in terminal_events] == ["run.completed"]
+        assert adapter._response_store.get_run_status(run_id)["status"] == "completed"
+
+    @pytest.mark.asyncio
     async def test_stop_before_agent_creation_prevents_run_start(self, adapter):
         """A stop accepted while queued must prevent agent construction."""
         app = _create_runs_app(adapter)
@@ -854,8 +2823,8 @@ class TestStopRun:
         assert resp.status == 401
 
     @pytest.mark.asyncio
-    async def test_stop_already_completed_run_returns_404(self, adapter):
-        """Stopping a run that already finished should return 404 (refs cleaned up)."""
+    async def test_stop_already_completed_run_returns_terminal_status(self, adapter):
+        """Stopping a finished run idempotently returns its terminal status."""
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app)) as cli:
             with patch.object(adapter, "_create_agent") as mock_create:
@@ -877,9 +2846,14 @@ class TestStopRun:
                 # Run should be done, refs cleaned up
                 assert run_id not in adapter._active_run_agents
 
-                # Stop should return 404
+                # Force the endpoint to consult durable state after local cleanup.
+                adapter._run_statuses.pop(run_id, None)
+
+                # Stop must not replace the durable terminal status with stopping.
                 stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
-                assert stop_resp.status == 404
+                stop_payload = await stop_resp.json()
+                assert stop_resp.status == 200
+                assert stop_payload["status"] == "completed"
 
     @pytest.mark.asyncio
     async def test_stop_interrupt_exception_does_not_crash(self, adapter):

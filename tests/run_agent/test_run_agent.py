@@ -2996,10 +2996,9 @@ class TestConcurrentToolExecution:
         assert "fast-result" in flushed[0][-1]["content"]
         assert "timed out after" in flushed[1][-1]["content"]
 
-    def test_concurrent_timeout_prefers_late_real_result_over_timeout_message(self, agent, monkeypatch):
-        """A worker that finishes in the window between the deadline snapshot
-        and the result loop must keep its real result, not be overwritten with
-        a fabricated 'timed out' message (late-completion race)."""
+    def test_concurrent_timeout_fences_late_real_result_after_deadline(self, agent, monkeypatch):
+        """Once the deadline snapshot fences a call, a concurrent worker that
+        publishes afterward must not replace the truthful unknown result."""
         import concurrent.futures as _cf
 
         monkeypatch.setenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "0.1")
@@ -3008,12 +3007,8 @@ class TestConcurrentToolExecution:
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
         messages = []
 
-        # Both tools return instantly, so results[*] are populated almost
-        # immediately. We still force the deadline path by making the FIRST
-        # wait() report everything as not-done (after crossing the deadline),
-        # so the loop snapshots both as timed-out even though the workers have
-        # in fact already written their results. The fix must surface the real
-        # results, not the timeout message.
+        # Force the first deadline snapshot to classify both calls as still
+        # running even if the workers publish during the race window.
         real_wait = _cf.wait
         calls = {"n": 0}
 
@@ -3031,9 +3026,10 @@ class TestConcurrentToolExecution:
 
         assert len(messages) == 2
         joined = " ".join(m["content"] for m in messages)
-        assert "timed out after" not in joined, "late-completing real results must not be discarded"
-        assert "real-a" in messages[0]["content"]
-        assert "real-b" in messages[1]["content"]
+        assert joined.count("timed out after") == 2
+        assert all(message["effect_disposition"] == "unknown" for message in messages)
+        assert "real-a" not in joined
+        assert "real-b" not in joined
 
     def test_concurrent_interrupt_before_start(self, agent):
         """If interrupt is requested before concurrent execution, all tools are skipped."""
@@ -6936,6 +6932,18 @@ class TestCredentialPoolRecovery:
         assert context["reason"] == "usage_limit_reached"
         assert context["message"] == "The usage limit has been reached"
 
+    def test_extract_api_error_context_parses_http_date_retry_after(self, agent):
+        error = SimpleNamespace(
+            body={"error": {"type": "usage_limit_reached"}},
+            response=SimpleNamespace(
+                headers={"Retry-After": "Sun, 06 Nov 2094 08:49:37 GMT"}
+            ),
+        )
+
+        context = agent._extract_api_error_context(error)
+
+        assert context["reset_at"] == 3_939_871_777.0
+
     def test_extract_api_error_context_parses_resets_in_hours_and_minutes(self, agent, monkeypatch):
         from agent import agent_runtime_helpers
 
@@ -8672,7 +8680,7 @@ class TestDeadRetryCode:
 
     def test_no_unreachable_max_retries_after_backoff(self):
         import inspect
-        from agent.conversation_loop import run_conversation as _rc
+        from agent.conversation_loop import _run_conversation_inner as _rc
         source = inspect.getsource(_rc)
         occurrences = source.count("if retry_count >= max_retries:")
         assert occurrences == 2, (

@@ -1,10 +1,13 @@
 """Runtime tests for tool-call loop guardrails."""
 
 import json
+import threading
+import time
 import uuid
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+from agent.errors import TurnWallClockExceeded
 from run_agent import AIAgent
 
 
@@ -110,6 +113,560 @@ def test_default_sequential_path_warns_repeated_exact_failure_without_blocking_e
     assert "repeated_exact_failure_warning" in messages[0]["content"]
     assert "repeated_exact_failure_block" not in messages[0]["content"]
     assert agent._tool_guardrail_halt_decision is None
+
+
+def test_repeated_tool_error_limit_is_an_explicit_failed_turn():
+    agent = _make_agent(
+        "web_search",
+        config={"agent": {"repeated_tool_error_limit": 2}},
+    )
+    tool_call_1 = _mock_tool_call("web_search", '{"query":"same"}', "c-error-1")
+    tool_call_2 = _mock_tool_call("web_search", '{"query":"same"}', "c-error-2")
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(content="", finish_reason="tool_calls", tool_calls=[tool_call_1]),
+        _mock_response(content="", finish_reason="tool_calls", tool_calls=[tool_call_2]),
+    ]
+
+    with patch(
+        "run_agent.handle_function_call",
+        return_value=json.dumps({"success": False, "error": "same failure"}),
+    ):
+        result = agent.run_conversation("keep trying")
+
+    assert result["turn_exit_reason"] == "repeated_tool_error_limit_reached"
+    assert result["completed"] is False
+    assert result["failed"] is True
+    assert result["api_calls"] == 2
+
+
+def test_api_deadline_is_an_explicit_failed_turn():
+    agent = _make_agent(config={"agent": {"max_wall_clock_seconds": 30}})
+
+    with patch(
+        "hermes_cli.middleware.run_llm_execution_middleware",
+        side_effect=TurnWallClockExceeded("wall_clock_budget_reached"),
+    ):
+        result = agent.run_conversation("wait for the provider")
+
+    assert result["turn_exit_reason"] == "wall_clock_budget_reached"
+    assert result["completed"] is False
+    assert result["failed"] is True
+
+
+def test_preflight_deadline_closes_and_persists_the_assistant_turn(monkeypatch):
+    agent = _make_agent(config={"agent": {"max_wall_clock_seconds": 0.5}})
+    persisted = []
+    agent._persist_session = lambda messages, history: persisted.append(
+        [dict(message) for message in messages]
+    )
+    monotonic_values = iter([0.0])
+
+    def elapsed_after_turn_start():
+        return next(monotonic_values, 1.0)
+
+    monkeypatch.setattr("agent.conversation_loop.time.monotonic", elapsed_after_turn_start)
+
+    result = agent.run_conversation("do not replay me")
+
+    assert result["turn_exit_reason"] == "wall_clock_budget_reached"
+    assert result["completed"] is False
+    assert result["failed"] is True
+    assert result["messages"][-1] == {
+        "role": "assistant",
+        "content": result["final_response"],
+    }
+    assert persisted[-1][-1] == result["messages"][-1]
+    agent.client.chat.completions.create.assert_not_called()
+
+
+def test_sequential_blocking_tool_returns_at_whole_turn_deadline_without_late_output():
+    agent = _make_agent("web_search")
+    release = threading.Event()
+    completed = []
+    agent._turn_deadline_monotonic = time.monotonic() + 0.1
+    agent.tool_progress_callback = lambda event, *_a, **_k: completed.append(event)
+    tc = _mock_tool_call("web_search", '{"query":"slow"}', "c-deadline")
+    messages = []
+
+    def _blocking_call(*_args, **_kwargs):
+        release.wait(timeout=2)
+        return "late-result-must-not-land"
+
+    started = time.monotonic()
+    with patch("run_agent.handle_function_call", side_effect=_blocking_call):
+        agent._execute_tool_calls_sequential(
+            SimpleNamespace(content="", tool_calls=[tc]), messages, "task-1"
+        )
+        elapsed = time.monotonic() - started
+        snapshot = list(messages)
+        release.set()
+        time.sleep(0.1)
+
+    assert elapsed < 0.5
+    assert agent._wall_clock_expired is True
+    assert messages == snapshot
+    assert len(messages) == 1
+    assert "wall-clock budget" in messages[0]["content"]
+    assert "late-result-must-not-land" not in str(messages)
+    assert "tool.completed" not in completed
+
+
+def test_sequential_abandoned_worker_stays_fenced_until_exit_then_cleans_up():
+    from tools.interrupt import is_interrupted
+
+    agent = _make_agent("web_search")
+    started = threading.Event()
+    release = threading.Event()
+    exited = threading.Event()
+    observed = []
+    agent._turn_deadline_monotonic = time.monotonic() + 0.05
+    tc = _mock_tool_call("web_search", '{"query":"slow"}', "c-fenced-sequential")
+
+    def _blocking_call(*_args, **_kwargs):
+        started.set()
+        release.wait(timeout=2)
+        observed.append(is_interrupted())
+        exited.set()
+        return "late"
+
+    try:
+        with patch("run_agent.handle_function_call", side_effect=_blocking_call):
+            agent._execute_tool_calls_sequential(
+                SimpleNamespace(content="", tool_calls=[tc]), [], "task-1"
+            )
+            assert started.is_set()
+            assert agent._tool_worker_threads
+            agent.clear_interrupt()
+            assert agent._interrupt_requested is True
+            release.set()
+            assert exited.wait(timeout=1)
+    finally:
+        release.set()
+
+    deadline = time.monotonic() + 1
+    while agent._tool_worker_threads and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert observed == [True]
+    assert agent._tool_worker_threads == set()
+    assert agent._interrupt_requested is False
+
+
+def test_concurrent_abandoned_worker_cleanup_does_not_clear_newer_interrupt():
+    from tools.interrupt import is_interrupted
+
+    agent = _make_agent("web_search")
+    started = threading.Event()
+    release = threading.Event()
+    exited = threading.Event()
+    observed = []
+    agent._turn_deadline_monotonic = time.monotonic() + 0.05
+    tc = _mock_tool_call("web_search", '{"query":"slow"}', "c-fenced-concurrent")
+
+    def _blocking_call(*_args, **_kwargs):
+        started.set()
+        release.wait(timeout=2)
+        observed.append(is_interrupted())
+        exited.set()
+        return "late"
+
+    try:
+        with patch.object(agent, "_invoke_tool", side_effect=_blocking_call):
+            agent._execute_tool_calls_concurrent(
+                SimpleNamespace(content="", tool_calls=[tc]), [], "task-1"
+            )
+            assert started.is_set()
+            assert agent._tool_worker_threads
+            agent.clear_interrupt()
+            agent.interrupt("newer unrelated stop")
+            release.set()
+            assert exited.wait(timeout=1)
+
+        deadline = time.monotonic() + 1
+        while agent._tool_worker_threads and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert observed == [True]
+        assert agent._tool_worker_threads == set()
+        assert agent._interrupt_requested is True
+        assert agent._interrupt_message == "newer unrelated stop"
+    finally:
+        release.set()
+        agent.clear_interrupt()
+
+
+def test_sequential_worker_stops_all_projections_when_flush_crosses_deadline():
+    agent = _make_agent("web_search")
+    flush_entered = threading.Event()
+    release_flush = threading.Event()
+    progress = []
+    completed = []
+    steer = []
+    agent._turn_deadline_monotonic = time.monotonic() + 0.1
+    agent.tool_progress_callback = lambda event, *_a, **_k: progress.append(event)
+    agent.tool_complete_callback = lambda *args, **kwargs: completed.append((args, kwargs))
+    agent._apply_pending_steer_to_tool_results = lambda *args: steer.append(args)
+
+    def _blocking_flush(_messages):
+        flush_entered.set()
+        release_flush.wait(timeout=2)
+        return True
+
+    agent._flush_messages_to_session_db = _blocking_flush
+    tc = _mock_tool_call("web_search", '{"query":"fast"}', "c-flush-deadline")
+    messages = []
+
+    with patch("run_agent.handle_function_call", return_value="result"):
+        agent._execute_tool_calls_sequential(
+            SimpleNamespace(content="", tool_calls=[tc]), messages, "task-1"
+        )
+        assert flush_entered.is_set()
+        # A cached gateway agent can already own a fresh mutable deadline. The
+        # abandoned worker must still honor its private originating fence.
+        agent._turn_deadline_monotonic = time.monotonic() + 30
+        release_flush.set()
+        time.sleep(0.1)
+
+    assert "tool.completed" not in progress
+    assert "tool.output_risk" not in progress
+    assert completed == []
+    assert steer == []
+
+
+def test_sequential_deadline_worker_receives_interrupt_and_clears_targeted_bit():
+    from tools.interrupt import _interrupted_threads, _lock, is_interrupted
+
+    agent = _make_agent("web_search")
+    started = threading.Event()
+    agent._turn_deadline_monotonic = time.monotonic() + 2.0
+    tc = _mock_tool_call("web_search", '{"query":"interruptible"}', "c-interrupt")
+    messages = []
+
+    def _cooperative_call(*_args, **_kwargs):
+        started.set()
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline and not is_interrupted():
+            time.sleep(0.01)
+        return "interrupted" if is_interrupted() else "missed-interrupt"
+
+    def _interrupt():
+        assert started.wait(timeout=1)
+        agent.interrupt("hard stop")
+
+    interrupter = threading.Thread(target=_interrupt)
+    interrupter.start()
+    began = time.monotonic()
+    with patch("run_agent.handle_function_call", side_effect=_cooperative_call):
+        agent._execute_tool_calls_sequential(
+            SimpleNamespace(content="", tool_calls=[tc]), messages, "task-1"
+        )
+    elapsed = time.monotonic() - began
+    interrupter.join(timeout=1)
+
+    assert elapsed < 0.5
+    assert agent._tool_worker_threads == set()
+    with _lock:
+        assert _interrupted_threads == set()
+
+
+def test_sequential_deadline_hard_stop_does_not_wait_for_noncooperative_tool():
+    from tools.interrupt import _interrupted_threads, _lock
+
+    agent = _make_agent("web_search")
+    started = threading.Event()
+    release = threading.Event()
+    worker_exited = threading.Event()
+    agent._turn_deadline_monotonic = time.monotonic() + 2.0
+    tc = _mock_tool_call("web_search", '{"query":"noncooperative"}', "c-stop")
+    messages = []
+
+    def _blocking_call(*_args, **_kwargs):
+        started.set()
+        release.wait(timeout=3)
+        worker_exited.set()
+        return "late-result"
+
+    def _interrupt():
+        assert started.wait(timeout=1)
+        agent.interrupt("hard stop")
+
+    interrupter = threading.Thread(target=_interrupt)
+    interrupter.start()
+    began = time.monotonic()
+    try:
+        with patch("run_agent.handle_function_call", side_effect=_blocking_call):
+            agent._execute_tool_calls_sequential(
+                SimpleNamespace(content="", tool_calls=[tc]), messages, "task-1"
+            )
+        elapsed = time.monotonic() - began
+        assert elapsed < 0.5
+        assert messages[0]["effect_disposition"] == "unknown"
+        assert "interrupt" in messages[0]["content"].lower()
+    finally:
+        release.set()
+        interrupter.join(timeout=1)
+        assert worker_exited.wait(timeout=1)
+
+    deadline = time.monotonic() + 1
+    while agent._tool_worker_threads and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert agent._tool_worker_threads == set()
+    with _lock:
+        assert _interrupted_threads == set()
+
+
+def test_sequential_deadline_fence_does_not_wait_for_blocked_persistence():
+    agent = _make_agent("web_search")
+    persistence_started = threading.Event()
+    release_persistence = threading.Event()
+    agent._turn_deadline_monotonic = time.monotonic() + 0.05
+    tc = _mock_tool_call("web_search", '{"query":"fast"}', "c-persist")
+    messages = []
+
+    def _blocking_flush(_messages):
+        persistence_started.set()
+        release_persistence.wait(timeout=2)
+        return True
+
+    agent._flush_messages_to_session_db = _blocking_flush
+    timer = threading.Timer(0.6, release_persistence.set)
+    timer.start()
+    began = time.monotonic()
+    try:
+        with patch("run_agent.handle_function_call", return_value="fast-result"):
+            agent._execute_tool_calls_sequential(
+                SimpleNamespace(content="", tool_calls=[tc]), messages, "task-1"
+            )
+        elapsed = time.monotonic() - began
+    finally:
+        release_persistence.set()
+        timer.cancel()
+
+    assert persistence_started.is_set()
+    assert elapsed < 0.3
+    assert agent._wall_clock_expired is True
+
+
+def test_sequential_deadline_preserves_and_persists_completed_prefix_in_order():
+    agent = _make_agent("web_search")
+    release = threading.Event()
+    persisted = []
+    agent._turn_deadline_monotonic = time.monotonic() + 0.1
+    agent._flush_messages_to_session_db = lambda current: (
+        persisted.append([dict(item) for item in current]) or True
+    )
+    calls = [
+        _mock_tool_call("web_search", '{"query":"first"}', "c-first"),
+        _mock_tool_call("web_search", '{"query":"blocking"}', "c-blocking"),
+        _mock_tool_call("web_search", '{"query":"never"}', "c-never"),
+    ]
+    messages = []
+
+    def _invoke(_name, args, *_rest, **_kwargs):
+        if args["query"] == "first":
+            return "first-success"
+        release.wait(timeout=2)
+        return "late-result-must-not-land"
+
+    try:
+        with patch("run_agent.handle_function_call", side_effect=_invoke):
+            agent._execute_tool_calls_sequential(
+                SimpleNamespace(content="", tool_calls=calls), messages, "task-1"
+            )
+
+        assert [item["tool_call_id"] for item in messages] == [
+            "c-first", "c-blocking", "c-never"
+        ]
+        assert messages[0]["content"] == "first-success"
+        assert "effect_disposition" not in messages[0]
+        assert messages[1]["effect_disposition"] == "unknown"
+        assert messages[2]["effect_disposition"] == "none"
+        persist_deadline = time.monotonic() + 1
+        while (not persisted or persisted[-1] != messages) and time.monotonic() < persist_deadline:
+            time.sleep(0.01)
+        assert persisted[-1] == messages
+    finally:
+        release.set()
+
+
+def test_sequential_deadline_marks_calls_not_started_during_inter_tool_delay_none():
+    agent = _make_agent("web_search")
+    agent._turn_deadline_monotonic = time.monotonic() + 0.05
+    agent.tool_delay = 1
+    calls = [
+        _mock_tool_call("web_search", '{"query":"first"}', "c-delay-first"),
+        _mock_tool_call("web_search", '{"query":"second"}', "c-delay-second"),
+    ]
+    messages = []
+
+    with patch("run_agent.handle_function_call", return_value="completed-before-delay"):
+        agent._execute_tool_calls_sequential(
+            SimpleNamespace(content="", tool_calls=calls), messages, "task-1"
+        )
+
+    assert messages[0]["tool_call_id"] == "c-delay-first"
+    assert messages[1]["tool_call_id"] == "c-delay-second"
+    assert messages[1]["effect_disposition"] == "none"
+    assert "was not started" in messages[1]["content"]
+
+
+def test_sequential_tool_start_callback_cannot_dispatch_after_deadline():
+    agent = _make_agent("web_search")
+    callback_entered = threading.Event()
+    release_callback = threading.Event()
+    callback_finished = threading.Event()
+    agent._turn_deadline_monotonic = time.monotonic() + 0.05
+    call = _mock_tool_call("web_search", '{"query":"callback-race"}', "c-callback")
+    messages = []
+
+    def _blocking_start_callback(*_args, **_kwargs):
+        callback_entered.set()
+        release_callback.wait(timeout=2)
+        callback_finished.set()
+
+    agent.tool_start_callback = _blocking_start_callback
+    with patch("run_agent.handle_function_call", return_value="must-not-run") as invoke:
+        agent._execute_tool_calls_sequential(
+            SimpleNamespace(content="", tool_calls=[call]), messages, "task-1"
+        )
+        assert callback_entered.is_set()
+        assert messages[0]["effect_disposition"] == "none"
+        release_callback.set()
+        assert callback_finished.wait(timeout=1)
+        time.sleep(0.05)
+
+    invoke.assert_not_called()
+    assert "was not started" in messages[0]["content"]
+
+
+def test_concurrent_blocking_tools_do_not_publish_late_results_after_deadline():
+    agent = _make_agent("web_search")
+    release = threading.Event()
+    agent._turn_deadline_monotonic = time.monotonic() + 0.1
+    calls = [
+        _mock_tool_call("web_search", '{"query":"one"}', "c-one"),
+        _mock_tool_call("web_search", '{"query":"two"}', "c-two"),
+    ]
+    messages = []
+
+    def _blocking_invoke(*_args, **_kwargs):
+        release.wait(timeout=2)
+        return "late-concurrent-result"
+
+    started = time.monotonic()
+    with patch.object(agent, "_invoke_tool", side_effect=_blocking_invoke):
+        agent._execute_tool_calls_concurrent(
+            SimpleNamespace(content="", tool_calls=calls), messages, "task-1"
+        )
+        elapsed = time.monotonic() - started
+        snapshot = list(messages)
+        release.set()
+        time.sleep(0.1)
+
+    assert elapsed < 0.5
+    assert messages == snapshot
+    assert len(messages) == 2
+    assert all("timed out" in item["content"] for item in messages)
+    assert "late-concurrent-result" not in str(messages)
+
+
+def test_concurrent_tool_start_callback_cannot_submit_after_deadline():
+    agent = _make_agent("web_search")
+    agent._turn_deadline_monotonic = time.monotonic() + 0.03
+    call = _mock_tool_call("web_search", '{"query":"callback-race"}', "c-callback")
+    messages = []
+
+    def _blocking_start_callback(*_args, **_kwargs):
+        time.sleep(0.08)
+
+    agent.tool_start_callback = _blocking_start_callback
+    with patch.object(agent, "_invoke_tool", return_value="must-not-run") as invoke:
+        agent._execute_tool_calls_concurrent(
+            SimpleNamespace(content="", tool_calls=[call]), messages, "task-1"
+        )
+
+    invoke.assert_not_called()
+    assert len(messages) == 1
+    assert messages[0]["effect_disposition"] == "none"
+    assert "was not started" in messages[0]["content"]
+
+
+def test_concurrent_preflight_middleware_is_bounded_by_turn_deadline():
+    agent = _make_agent("web_search")
+    entered = threading.Event()
+    release = threading.Event()
+    agent._turn_deadline_monotonic = time.monotonic() + 0.05
+    calls = [
+        _mock_tool_call("web_search", '{"query":"one"}', "c-preflight-one"),
+        _mock_tool_call("web_search", '{"query":"two"}', "c-preflight-two"),
+    ]
+    messages = []
+
+    def _blocking_middleware(_agent, **kwargs):
+        entered.set()
+        release.wait(timeout=2)
+        return kwargs["function_args"], []
+
+    timer = threading.Timer(0.6, release.set)
+    timer.start()
+    began = time.monotonic()
+    try:
+        with (
+            patch(
+                "agent.tool_executor._apply_tool_request_middleware_for_agent",
+                side_effect=_blocking_middleware,
+            ),
+            patch.object(agent, "_invoke_tool", return_value="must-not-run") as invoke,
+        ):
+            agent._execute_tool_calls_concurrent(
+                SimpleNamespace(content="", tool_calls=calls), messages, "task-1"
+            )
+        elapsed = time.monotonic() - began
+    finally:
+        release.set()
+        timer.cancel()
+
+    assert entered.is_set()
+    assert elapsed < 0.3
+    invoke.assert_not_called()
+    assert [message["tool_call_id"] for message in messages] == [
+        "c-preflight-one",
+        "c-preflight-two",
+    ]
+    assert all(message["effect_disposition"] == "none" for message in messages)
+
+
+def test_concurrent_result_finishing_during_deadline_fence_stays_unknown():
+    agent = _make_agent("web_search")
+    release = threading.Event()
+    worker_finished = threading.Event()
+    completed = []
+    agent._turn_deadline_monotonic = time.monotonic() + 0.05
+    agent.tool_complete_callback = lambda *_a, **_k: completed.append("complete")
+    call = _mock_tool_call("web_search", '{"query":"race"}', "c-race")
+    messages = []
+
+    def _invoke(*_args, **_kwargs):
+        release.wait(timeout=2)
+        worker_finished.set()
+        return "late-race-result"
+
+    def _release_at_fence(*_args, **_kwargs):
+        release.set()
+        worker_finished.wait(timeout=1)
+
+    with (
+        patch.object(agent, "_invoke_tool", side_effect=_invoke),
+        patch("run_agent._set_interrupt", side_effect=_release_at_fence),
+    ):
+        agent._execute_tool_calls_concurrent(
+            SimpleNamespace(content="", tool_calls=[call]), messages, "task-1"
+        )
+
+    assert len(messages) == 1
+    assert messages[0]["tool_call_id"] == "c-race"
+    assert messages[0]["effect_disposition"] == "unknown"
+    assert "timed out" in messages[0]["content"]
+    assert "late-race-result" not in messages[0]["content"]
+    assert completed == []
 
 
 def test_config_enabled_hard_stop_blocks_repeated_exact_failure_before_execution():

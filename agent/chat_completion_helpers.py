@@ -38,12 +38,65 @@ from agent.message_sanitization import (
     _sanitize_surrogates,
     _repair_tool_call_arguments,
 )
-from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
+from agent.stream_single_writer import (
+    claim_stream_writer,
+    stream_writer_generation,
+    stream_writer_is_current,
+)
 from tools.terminal_tool import is_persistent_env
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 
 logger = logging.getLogger(__name__)
 _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
+
+
+def _turn_deadline_remaining(agent) -> Optional[float]:
+    deadline = getattr(agent, "_turn_deadline_monotonic", None)
+    if not isinstance(deadline, (int, float)) or not math.isfinite(deadline):
+        return None
+    return max(0.0, deadline - time.monotonic())
+
+
+def _turn_deadline_join_timeout(agent, maximum: float = 0.3) -> float:
+    remaining = _turn_deadline_remaining(agent)
+    if remaining is None:
+        return maximum
+    if remaining <= 0:
+        from agent.errors import TurnWallClockExceeded
+
+        raise TurnWallClockExceeded("wall_clock_budget_reached")
+    return min(maximum, remaining)
+
+
+def _cap_request_timeout_to_deadline(timeout: Any, remaining: float) -> Any:
+    """Return the stricter of a provider timeout and the turn deadline."""
+    if timeout is None:
+        return remaining
+    if isinstance(timeout, (int, float)):
+        return min(float(timeout), remaining)
+    # OpenAI/httpx callers may pass a structured Timeout. Preserve each stricter
+    # phase while replacing unbounded phases with the finite turn budget.
+    if all(hasattr(timeout, name) for name in ("connect", "read", "write", "pool")):
+        import httpx
+
+        def _phase(name: str) -> float:
+            value = getattr(timeout, name)
+            if value is None:
+                return remaining
+            try:
+                return min(float(value), remaining)
+            except (TypeError, ValueError):
+                return remaining
+
+        return httpx.Timeout(
+            connect=_phase("connect"),
+            read=_phase("read"),
+            write=_phase("write"),
+            pool=_phase("pool"),
+        )
+    # Unknown SDK-specific timeout objects cannot be ordered reliably. Fall back
+    # to the finite deadline rather than allowing transport work past the turn.
+    return remaining
 
 # When the fallback chain is fully exhausted on a non-rate-limit failure
 # (e.g. every provider returns a non-retryable client error like HTTP 400),
@@ -516,6 +569,8 @@ def direct_api_call(agent, api_kwargs: dict):
     agent._touch_activity("waiting for non-streaming API response")
     request_client_holder = {"client": None}
     request_client_lock = threading.Lock()
+    deadline_expired = threading.Event()
+    watchdog_cancel = threading.Event()
 
     def _abort_active_request(reason: str) -> None:
         """Abort the inline request from a watchdog/interrupt thread."""
@@ -533,29 +588,72 @@ def direct_api_call(agent, api_kwargs: dict):
         with request_client_lock:
             request_client_holder["client"] = client
         agent._active_request_abort = _abort_active_request
+        if deadline_expired.is_set():
+            _abort_active_request("turn_deadline")
         return client
+
+    deadline = getattr(agent, "_turn_deadline_monotonic", None)
+    watchdog = None
+    if isinstance(deadline, (int, float)) and math.isfinite(deadline):
+        def _deadline_watchdog() -> None:
+            remaining = max(0.0, deadline - time.monotonic())
+            if watchdog_cancel.wait(timeout=remaining):
+                return
+            deadline_expired.set()
+            _abort_active_request("turn_deadline")
+
+        watchdog = threading.Thread(
+            target=_deadline_watchdog,
+            name="hermes-direct-api-deadline",
+            daemon=True,
+        )
+        watchdog.start()
 
     try:
         response = _dispatch_nonstreaming_api_request(
             agent, api_kwargs, make_client=_make_client
         )
     except Exception:
+        if deadline_expired.is_set():
+            from agent.errors import TurnWallClockExceeded
+
+            raise TurnWallClockExceeded("wall_clock_budget_reached") from None
         if getattr(agent, "_interrupt_requested", False):
             raise InterruptedError("Agent interrupted during API call") from None
         raise
     else:
+        if deadline_expired.is_set():
+            from agent.errors import TurnWallClockExceeded
+
+            raise TurnWallClockExceeded("wall_clock_budget_reached")
         if getattr(agent, "_interrupt_requested", False):
             raise InterruptedError("Agent interrupted during API call")
         _reset_stale_streak(agent)
         return response
     finally:
+        watchdog_cancel.set()
+        join_error = None
+        try:
+            if watchdog is not None and watchdog is not threading.current_thread():
+                watchdog.join(timeout=_turn_deadline_join_timeout(agent))
+        except BaseException as exc:
+            # The absolute deadline can expire while computing the bounded join
+            # timeout. Do not let that skip request ownership cleanup below.
+            join_error = exc
+
         if getattr(agent, "_active_request_abort", None) is _abort_active_request:
             agent._active_request_abort = None
         with request_client_lock:
             request_client = request_client_holder["client"]
             request_client_holder["client"] = None
-        if request_client is not None:
-            agent._close_request_openai_client(request_client, reason="request_complete")
+        try:
+            if request_client is not None:
+                agent._close_request_openai_client(
+                    request_client, reason="request_complete"
+                )
+        finally:
+            if join_error is not None:
+                raise join_error
 
 
 def interruptible_api_call(agent, api_kwargs: dict):
@@ -572,6 +670,20 @@ def interruptible_api_call(agent, api_kwargs: dict):
     the main retry loop can try again with backoff / credential rotation /
     provider fallback.
     """
+    remaining = _turn_deadline_remaining(agent)
+    if remaining is not None:
+        if remaining <= 0:
+            from agent.errors import TurnWallClockExceeded
+
+            raise TurnWallClockExceeded("wall_clock_budget_reached")
+        # Direct cron/subagent paths cannot be externally cancelled safely;
+        # bound the transport itself rather than claiming thread cancellation.
+        if agent.api_mode != "bedrock_converse":
+            api_kwargs = dict(api_kwargs)
+            api_kwargs["timeout"] = _cap_request_timeout_to_deadline(
+                api_kwargs.get("timeout"), remaining
+            )
+
     # Cron and other non-interactive, nested-pool contexts must not spawn the
     # interrupt worker — it wedges before the socket opens on the 2nd+ call
     # (#62151). Run inline instead. See should_use_direct_api_call.
@@ -814,7 +926,12 @@ def interruptible_api_call(agent, api_kwargs: dict):
     t.start()
     _poll_count = 0
     while t.is_alive():
-        t.join(timeout=0.3)
+        try:
+            t.join(timeout=_turn_deadline_join_timeout(agent))
+        except TimeoutError:
+            _request_cancelled["value"] = True
+            _close_request_client_once("turn_deadline")
+            raise
         _poll_count += 1
 
         # Every ~30s: touch activity for the gateway inactivity monitor AND
@@ -2365,6 +2482,31 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         result = {"response": None, "error": None}
         first_delta_fired = {"done": False}
         deltas_were_sent = {"yes": False}
+        # Fence callbacks to this specific provider attempt. Cached gateway
+        # agents replace their mutable turn deadline on the next request, so a
+        # late worker must not consult agent state that now belongs to a newer
+        # turn.
+        _bedrock_origin_deadline = getattr(agent, "_turn_deadline_monotonic", None)
+        _bedrock_origin_turn_id = getattr(agent, "_current_turn_id", None)
+        # Immutable CAS generation captured before the provider worker opens its
+        # socket. A newer retry/turn claim changes this generation; the old
+        # worker must then fail its claim instead of superseding that writer.
+        _bedrock_origin_writer_generation = stream_writer_generation(agent)
+        _bedrock_callback_fence = threading.Event()
+
+        def _bedrock_callback_allowed() -> bool:
+            if _bedrock_callback_fence.is_set():
+                return False
+            if (
+                _bedrock_origin_turn_id is not None
+                and getattr(agent, "_current_turn_id", None)
+                != _bedrock_origin_turn_id
+            ):
+                return False
+            return not (
+                isinstance(_bedrock_origin_deadline, (int, float))
+                and time.monotonic() >= _bedrock_origin_deadline
+            )
         # Wire-level liveness for the boto3 converse_stream worker: the worker
         # thread blocks inside ``for event in event_stream`` with NO read
         # timeout, so a provider that opens the stream then stops yielding
@@ -2439,18 +2581,40 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
                 # Claim the delta sink for this bedrock stream (#65991) so a
                 # superseded attempt's callbacks are fenced by the sink guard.
-                claim_stream_writer(agent)
+                # The socket call above can unblock after this turn already
+                # expired. Never let that stale worker supersede a newer turn's
+                # writer token before its callback fence gets a chance to run.
+                _writer_token = claim_stream_writer(
+                    agent,
+                    expected_generation=_bedrock_origin_writer_generation,
+                    # AIAgent evaluates this under _stream_writer_lock, making
+                    # the immutable turn/deadline check and token bump one
+                    # atomic compare-and-swap against a newer writer claim.
+                    is_valid=_bedrock_callback_allowed,
+                )
+                # ``0`` is an atomic CAS rejection and proves this worker is
+                # stale. ``None`` means a version-skewed/duck-typed agent has no
+                # compatible fence; preserve documented unfenced degradation
+                # and rely on the immutable Bedrock callback turn fence.
+                if _writer_token == 0:
+                    return
 
                 def _on_text(text):
+                    if not _bedrock_callback_allowed():
+                        return
                     _fire_first()
                     agent._fire_stream_delta(text)
                     deltas_were_sent["yes"] = True
 
                 def _on_tool(name):
+                    if not _bedrock_callback_allowed():
+                        return
                     _fire_first()
                     agent._fire_tool_gen_started(name)
 
                 def _on_reasoning(text):
+                    if not _bedrock_callback_allowed():
+                        return
                     _fire_first()
                     agent._fire_reasoning_delta(text)
 
@@ -2468,8 +2632,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         t = threading.Thread(target=_bedrock_call, daemon=True)
         t.start()
         while t.is_alive():
-            t.join(timeout=0.3)
+            try:
+                t.join(timeout=_turn_deadline_join_timeout(agent))
+            except BaseException:
+                _bedrock_callback_fence.set()
+                raise
             if agent._interrupt_requested:
+                _bedrock_callback_fence.set()
                 raise InterruptedError("Agent interrupted during Bedrock API call")
             # Liveness watchdog: no Bedrock event for longer than the stale
             # timeout means the stream has wedged (open socket, keep-alives but
@@ -2521,6 +2690,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     f"stream so the retry/fallback path can recover."
                 )
                 break
+        _bedrock_callback_fence.set()
         # Worker exited before the poll loop observed the interrupt flag. The
         # Bedrock stream callback breaks out and returns a PARTIAL response
         # without raising on interrupt (see bedrock_adapter.py
@@ -3751,7 +3921,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
     _last_heartbeat = time.time()
     _HEARTBEAT_INTERVAL = 30.0  # seconds between gateway activity touches
     while t.is_alive():
-        t.join(timeout=0.3)
+        try:
+            t.join(timeout=_turn_deadline_join_timeout(agent))
+        except TimeoutError:
+            _request_cancelled["value"] = True
+            _close_request_client_once("turn_deadline")
+            raise
 
         # Periodic heartbeat: touch the agent's activity tracker so the
         # gateway's inactivity monitor knows we're alive while waiting

@@ -460,6 +460,8 @@ def make_tool_result_message(
     tool_call_id: str,
     *,
     effect_disposition: str | None = None,
+    execution_status: str | None = None,
+    execution_signature: str | None = None,
 ) -> dict:
     """Build a tool-result message dict with both the OpenAI-format ``name``
     field (required by the wire format and provider adapters) and the internal
@@ -497,6 +499,13 @@ def make_tool_result_message(
             message["_tool_output_risk"] = risk_metadata
     if effect_disposition is not None:
         message["effect_disposition"] = effect_disposition
+    if execution_status is not None:
+        # Internal-only structured outcome. Provider transports strip
+        # underscore-prefixed metadata, while persistence retains it for
+        # deterministic loop-guard classification.
+        message["_tool_execution_status"] = execution_status
+    if execution_signature is not None:
+        message["_tool_execution_signature"] = execution_signature
     return message
 
 

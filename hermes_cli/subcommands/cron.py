@@ -165,5 +165,10 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     # cron tick (mostly for debugging)
     cron_tick = cron_subparsers.add_parser("tick", help="Run due jobs once and exit")
     add_accept_hooks_flag(cron_tick)
+
+    cron_subparsers.add_parser(
+        "gc-bootstrap",
+        help="One-time portable output-GC index migration for an existing profile",
+    )
     add_accept_hooks_flag(cron_parser)
     cron_parser.set_defaults(func=cmd_cron)

@@ -88,6 +88,22 @@ class TestSingleWriterSink:
         assert "".join(delivered) == "hello world"
         assert agent._stream_writer_dropped == 0
 
+    def test_atomic_claim_rejects_stale_generation_without_replacing_writer(self):
+        agent = _make_agent()
+
+        token = agent._claim_stream_writer(
+            expected_generation=0,
+            is_valid=lambda: True,
+        )
+
+        assert token == 1
+        assert agent._stream_writer_is_current(token)
+        assert agent._claim_stream_writer(
+            expected_generation=0,
+            is_valid=lambda: True,
+        ) == 0
+        assert agent._stream_writer_token == token
+
     def test_non_claiming_thread_is_not_a_writer(self):
         """A thread that never claimed (a non-streaming delta caller) is never
         treated as a stale writer, even after other attempts have claimed."""

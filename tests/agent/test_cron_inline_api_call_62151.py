@@ -15,11 +15,15 @@ the shared dispatch closes the per-request client.
 """
 
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 from run_agent import AIAgent
 
+from agent import chat_completion_helpers as cch
 from agent.chat_completion_helpers import (
     direct_api_call,
     interruptible_api_call,
@@ -94,6 +98,95 @@ def test_interruptible_api_call_routes_cron_inline_no_worker_thread():
 
     assert resp.id == "first"
     assert ran_on["tid"] == caller_tid  # no daemon worker thread
+
+
+def test_turn_deadline_does_not_raise_stricter_existing_request_timeout():
+    agent = _make_agent()
+    agent._turn_deadline_monotonic = time.monotonic() + 30
+    fake_client = MagicMock()
+    fake_client.chat.completions.create.return_value = SimpleNamespace(id="bounded")
+    agent._create_request_openai_client.return_value = fake_client
+
+    resp = interruptible_api_call(
+        agent,
+        {"model": "m", "messages": [], "timeout": 3.0},
+    )
+
+    assert resp.id == "bounded"
+    request_kwargs = fake_client.chat.completions.create.call_args.kwargs
+    assert request_kwargs["timeout"] == 3.0
+
+
+def test_turn_deadline_caps_each_structured_request_timeout_phase():
+    import httpx
+
+    agent = _make_agent()
+    agent._turn_deadline_monotonic = time.monotonic() + 1.0
+    fake_client = MagicMock()
+    fake_client.chat.completions.create.return_value = SimpleNamespace(id="bounded")
+    agent._create_request_openai_client.return_value = fake_client
+    configured = httpx.Timeout(connect=0.1, read=20, write=None, pool=0.2)
+
+    interruptible_api_call(
+        agent,
+        {"model": "m", "messages": [], "timeout": configured},
+    )
+
+    effective = fake_client.chat.completions.create.call_args.kwargs["timeout"]
+    assert effective.connect == 0.1
+    assert 0 < effective.read <= 1.0
+    assert 0 < effective.write <= 1.0
+    assert effective.pool == 0.2
+
+
+def test_direct_api_call_absolute_deadline_aborts_stalled_transport():
+    from agent.errors import TurnWallClockExceeded
+
+    agent = _make_agent()
+    agent._turn_deadline_monotonic = time.monotonic() + 0.05
+    fake_client = MagicMock()
+    aborted = threading.Event()
+
+    def _request(**_kwargs):
+        assert aborted.wait(timeout=1)
+        raise RuntimeError("socket aborted by deadline watchdog")
+
+    fake_client.chat.completions.create.side_effect = _request
+    agent._create_request_openai_client.return_value = fake_client
+    agent._abort_request_openai_client.side_effect = lambda *_a, **_k: aborted.set()
+
+    started = time.monotonic()
+    with pytest.raises(TurnWallClockExceeded, match="wall_clock_budget_reached"):
+        direct_api_call(agent, {"model": "m", "messages": [], "timeout": 30.0})
+
+    assert time.monotonic() - started < 0.5
+    agent._abort_request_openai_client.assert_called_once_with(
+        fake_client, reason="turn_deadline"
+    )
+
+
+def test_direct_api_call_deadline_during_watchdog_join_cleans_request(monkeypatch):
+    """Deadline detection in finalization must not bypass request cleanup."""
+    from agent.errors import TurnWallClockExceeded
+
+    agent = _make_agent(platform="subagent")
+    agent._turn_deadline_monotonic = time.monotonic() + 1
+    fake_client = MagicMock()
+    fake_client.chat.completions.create.return_value = SimpleNamespace(id="done")
+    agent._create_request_openai_client.return_value = fake_client
+
+    def _deadline_before_join(_agent, maximum=0.3):
+        raise TurnWallClockExceeded("wall_clock_budget_reached")
+
+    monkeypatch.setattr(cch, "_turn_deadline_join_timeout", _deadline_before_join)
+
+    with pytest.raises(TurnWallClockExceeded, match="wall_clock_budget_reached"):
+        direct_api_call(agent, {"model": "m", "messages": []})
+
+    assert agent._active_request_abort is None
+    agent._close_request_openai_client.assert_called_once_with(
+        fake_client, reason="request_complete"
+    )
 
 
 def test_direct_api_call_interrupt_aborts_active_client_and_raises():

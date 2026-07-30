@@ -1,0 +1,128 @@
+from types import SimpleNamespace
+
+from agent.conversation_loop import _loop_guard_reason
+
+
+def test_loop_guard_stops_after_wall_clock_budget(monkeypatch):
+    agent = SimpleNamespace(
+        max_wall_clock_seconds=30,
+        repeated_tool_error_limit=0,
+        no_progress_tool_limit=0,
+    )
+    monkeypatch.setattr("agent.conversation_loop.time.monotonic", lambda: 31)
+
+    assert _loop_guard_reason(agent, [], 0) == "wall_clock_budget_reached"
+
+
+def test_loop_guard_stops_repeated_identical_tool_errors():
+    agent = SimpleNamespace(
+        max_wall_clock_seconds=0,
+        repeated_tool_error_limit=3,
+        no_progress_tool_limit=0,
+    )
+    messages = []
+    for index in range(3):
+        messages.extend([
+            {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": f"call-{index}",
+                    "function": {"name": "terminal", "arguments": "{}"},
+                }],
+            },
+            {
+                "role": "tool",
+                "content": "same deterministic failure",
+                "_tool_execution_status": "error",
+            },
+        ])
+
+    assert (
+        _loop_guard_reason(agent, messages, 0)
+        == "repeated_tool_error_limit_reached"
+    )
+
+
+def test_loop_guard_does_not_treat_successful_error_text_as_failure():
+    agent = SimpleNamespace(
+        max_wall_clock_seconds=0,
+        repeated_tool_error_limit=2,
+        no_progress_tool_limit=0,
+    )
+    messages = []
+    for index in range(2):
+        messages.extend([
+            {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": f"call-{index}",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }],
+            },
+            {
+                "role": "tool",
+                "content": "ERROR: this is log-file content, not tool failure",
+                "_tool_execution_status": "success",
+            },
+        ])
+
+    assert _loop_guard_reason(agent, messages, 0) is None
+
+
+def test_loop_guard_allows_repeated_poll_calls_when_results_change():
+    agent = SimpleNamespace(
+        max_wall_clock_seconds=0,
+        repeated_tool_error_limit=0,
+        no_progress_tool_limit=3,
+    )
+    messages = []
+    for index in range(3):
+        messages.extend([
+            {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": f"call-{index}",
+                    "function": {
+                        "name": "terminal",
+                        "arguments": '{"command":"retry unchanged"}',
+                    },
+                }],
+            },
+            {"role": "tool", "content": f"attempt {index}"},
+        ])
+
+    assert _loop_guard_reason(agent, messages, 0) is None
+
+
+def test_loop_guard_stops_repeated_tool_calls_when_results_do_not_change():
+    agent = SimpleNamespace(
+        max_wall_clock_seconds=0,
+        repeated_tool_error_limit=0,
+        no_progress_tool_limit=3,
+    )
+    messages = []
+    for index in range(3):
+        messages.extend([
+            {
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": f"call-{index}",
+                    "function": {
+                        "name": "process",
+                        "arguments": '{"action":"poll","session_id":"build"}',
+                    },
+                }],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": f"call-{index}",
+                "content": "still running; no new output",
+                "_tool_execution_status": "success",
+            },
+        ])
+
+    assert _loop_guard_reason(agent, messages, 0) == "no_progress_tool_limit_reached"
+
+
+def test_loop_guard_defaults_to_disabled():
+    assert _loop_guard_reason(SimpleNamespace(), [], 0) is None

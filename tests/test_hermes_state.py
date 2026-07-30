@@ -5618,6 +5618,50 @@ class TestAutoMaintenance:
         # File stays — caller didn't opt in
         assert (sessions_dir / "old.jsonl").exists()
 
+    def test_auto_prune_applies_source_specific_retention(self, db):
+        """High-volume cron history can expire sooner than interactive sessions."""
+        self._make_old_ended(db, "cron-old", days_old=10)
+        self._make_old_ended(db, "cli-old", days_old=10)
+        db._conn.execute("UPDATE sessions SET source = 'cron' WHERE id = 'cron-old'")
+        db._conn.commit()
+
+        result = db.maybe_auto_prune_and_vacuum(
+            retention_days=90,
+            retention_by_source={"cron": 7},
+            vacuum=False,
+        )
+
+        assert result["pruned"] == 1
+        assert db.get_session("cron-old") is None
+        assert db.get_session("cli-old") is not None
+
+    @pytest.mark.parametrize("retention", [-1, float("nan"), float("inf"), 4000])
+    def test_auto_prune_rejects_unsafe_default_retention(self, db, retention):
+        self._make_old_ended(db, "must-survive", days_old=100)
+
+        result = db.maybe_auto_prune_and_vacuum(
+            retention_days=retention,
+            vacuum=False,
+        )
+
+        assert result["pruned"] == 0
+        assert "error" in result
+        assert db.get_session("must-survive") is not None
+
+    def test_auto_prune_ignores_nonfinite_source_retention(self, db):
+        self._make_old_ended(db, "cron-old", days_old=10)
+        db._conn.execute("UPDATE sessions SET source = 'cron' WHERE id = 'cron-old'")
+        db._conn.commit()
+
+        result = db.maybe_auto_prune_and_vacuum(
+            retention_days=90,
+            retention_by_source={"cron": float("inf")},
+            vacuum=False,
+        )
+
+        assert result["pruned"] == 0
+        assert db.get_session("cron-old") is not None
+
     def test_prune_sessions_deletes_files_for_pruned_only(self, db, tmp_path):
         """Active-session transcripts must never be deleted by prune."""
         sessions_dir = tmp_path / "sessions"
