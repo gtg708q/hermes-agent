@@ -1291,36 +1291,57 @@ def _admit_api_agent_request(handler):
         draining = self._draining_response()
         if draining is not None:
             return draining
-        # A keyed /v1/runs replay consumes no execution slot. Consult the
-        # header-derived durable identity before rejecting on capacity; the
-        # handler still parses and fingerprints the bounded body, so key reuse
-        # with a different payload remains a 409.
+        # A keyed /v1/runs replay consumes no execution slot. Reserve the
+        # request before the durable lookup is offloaded so shutdown drain can
+        # see it while SQLite is busy. The reservation remains an execution
+        # reservation for queued claims because their lease can expire while
+        # the body is parsed; only claim_run can atomically decide whether this
+        # request must execute/reclaim.
         durable_replay = False
+        defer_capacity_until_claim = False
+        valid_keyed_run = False
+        idempotency_key = None
         if handler.__name__ == "_handle_runs":
             idempotency_key = request.headers.get("Idempotency-Key")
-            if (
+            valid_keyed_run = bool(
                 idempotency_key
                 and len(idempotency_key) <= 255
                 and all(0x21 <= ord(char) <= 0x7E for char in idempotency_key)
-            ):
+            )
+
+        # Headerless and malformed-key requests cannot be durable replays, so
+        # reject them before body parsing exactly as before.
+        if not valid_keyed_run:
+            limited = self._concurrency_limited_response()
+            if limited is not None:
+                return limited
+
+        reservation = {"active": True, "replay": False}
+        token = _api_agent_request_reservation.set(reservation)
+        self._pending_agent_requests += 1
+        try:
+            if valid_keyed_run:
+                assert idempotency_key is not None
                 request_profile = _api_request_profile.get()
                 run_id = _derive_idempotent_run_id(idempotency_key, request_profile)
                 try:
-                    claim_metadata = self._response_store.get_run_claim_metadata(
+                    claim_metadata = await asyncio.to_thread(
+                        self._response_store.get_run_claim_metadata,
                         run_id,
                         profile=_canonical_run_profile(request_profile),
                     )
                     if claim_metadata is not None:
                         durable_status = claim_metadata["status"]
-                        # Any non-terminal queued row may become reclaimable
-                        # before the awaited body parse completes. Reserve
-                        # execution capacity for the whole parse window rather
-                        # than sampling lease expiry only once here. Running,
-                        # waiting, stopping, and terminal rows are replay-only.
-                        durable_replay = not (
+                        queued_claim = (
                             claim_metadata["terminal_at"] is None
                             and durable_status.get("status") == "queued"
                         )
+                        if queued_claim:
+                            defer_capacity_until_claim = True
+                        else:
+                            durable_replay = True
+                            reservation["replay"] = True
+                            self._pending_replay_requests += 1
                 except Exception as exc:
                     logger.exception(
                         "Failed to inspect durable run ownership for %s", run_id
@@ -1333,19 +1354,14 @@ def _admit_api_agent_request(handler):
                         status=503,
                     )
 
-        # Admission and reservation are deliberately adjacent with no await:
-        # overlapping requests on this event loop therefore have exactly one
-        # winner for the last slot, before either starts reading its body.
-        if not durable_replay:
-            limited = self._concurrency_limited_response()
-            if limited is not None:
-                return limited
-        reservation = {"active": True, "replay": durable_replay}
-        token = _api_agent_request_reservation.set(reservation)
-        self._pending_agent_requests += 1
-        if durable_replay:
-            self._pending_replay_requests += 1
-        try:
+            # Admission and reservation have no intervening await after the
+            # durable classification. New claims still have exactly one winner
+            # for the last slot. A queued claim proceeds to claim_run even when
+            # full so a live lease can return its durable queued replay.
+            if not durable_replay and not defer_capacity_until_claim:
+                limited = self._concurrency_limited_response()
+                if limited is not None:
+                    return limited
             return await handler(self, request, *args, **kwargs)
         finally:
             if reservation["active"]:
@@ -6685,7 +6701,9 @@ class APIServerAdapter(BasePlatformAdapter):
 
         stored_session_id = None
         if not conversation_history and previous_response_id:
-            stored = self._response_store.get(previous_response_id)
+            stored = await asyncio.to_thread(
+                self._response_store.get, previous_response_id
+            )
             if stored:
                 conversation_history = list(stored.get("conversation_history", []))
                 stored_session_id = stored.get("session_id")
@@ -6745,7 +6763,8 @@ class APIServerAdapter(BasePlatformAdapter):
             ).encode("utf-8")
         ).hexdigest()
         try:
-            owned, conflict, durable_status = self._response_store.claim_run(
+            owned, conflict, durable_status = await asyncio.to_thread(
+                self._response_store.claim_run,
                 run_id,
                 request_fingerprint,
                 initial_status,
@@ -6777,8 +6796,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 headers=response_headers,
             )
         if not owned:
-            self._run_statuses[run_id] = durable_status
             self._run_profiles[run_id] = canonical_profile
+            # A sibling gateway owns nonterminal state and can advance it at
+            # any time. Caching that snapshot would make subsequent polls stale.
+            # Terminal rows are immutable and safe to retain locally.
+            if durable_status.get("status") in self._RUN_TERMINAL_STATUSES:
+                self._run_statuses[run_id] = durable_status
+            else:
+                self._run_statuses.pop(run_id, None)
             return web.json_response(durable_status, headers=response_headers)
 
         # Only the durable CAS winner consumes an execution slot.
@@ -7240,12 +7265,17 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         status = self._run_statuses.get(run_id)
         if status is None:
-            status = self._response_store.get_run_status(
-                run_id, profile=request_profile
+            status = await asyncio.to_thread(
+                self._response_store.get_run_status,
+                run_id,
+                profile=request_profile,
             )
             if status is not None:
-                self._run_statuses[run_id] = status
                 self._run_profiles[run_id] = request_profile
+                # A non-owner must re-read mutable durable state on every poll.
+                # Terminal rows are immutable and safe to cache locally.
+                if status.get("status") in self._RUN_TERMINAL_STATUSES:
+                    self._run_statuses[run_id] = status
         if status is None:
             return web.json_response(
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),
