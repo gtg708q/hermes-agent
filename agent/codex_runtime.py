@@ -789,6 +789,14 @@ def run_codex_app_server_turn(
                 else {}
             ),
             "error": "wall_clock_budget_reached" if _wall_clock_stopped else str(exc),
+            **(
+                {
+                    "failed": True,
+                    "turn_exit_reason": "wall_clock_budget_reached",
+                }
+                if _wall_clock_stopped
+                else {}
+            ),
             **({"agent_persisted": True} if _deadline_persisted else {}),
         }
 

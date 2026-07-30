@@ -105,6 +105,48 @@ def test_codex_deadline_appends_and_persists_assistant_closure():
     assert result["agent_persisted"] is True
 
 
+def test_codex_persisted_deadline_closure_survives_post_deadline_handoff(monkeypatch):
+    """The outer fence must accept a durable Codex closure completed in handoff."""
+    flush_entered = threading.Event()
+    release_flush = threading.Event()
+    agent = _make_agent(session_db=object())
+    agent.max_wall_clock_seconds = 0.01
+    agent._interrupt_requested = False
+    agent._codex_session.run_turn.side_effect = TurnWallClockExceeded(
+        "wall_clock_budget_reached"
+    )
+
+    def _blocked_flush(_messages):
+        flush_entered.set()
+        assert release_flush.wait(timeout=1)
+        return True
+
+    agent._flush_messages_to_session_db.side_effect = _blocked_flush
+    agent.interrupt.side_effect = lambda _reason: release_flush.set()
+
+    def _codex_inner(current_agent, *_args, **_kwargs):
+        return run_codex_app_server_turn(
+            current_agent,
+            user_message="deadline",
+            original_user_message="deadline",
+            messages=[{"role": "user", "content": "deadline"}],
+            effective_task_id="task-deadline-handoff",
+        )
+
+    monkeypatch.setattr(conversation_loop, "_run_conversation_inner", _codex_inner)
+
+    result = conversation_loop.run_conversation(agent, "deadline")
+
+    assert flush_entered.is_set()
+    assert result["failed"] is True
+    assert result["turn_exit_reason"] == "wall_clock_budget_reached"
+    assert result["agent_persisted"] is True
+    assert result["messages"][-1] == {
+        "role": "assistant",
+        "content": result["final_response"],
+    }
+
+
 def test_codex_deadline_flush_remains_inside_whole_turn_fence(monkeypatch):
     flush_entered = threading.Event()
     release_flush = threading.Event()

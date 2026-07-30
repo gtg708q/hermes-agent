@@ -23,6 +23,7 @@ import pytest
 
 from run_agent import AIAgent
 
+from agent import chat_completion_helpers as cch
 from agent.chat_completion_helpers import (
     direct_api_call,
     interruptible_api_call,
@@ -161,6 +162,30 @@ def test_direct_api_call_absolute_deadline_aborts_stalled_transport():
     assert time.monotonic() - started < 0.5
     agent._abort_request_openai_client.assert_called_once_with(
         fake_client, reason="turn_deadline"
+    )
+
+
+def test_direct_api_call_deadline_during_watchdog_join_cleans_request(monkeypatch):
+    """Deadline detection in finalization must not bypass request cleanup."""
+    from agent.errors import TurnWallClockExceeded
+
+    agent = _make_agent(platform="subagent")
+    agent._turn_deadline_monotonic = time.monotonic() + 1
+    fake_client = MagicMock()
+    fake_client.chat.completions.create.return_value = SimpleNamespace(id="done")
+    agent._create_request_openai_client.return_value = fake_client
+
+    def _deadline_before_join(_agent, maximum=0.3):
+        raise TurnWallClockExceeded("wall_clock_budget_reached")
+
+    monkeypatch.setattr(cch, "_turn_deadline_join_timeout", _deadline_before_join)
+
+    with pytest.raises(TurnWallClockExceeded, match="wall_clock_budget_reached"):
+        direct_api_call(agent, {"model": "m", "messages": []})
+
+    assert agent._active_request_abort is None
+    agent._close_request_openai_client.assert_called_once_with(
+        fake_client, reason="request_complete"
     )
 
 

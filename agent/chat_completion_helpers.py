@@ -632,15 +632,28 @@ def direct_api_call(agent, api_kwargs: dict):
         return response
     finally:
         watchdog_cancel.set()
-        if watchdog is not None and watchdog is not threading.current_thread():
-            watchdog.join(timeout=_turn_deadline_join_timeout(agent))
+        join_error = None
+        try:
+            if watchdog is not None and watchdog is not threading.current_thread():
+                watchdog.join(timeout=_turn_deadline_join_timeout(agent))
+        except BaseException as exc:
+            # The absolute deadline can expire while computing the bounded join
+            # timeout. Do not let that skip request ownership cleanup below.
+            join_error = exc
+
         if getattr(agent, "_active_request_abort", None) is _abort_active_request:
             agent._active_request_abort = None
         with request_client_lock:
             request_client = request_client_holder["client"]
             request_client_holder["client"] = None
-        if request_client is not None:
-            agent._close_request_openai_client(request_client, reason="request_complete")
+        try:
+            if request_client is not None:
+                agent._close_request_openai_client(
+                    request_client, reason="request_complete"
+                )
+        finally:
+            if join_error is not None:
+                raise join_error
 
 
 def interruptible_api_call(agent, api_kwargs: dict):
