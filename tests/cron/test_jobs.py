@@ -1850,6 +1850,211 @@ print(json.dumps({{"records": records[0], "removed": removed}}))
         assert not (set(old_state["first_seen"]) & set(new_state["first_seen"]))
         assert any(old_output.iterdir())
 
+    @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux output GC")
+    def test_linux_gc_preserves_cross_process_publication_after_candidate_capture(
+        self, tmp_path
+    ):
+        """A stale candidate snapshot must not detach a newly published generation."""
+        home = tmp_path / "linux-race-home"
+        cron_dir = home / "cron"
+        output_root = cron_dir / "output"
+        output_root.mkdir(parents=True)
+        (cron_dir / "jobs.json").write_text("[]", encoding="utf-8")
+        captured = home / "candidate-captured"
+        release = home / "release-gc"
+        env = os.environ.copy()
+        env["HERMES_HOME"] = str(home)
+        env["PYTHONPATH"] = os.getcwd()
+
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from cron.jobs import save_job_output; "
+                "save_job_output('publication-race', 'old output')",
+            ],
+            check=True,
+            cwd=os.getcwd(),
+            env=env,
+        )
+        gc_script = f"""
+import time
+from pathlib import Path
+from cron import jobs
+captured = Path({str(captured)!r})
+release = Path({str(release)!r})
+real_replace = jobs.atomic_replace
+def barrier(source, destination):
+    if Path(destination).name == '.output-gc-state.json' and not captured.exists():
+        captured.write_text('ready', encoding='utf-8')
+        deadline = time.monotonic() + 10
+        while not release.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert release.exists()
+    return real_replace(source, destination)
+jobs.atomic_replace = barrier
+print(jobs.gc_orphaned_output(
+    retention_days=0, interval_seconds=0, max_directories=20
+))
+"""
+        collector = subprocess.Popen(
+            [sys.executable, "-c", gc_script],
+            cwd=os.getcwd(),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        deadline = time.monotonic() + 5
+        while not captured.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert captured.exists()
+
+        subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from cron.jobs import save_job_output; "
+                "save_job_output('publication-race', 'new output')",
+            ],
+            check=True,
+            cwd=os.getcwd(),
+            env=env,
+        )
+        release.write_text("go", encoding="utf-8")
+        stdout, stderr = collector.communicate(timeout=10)
+        assert collector.returncode == 0, stderr
+        assert stdout.strip() == "0"
+        published = output_root / "publication-race"
+        assert published.is_dir()
+        assert any(
+            path.read_text(encoding="utf-8") == "new output"
+            for path in published.glob("*.md")
+        )
+
+    @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="POSIX flock")
+    def test_linux_gc_cross_process_guard_acquisition_is_bounded(self, tmp_path):
+        home = tmp_path / "linux-lock-home"
+        cron_dir = home / "cron"
+        output_root = cron_dir / "output"
+        output_root.mkdir(parents=True)
+        (cron_dir / "jobs.json").write_text("[]", encoding="utf-8")
+        (output_root / "must-survive").mkdir()
+        ready = home / "lock-ready"
+        release = home / "lock-release"
+        env = os.environ.copy()
+        env["HERMES_HOME"] = str(home)
+        env["PYTHONPATH"] = os.getcwd()
+        holder_script = f"""
+import time
+from pathlib import Path
+from cron import jobs
+ready = Path({str(ready)!r})
+release = Path({str(release)!r})
+with jobs._portable_output_filesystem_guard() as acquired:
+    assert acquired
+    ready.write_text('ready', encoding='utf-8')
+    deadline = time.monotonic() + 10
+    while not release.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+"""
+        holder = subprocess.Popen(
+            [sys.executable, "-c", holder_script],
+            cwd=os.getcwd(),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        deadline = time.monotonic() + 5
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists()
+        gc_script = """
+import json
+import time
+from cron import jobs
+started = time.monotonic()
+removed = jobs.gc_orphaned_output(
+    retention_days=0, interval_seconds=0, max_directories=20
+)
+print(json.dumps({'elapsed': time.monotonic() - started, 'removed': removed}))
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", gc_script],
+            check=True,
+            cwd=os.getcwd(),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        report = json.loads(result.stdout)
+        assert report["elapsed"] < 1.0
+        assert report["removed"] == 0
+        assert (output_root / "must-survive").is_dir()
+        writer_script = """
+import json
+import time
+from cron import jobs
+started = time.monotonic()
+try:
+    jobs.save_job_output('blocked-writer', 'must not publish unsafely')
+except TimeoutError:
+    timed_out = True
+else:
+    timed_out = False
+print(json.dumps({'elapsed': time.monotonic() - started, 'timed_out': timed_out}))
+"""
+        writer = subprocess.run(
+            [sys.executable, "-c", writer_script],
+            check=True,
+            cwd=os.getcwd(),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        writer_report = json.loads(writer.stdout)
+        assert writer_report["elapsed"] < 1.0
+        assert writer_report["timed_out"] is True
+        assert not (output_root / "blocked-writer").exists()
+        release.write_text("go", encoding="utf-8")
+        _, stderr = holder.communicate(timeout=5)
+        assert holder.returncode == 0, stderr
+
+    @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux output GC")
+    def test_linux_gc_recovers_crash_tombstone(self, tmp_cron_dir, monkeypatch):
+        from cron import jobs
+
+        save_jobs([])
+        output = save_job_output("linux-crash-orphan", "old output")
+        real_rmtree = jobs.shutil.rmtree
+        crashed = False
+
+        def crash_tombstone(path, *args, **kwargs):
+            nonlocal crashed
+            if str(path).startswith(".gc-") and not crashed:
+                crashed = True
+                raise OSError("simulated crash after Linux detach")
+            return real_rmtree(path, *args, **kwargs)
+
+        monkeypatch.setattr(jobs.shutil, "rmtree", crash_tombstone)
+        assert jobs.gc_orphaned_output(
+            retention_days=0, interval_seconds=0, max_directories=20
+        ) == 0
+        assert not output.parent.exists()
+        tombstones = list(jobs.get_cron_output_dir().glob(".gc-*"))
+        assert len(tombstones) == 1
+
+        monkeypatch.setattr(jobs.shutil, "rmtree", real_rmtree)
+        for _ in range(4):
+            if jobs.gc_orphaned_output(
+                retention_days=0, interval_seconds=0, max_directories=20
+            ):
+                break
+        assert not tombstones[0].exists()
+
     def test_portable_gc_restarts_use_durable_exact_work_queue(self, tmp_cron_dir, monkeypatch):
         """Portable schedulers must never replay the output-root prefix after restart."""
         import cron.jobs as jobs
@@ -1891,6 +2096,126 @@ print(json.dumps({{"records": records[0], "removed": removed}}))
 
         assert removed_total == len(names)
         assert previous_remaining == 0
+
+    def test_portable_pending_debris_is_bounded_and_converges_across_restarts(
+        self, tmp_path
+    ):
+        """Every pending-dir record spends budget, including invalid managed debris."""
+        home = tmp_path / "portable-home"
+        cron_dir = home / "cron"
+        output_root = cron_dir / "output"
+        pending = cron_dir / ".output-gc-pending"
+        output_root.mkdir(parents=True)
+        pending.mkdir()
+        (cron_dir / "jobs.json").write_text("[]", encoding="utf-8")
+
+        env = os.environ.copy()
+        env["HERMES_HOME"] = str(home)
+        env["PYTHONPATH"] = os.getcwd()
+        budget = 32
+        script = f"""
+import json
+import os
+from pathlib import Path
+from cron import jobs
+
+jobs._use_linux_output_gc = lambda: False
+pending = jobs._portable_output_pending_dir()
+real_scandir = os.scandir
+real_path_open = Path.open
+counts = {{"next": 0, "stat": 0, "open": 0}}
+
+class Entry:
+    def __init__(self, entry):
+        self._entry = entry
+        self.name = entry.name
+        self.path = entry.path
+    def is_file(self, *args, **kwargs):
+        counts["stat"] += 1
+        return self._entry.is_file(*args, **kwargs)
+    def __getattr__(self, name):
+        return getattr(self._entry, name)
+
+class Scanner:
+    def __init__(self, scanner):
+        self._scanner = scanner
+    def __enter__(self):
+        self._scanner.__enter__()
+        return self
+    def __exit__(self, *args):
+        return self._scanner.__exit__(*args)
+    def __iter__(self):
+        return self
+    def __next__(self):
+        counts["next"] += 1
+        return Entry(next(self._scanner))
+
+def counted_scandir(path):
+    scanner = real_scandir(path)
+    return Scanner(scanner) if Path(path) == pending else scanner
+
+def counted_open(path, *args, **kwargs):
+    if Path(path).parent == pending:
+        counts["open"] += 1
+    return real_path_open(path, *args, **kwargs)
+
+os.scandir = counted_scandir
+Path.open = counted_open
+removed = jobs.gc_orphaned_output(
+    retention_days=0, interval_seconds=0, max_directories={budget}
+)
+print(json.dumps({{"counts": counts, "removed": removed}}))
+"""
+
+        # Create the portable index before adding a legacy-looking output tree.
+        subprocess.run(
+            [sys.executable, "-c", script],
+            check=True,
+            cwd=os.getcwd(),
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+        for index in range(1024):
+            path = pending / f".pending-{index:04d}.tmp"
+            if index % 3 == 0:
+                path.write_text("{broken", encoding="utf-8")
+            elif index % 3 == 1:
+                path.write_text(json.dumps({"name": [index]}), encoding="utf-8")
+            else:
+                path.write_text("temporary", encoding="utf-8")
+        (pending / "wrong-type").mkdir()
+        if os.name != "nt":
+            (pending / "dangling-link.json").symlink_to(pending / "missing")
+
+        valid_dir = output_root / "valid-tail"
+        valid_dir.mkdir()
+        (valid_dir / "run.md").write_text("valid", encoding="utf-8")
+        (pending / "zzzz-valid-tail.json").write_text(
+            json.dumps({"name": "valid-tail"}), encoding="utf-8"
+        )
+
+        for _ in range(80):
+            result = subprocess.run(
+                [sys.executable, "-c", script],
+                check=True,
+                cwd=os.getcwd(),
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            report = json.loads(result.stdout)
+            assert report["counts"]["next"] <= budget
+            assert report["counts"]["stat"] <= budget
+            assert report["counts"]["open"] <= budget
+            if not valid_dir.exists():
+                break
+        else:
+            pytest.fail("valid marker behind pending debris was never consumed")
+
+        assert not (pending / "zzzz-valid-tail.json").exists()
+        assert len(list(pending.iterdir())) < budget
 
     def test_portable_gc_legacy_bootstrap_is_explicit_and_durable(
         self, tmp_cron_dir, monkeypatch

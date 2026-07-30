@@ -479,6 +479,8 @@ def _job_output_dir(job_id: str) -> Path:
         raise ValueError(f"Invalid cron job id for output path: {job_id!r}")
     if Path(text).is_absolute() or Path(text).drive:
         raise ValueError(f"Invalid cron job id for output path: {job_id!r}")
+    if re.fullmatch(r"\.gc-[0-9a-f]{32}", text):
+        raise ValueError(f"Invalid cron job id for output path: {job_id!r}")
     return _current_cron_store().output_dir / text
 
 
@@ -629,6 +631,7 @@ def _portable_output_gc_db_path() -> Path:
 _PORTABLE_OUTPUT_GC_BUSY_TIMEOUT_SECONDS = 0.1
 _portable_output_file_lock = threading.RLock()
 _PORTABLE_OUTPUT_PENDING_DIR = ".output-gc-pending"
+_PORTABLE_OUTPUT_PENDING_QUARANTINE_DIR = ".output-gc-pending-quarantine"
 
 
 @contextlib.contextmanager
@@ -678,11 +681,11 @@ def _portable_output_filesystem_guard(*, timeout: Optional[float] = None):
                         time.sleep(0.01)
             except (OSError, IOError) as exc:
                 logger.warning(
-                    "Portable cron output filesystem guard unavailable; "
-                    "continuing with in-process serialization: %s",
+                    "Cron output filesystem guard unavailable; skipping the "
+                    "guarded filesystem change: %s",
                     exc,
                 )
-                acquired_file = True
+                acquired_file = False
             yield acquired_file
         finally:
             if lock_fd is not None and acquired_file:
@@ -711,7 +714,13 @@ def _write_portable_output_pending(name: str) -> Path:
     pending_dir.mkdir(parents=True, exist_ok=True)
     _secure_dir(pending_dir)
     marker = pending_dir / f"{uuid.uuid4().hex}.json"
-    fd, tmp_name = tempfile.mkstemp(dir=str(pending_dir), prefix=".pending-", suffix=".tmp")
+    # Stage outside the scanned directory. A bounded consumer may safely
+    # quarantine every entry it sees without racing an active marker writer.
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(_current_cron_store().cron_dir),
+        prefix=".output-pending-",
+        suffix=".tmp",
+    )
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump({"name": name}, handle)
@@ -730,22 +739,54 @@ def _write_portable_output_pending(name: str) -> Path:
 
 def _consume_portable_output_pending(
     conn: sqlite3.Connection, *, limit: int = 10_000
-) -> List[Path]:
-    """Index a bounded set of durable fail-open publication markers."""
+) -> Tuple[List[Path], int]:
+    """Index at most *limit* pending-directory entries.
+
+    Every ``next`` result spends budget, even for temp files, corrupt payloads,
+    wrong types, symlinks, and entries that disappear concurrently. Invalid
+    managed debris is atomically moved out of the scan directory so fresh
+    scheduler processes make durable progress instead of replaying a prefix.
+    """
     consumed: List[Path] = []
+    visited = 0
+    pending_dir = _portable_output_pending_dir()
+    quarantine_dir = (
+        _current_cron_store().cron_dir / _PORTABLE_OUTPUT_PENDING_QUARANTINE_DIR
+    )
+
+    def quarantine(entry_path: Path) -> None:
+        try:
+            quarantine_dir.mkdir(parents=True, exist_ok=True)
+            _secure_dir(quarantine_dir)
+            os.replace(entry_path, quarantine_dir / uuid.uuid4().hex)
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            logger.debug("Failed to quarantine cron output pending debris %s: %s", entry_path, exc)
+
     try:
-        with os.scandir(_portable_output_pending_dir()) as entries:
-            for entry in entries:
-                if len(consumed) >= limit:
-                    break
-                if not entry.name.endswith(".json"):
-                    continue
+        with os.scandir(pending_dir) as entries:
+            while visited < max(0, limit):
                 try:
-                    if not entry.is_file(follow_symlinks=False):
+                    entry = next(entries)
+                except StopIteration:
+                    break
+                visited += 1
+                entry_path = Path(entry.path)
+                valid = False
+                try:
+                    if not entry.name.endswith(".json") or not entry.is_file(
+                        follow_symlinks=False
+                    ):
+                        quarantine(entry_path)
                         continue
-                    payload = json.loads(Path(entry.path).read_text(encoding="utf-8"))
+                    payload = json.loads(entry_path.read_text(encoding="utf-8"))
+                    if not isinstance(payload, dict):
+                        quarantine(entry_path)
+                        continue
                     name = payload.get("name")
                     if not isinstance(name, str) or not name or Path(name).name != name:
+                        quarantine(entry_path)
                         continue
                     conn.execute(
                         """INSERT INTO directories(name, first_seen, generation)
@@ -755,12 +796,15 @@ def _consume_portable_output_pending(
                                generation = excluded.generation""",
                         (name, uuid.uuid4().hex),
                     )
-                    consumed.append(Path(entry.path))
+                    consumed.append(entry_path)
+                    valid = True
                 except (OSError, ValueError, TypeError):
-                    continue
+                    pass
+                if not valid:
+                    quarantine(entry_path)
     except FileNotFoundError:
         pass
-    return consumed
+    return consumed, visited
 
 
 def _unlink_portable_output_pending(markers: List[Path]) -> None:
@@ -869,9 +913,7 @@ def _portable_output_gc_enqueue(name: str) -> None:
                    generation = excluded.generation""",
             (name, uuid.uuid4().hex),
         )
-        consumed = _consume_portable_output_pending(conn)
         conn.commit()
-        _unlink_portable_output_pending(consumed)
     finally:
         conn.close()
 
@@ -977,7 +1019,7 @@ def bootstrap_output_gc_index() -> Dict[str, Any]:
                                 indexed += 1
                         except OSError:
                             continue
-                consumed = _consume_portable_output_pending(conn)
+                consumed, _visited = _consume_portable_output_pending(conn)
                 conn.execute(
                     "INSERT OR REPLACE INTO metadata(key, value) VALUES('cursor', '0')"
                 )
@@ -2813,6 +2855,58 @@ def _prune_job_output(job_output_dir: Path, keep: int) -> int:
 
 
 _PORTABLE_TOMBSTONE_RE = re.compile(r"^\.gc-[0-9a-f]{32}$")
+_OUTPUT_GENERATION_FILE = ".output-generation"
+
+
+def _output_directory_identity(value: os.stat_result) -> Tuple[int, int, int, int]:
+    """Identity one directory generation without relying on process-local state."""
+    return (
+        int(value.st_dev),
+        int(value.st_ino),
+        int(value.st_mtime_ns),
+        int(value.st_ctime_ns),
+    )
+
+
+def _read_output_generation(job_output_dir: Path) -> Optional[str]:
+    """Read a bounded, no-follow publication generation marker."""
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(job_output_dir / _OUTPUT_GENERATION_FILE, flags)
+    except OSError:
+        return None
+    try:
+        value = os.read(fd, 64)
+        if os.read(fd, 1):
+            return None
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    try:
+        generation = value.decode("ascii")
+    except UnicodeDecodeError:
+        return None
+    return generation if re.fullmatch(r"[0-9a-f]{32}", generation) else None
+
+
+def _write_output_generation(job_output_dir: Path) -> None:
+    """Publish a fresh cross-process generation while the output guard is held."""
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(job_output_dir), prefix=".generation-", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="ascii") as handle:
+            handle.write(uuid.uuid4().hex)
+            handle.flush()
+            os.fsync(handle.fileno())
+        destination = job_output_dir / _OUTPUT_GENERATION_FILE
+        atomic_replace(tmp_name, destination)
+        _secure_file(destination)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_name)
+        raise
 
 
 def _portable_tombstone_path(output_root: Path, name: str) -> Optional[Path]:
@@ -2966,7 +3060,9 @@ def _gc_orphaned_output_portable(
                 database_was_missing and _portable_output_root_is_empty()
             )
         )
-        consumed = _consume_portable_output_pending(conn, limit=max_directories)
+        consumed, pending_visits = _consume_portable_output_pending(
+            conn, limit=max_directories
+        )
         conn.commit()
         _unlink_portable_output_pending(consumed)
     try:
@@ -2992,10 +3088,10 @@ def _gc_orphaned_output_portable(
                 pass
 
         removed = 0
-        work_done = 0
+        work_done = pending_visits
         tombstone_rows = conn.execute(
             """SELECT id FROM tombstones ORDER BY id LIMIT ?""",
-            (max_directories,),
+            (max(0, max_directories - work_done),),
         ).fetchall()
         for (tombstone_id,) in tombstone_rows:
             work_done += 1
@@ -3323,9 +3419,16 @@ def gc_orphaned_output(
             except OSError as exc:
                 logger.debug("Failed to inspect orphaned cron output %s: %s", name, exc)
                 continue
+            identity = _output_directory_identity(entry_stat)
+            is_tombstone = _PORTABLE_TOMBSTONE_RE.fullmatch(name) is not None
+            generation = None if is_tombstone else _read_output_generation(output_dir / name)
+            if is_tombstone:
+                first_seen.pop(name, None)
+                candidates.append((name, identity, generation, True))
+                continue
             seen_at = first_seen.setdefault(name, now)
             if now - seen_at >= retention_days * 86400:
-                candidates.append(name)
+                candidates.append((name, identity, generation, False))
 
         def _persist_gc_state() -> None:
             state = {
@@ -3360,25 +3463,94 @@ def gc_orphaned_output(
         return 0
 
     removed = 0
+    state_changed = False
+    assert root_fd is not None
     try:
-        for name in candidates:
+        for name, captured_identity, captured_generation, is_tombstone in candidates:
+            detached_name: Optional[str] = None
             try:
-                entry_stat = (
-                    os.stat(name, dir_fd=root_fd, follow_symlinks=False)
-                    if root_fd is not None
-                    else os.stat(output_dir / name, follow_symlinks=False)
-                )
-                if name in live_ids or not stat.S_ISDIR(entry_stat.st_mode):
+                # Job mutation and output publication use these locks in this
+                # order. Re-read jobs.json under the jobs lock, then validate the
+                # root, directory identity, and durable publication generation
+                # immediately before the atomic detach.
+                with _jobs_lock():
+                    with _portable_output_filesystem_guard(
+                        timeout=_PORTABLE_OUTPUT_GC_BUSY_TIMEOUT_SECONDS
+                    ) as acquired:
+                        if not acquired:
+                            continue
+                        current_live_ids = {
+                            str(job.get("id"))
+                            for job in load_jobs()
+                            if job.get("id")
+                        }
+                        if not is_tombstone and name in current_live_ids:
+                            first_seen.pop(name, None)
+                            state_changed = True
+                            continue
+                        canonical_root = os.stat(output_dir, follow_symlinks=False)
+                        opened_root = os.fstat(root_fd)
+                        if (
+                            int(canonical_root.st_dev),
+                            int(canonical_root.st_ino),
+                        ) != (int(opened_root.st_dev), int(opened_root.st_ino)):
+                            _close_output_gc_scan(output_dir)
+                            continue
+                        entry_stat = os.stat(
+                            name, dir_fd=root_fd, follow_symlinks=False
+                        )
+                        if (
+                            not stat.S_ISDIR(entry_stat.st_mode)
+                            or _output_directory_identity(entry_stat) != captured_identity
+                        ):
+                            first_seen.pop(name, None)
+                            state_changed = True
+                            continue
+                        if (
+                            not is_tombstone
+                            and _read_output_generation(output_dir / name)
+                            != captured_generation
+                        ):
+                            first_seen.pop(name, None)
+                            state_changed = True
+                            continue
+                        if is_tombstone:
+                            detached_name = name
+                        else:
+                            detached_name = f".gc-{uuid.uuid4().hex}"
+                            os.rename(
+                                name,
+                                detached_name,
+                                src_dir_fd=root_fd,
+                                dst_dir_fd=root_fd,
+                            )
+                            detached_stat = os.stat(
+                                detached_name,
+                                dir_fd=root_fd,
+                                follow_symlinks=False,
+                            )
+                            if (
+                                not stat.S_ISDIR(detached_stat.st_mode)
+                                or (
+                                    int(detached_stat.st_dev),
+                                    int(detached_stat.st_ino),
+                                )
+                                != captured_identity[:2]
+                            ):
+                                raise RuntimeError(
+                                    "cron output GC detached an unexpected directory"
+                                )
+                if detached_name is None:
                     continue
-                if root_fd is not None:
-                    shutil.rmtree(name, dir_fd=root_fd)
-                else:
-                    shutil.rmtree(output_dir / name)
+                # Recursive deletion can be slow. The original name is already
+                # atomically detached, so release both cross-process guards first.
+                shutil.rmtree(detached_name, dir_fd=root_fd)
                 removed += 1
                 first_seen.pop(name, None)
-            except OSError as exc:
+                state_changed = True
+            except (OSError, RuntimeError) as exc:
                 logger.debug("Failed to prune orphaned cron output %s: %s", name, exc)
-        if removed:
+        if state_changed:
             # The pre-delete marker intentionally makes failed deletions retryable.
             # Once deletion succeeds, durably remove those observations too so the
             # marker cannot grow forever or resurrect stale ages on name reuse.
@@ -3398,7 +3570,7 @@ def save_job_output(job_id: str, output: str):
     job_output_dir = _job_output_dir(job_id)
     portable = not _use_linux_output_gc()
 
-    def publish() -> Path:
+    def publish(*, write_generation: bool = False) -> Path:
         job_output_dir.mkdir(parents=True, exist_ok=True)
         _secure_dir(job_output_dir)
         timestamp = _hermes_now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -3413,6 +3585,8 @@ def save_job_output(job_id: str, output: str):
                 os.fsync(f.fileno())
             atomic_replace(tmp_path, output_file)
             _secure_file(output_file)
+            if write_generation:
+                _write_output_generation(job_output_dir)
         except BaseException:
             try:
                 os.unlink(tmp_path)
@@ -3422,7 +3596,14 @@ def save_job_output(job_id: str, output: str):
         return output_file
 
     if not portable:
-        output_file = publish()
+        with _portable_output_filesystem_guard(
+            timeout=_PORTABLE_OUTPUT_GC_BUSY_TIMEOUT_SECONDS
+        ) as acquired:
+            if not acquired:
+                raise TimeoutError(
+                    "Timed out waiting for the cron output publication guard"
+                )
+            output_file = publish(write_generation=True)
     else:
         pending_marker: Optional[Path] = None
         try:
