@@ -628,6 +628,104 @@ def _portable_output_gc_db_path() -> Path:
     return _current_cron_store().cron_dir / "output-gc.sqlite3"
 
 
+def _linux_output_gc_db_path() -> Path:
+    return _current_cron_store().cron_dir / "output-gc-linux.sqlite3"
+
+
+def _initialize_linux_output_gc_state(
+    root_dev: int, root_ino: int
+) -> sqlite3.Connection:
+    """Open bounded Linux orphan-age state bound to one output-root inode.
+
+    The legacy JSON map is intentionally never parsed: migration resets orphan
+    ages conservatively.  A replaced output root similarly gets a fresh
+    database, avoiding a population-sized DELETE on the scheduler thread.
+    """
+    store = _current_cron_store()
+    db_path = _linux_output_gc_db_path()
+    if db_path.is_symlink():
+        raise OSError("Linux cron output GC state must not be a symlink")
+
+    def open_database() -> sqlite3.Connection:
+        connection = sqlite3.connect(
+            str(db_path), timeout=_PORTABLE_OUTPUT_GC_BUSY_TIMEOUT_SECONDS
+        )
+        connection.execute("PRAGMA journal_mode=DELETE")
+        connection.execute("PRAGMA synchronous=FULL")
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS state (
+                   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                   root_dev INTEGER NOT NULL,
+                   root_ino INTEGER NOT NULL,
+                   cookie INTEGER NOT NULL,
+                   scan_epoch INTEGER NOT NULL,
+                   last_gc_at REAL
+               )"""
+        )
+        connection.execute(
+            """CREATE TABLE IF NOT EXISTS observations (
+                   name TEXT PRIMARY KEY,
+                   first_seen REAL NOT NULL,
+                   last_seen_epoch INTEGER NOT NULL
+               ) WITHOUT ROWID"""
+        )
+        return connection
+
+    conn = open_database()
+    row = conn.execute(
+        "SELECT root_dev, root_ino FROM state WHERE singleton = 1"
+    ).fetchone()
+    if row is not None and (int(row[0]), int(row[1])) != (root_dev, root_ino):
+        conn.close()
+        # Constant filesystem work replaces a potentially population-sized SQL
+        # reset. Old ages can never apply to same-named directories in the new
+        # root, including after a crash between unlink and recreate.
+        # Remove the rollback journal first. A crash at that point leaves the old
+        # database intact to be rejected again; it can never leave an orphaned hot
+        # journal able to restore ages for the replaced output root.
+        Path(f"{db_path}-journal").unlink(missing_ok=True)
+        db_path.unlink(missing_ok=True)
+        conn = open_database()
+        row = None
+    if row is None:
+        conn.execute(
+            """INSERT OR REPLACE INTO state
+               (singleton, root_dev, root_ino, cookie, scan_epoch, last_gc_at)
+               VALUES (1, ?, ?, 0, 1, NULL)""",
+            (root_dev, root_ino),
+        )
+    conn.commit()
+    _secure_file(db_path)
+
+    # Bounded migration: never deserialize or rewrite the legacy population.
+    for legacy in (
+        store.cron_dir / ".output-gc-state.json",
+        store.output_dir / ".orphan-gc.json",
+    ):
+        if not legacy.is_symlink():
+            with contextlib.suppress(OSError):
+                legacy.unlink()
+    return conn
+
+
+def _persist_linux_output_gc_page(
+    conn: sqlite3.Connection,
+    *,
+    root_dev: int,
+    root_ino: int,
+    next_cookie: int,
+    scan_epoch: int,
+    now: float,
+) -> None:
+    """Durably advance one Linux page; split out for race instrumentation."""
+    conn.execute(
+        """UPDATE state SET cookie = ?, scan_epoch = ?, last_gc_at = ?
+           WHERE singleton = 1 AND root_dev = ? AND root_ino = ?""",
+        (next_cookie, scan_epoch, now, root_dev, root_ino),
+    )
+    conn.commit()
+
+
 _PORTABLE_OUTPUT_GC_BUSY_TIMEOUT_SECONDS = 0.1
 _portable_output_file_lock = threading.RLock()
 _PORTABLE_OUTPUT_PENDING_DIR = ".output-gc-pending"
@@ -3292,14 +3390,12 @@ def gc_orphaned_output(
 
     store = _current_cron_store()
     output_dir = store.output_dir
-    marker = store.cron_dir / ".output-gc-state.json"
     legacy_marker = output_dir / ".orphan-gc.json"
     now = time.time()
     root_fd: Optional[int] = None
+    linux_conn: Optional[sqlite3.Connection] = None
     try:
-        if marker.is_symlink() or (not marker.exists() and legacy_marker.is_symlink()):
-            return 0
-        if interval_seconds and marker.is_file() and now - marker.stat().st_mtime < interval_seconds:
+        if _linux_output_gc_db_path().is_symlink() or legacy_marker.is_symlink():
             return 0
         # Resolve the authoritative live set before advancing cadence. A corrupt
         # jobs store must neither delete every output directory nor suppress a
@@ -3320,38 +3416,36 @@ def gc_orphaned_output(
                     exc,
                 )
                 return 0
-        try:
-            state_path = marker if marker.is_file() else legacy_marker
-            state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.is_file() else {}
-        except (OSError, ValueError, TypeError):
-            state = {}
-
         root_stat = os.stat(output_dir, follow_symlinks=False)
         if not stat.S_ISDIR(root_stat.st_mode):
             return 0
         root_dev = int(root_stat.st_dev)
         root_ino = int(root_stat.st_ino)
-        state_matches_root = (
-            state.get("version") == 1
-            and state.get("root_dev") == root_dev
-            and state.get("root_ino") == root_ino
-        )
-        first_seen = {
-            str(name): float(seen)
-            for name, seen in (state.get("first_seen") or {}).items()
-            if isinstance(name, str) and isinstance(seen, (int, float))
-        }
-        if not state_matches_root:
-            # Cookies and observations from a replaced inode must never apply to
-            # same-named entries in the new output directory.
-            first_seen = {}
-        raw_cookie = state.get("cookie", 0) if state_matches_root else 0
-        cookie = raw_cookie if isinstance(raw_cookie, int) and raw_cookie >= 0 else 0
+        linux_conn = _initialize_linux_output_gc_state(root_dev, root_ino)
+        state_row = linux_conn.execute(
+            "SELECT cookie, scan_epoch, last_gc_at FROM state WHERE singleton = 1"
+        ).fetchone()
+        if state_row is None:
+            linux_conn.close()
+            linux_conn = None
+            return 0
+        cookie = max(0, int(state_row[0]))
+        scan_epoch = max(1, int(state_row[1]))
+        last_gc_at = state_row[2]
+        if (
+            interval_seconds
+            and last_gc_at is not None
+            and now - float(last_gc_at) < interval_seconds
+        ):
+            linux_conn.close()
+            linux_conn = None
+            return 0
 
         # Every next_record call consumes budget, including dot/non-directory
         # records and the EOF probe. Linux reopens at d_off in O(1) after restart.
         page: List[str] = []
         next_cookie = cookie
+        reached_eof = False
         with _output_gc_scan_lock:
             scan = _output_gc_scans.get(output_dir)
             if scan is not None and (
@@ -3369,7 +3463,6 @@ def gc_orphaned_output(
                     if not cookie:
                         raise
                     # Invalid/stale cookies reset without processing entries.
-                    first_seen = {}
                     cookie = 0
                     next_cookie = 0
                     scan = scan_type(output_dir, 0)
@@ -3379,13 +3472,13 @@ def gc_orphaned_output(
                     name = scan.next_record()
                 except OSError:
                     _close_output_gc_scan(output_dir)
-                    first_seen = {}
                     next_cookie = 0
                     page = []
                     break
                 if name is None:
                     _close_output_gc_scan(output_dir)
                     next_cookie = 0
+                    reached_eof = True
                     break
                 next_cookie = scan.cookie
                 page.append(name)
@@ -3403,9 +3496,11 @@ def gc_orphaned_output(
             raise RuntimeError("cron output directory changed during GC scan")
 
         candidates = []
+        page_work = 0
         for name in page:
+            page_work += 1
             if name in {".", "..", legacy_marker.name, ".orphan-gc"} or name in live_ids:
-                first_seen.pop(name, None)
+                linux_conn.execute("DELETE FROM observations WHERE name = ?", (name,))
                 continue
             try:
                 entry_stat = (
@@ -3414,7 +3509,7 @@ def gc_orphaned_output(
                     else os.stat(output_dir / name, follow_symlinks=False)
                 )
                 if not stat.S_ISDIR(entry_stat.st_mode):
-                    first_seen.pop(name, None)
+                    linux_conn.execute("DELETE FROM observations WHERE name = ?", (name,))
                     continue
             except OSError as exc:
                 logger.debug("Failed to inspect orphaned cron output %s: %s", name, exc)
@@ -3423,48 +3518,61 @@ def gc_orphaned_output(
             is_tombstone = _PORTABLE_TOMBSTONE_RE.fullmatch(name) is not None
             generation = None if is_tombstone else _read_output_generation(output_dir / name)
             if is_tombstone:
-                first_seen.pop(name, None)
+                linux_conn.execute("DELETE FROM observations WHERE name = ?", (name,))
                 candidates.append((name, identity, generation, True))
                 continue
-            seen_at = first_seen.setdefault(name, now)
+            observed = linux_conn.execute(
+                "SELECT first_seen FROM observations WHERE name = ?", (name,)
+            ).fetchone()
+            seen_at = float(observed[0]) if observed is not None else now
+            linux_conn.execute(
+                """INSERT INTO observations(name, first_seen, last_seen_epoch)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(name) DO UPDATE SET
+                       last_seen_epoch = excluded.last_seen_epoch""",
+                (name, seen_at, scan_epoch),
+            )
             if now - seen_at >= retention_days * 86400:
                 candidates.append((name, identity, generation, False))
 
-        def _persist_gc_state() -> None:
-            state = {
-                "version": 1,
-                "root_dev": root_dev,
-                "root_ino": root_ino,
-                "cookie": next_cookie,
-                "first_seen": first_seen,
-            }
-            fd, tmp_name = tempfile.mkstemp(
-                dir=str(store.cron_dir), prefix=".output-gc-state-", suffix=".tmp"
+        # At EOF a complete rotation is known. Retire stale rows using only the
+        # unused page budget, so database work never exceeds max_directories.
+        next_epoch = scan_epoch + 1 if reached_eof else scan_epoch
+        cleanup_budget = max(0, max_directories - page_work)
+        if reached_eof and cleanup_budget:
+            linux_conn.execute(
+                """DELETE FROM observations WHERE name IN (
+                       SELECT name FROM observations
+                       WHERE last_seen_epoch < ? LIMIT ?
+                   )""",
+                (scan_epoch, cleanup_budget),
             )
-            try:
-                with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                    json.dump(state, handle, sort_keys=True)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                atomic_replace(tmp_name, marker)
-                with contextlib.suppress(OSError):
-                    legacy_marker.unlink()
-            except BaseException:
-                with contextlib.suppress(OSError):
-                    os.unlink(tmp_name)
-                raise
-
-        _persist_gc_state()
-    except (OSError, ValueError, TypeError, RuntimeError):
+        _persist_linux_output_gc_page(
+            linux_conn,
+            root_dev=root_dev,
+            root_ino=root_ino,
+            next_cookie=next_cookie,
+            scan_epoch=next_epoch,
+            now=now,
+        )
+    except (OSError, ValueError, TypeError, RuntimeError, sqlite3.Error):
         _close_output_gc_scan(output_dir)
         if root_fd is not None:
             with contextlib.suppress(OSError):
                 os.close(root_fd)
+        if linux_conn is not None:
+            linux_conn.close()
         return 0
 
     removed = 0
-    state_changed = False
     assert root_fd is not None
+
+    def forget_observation(name: str) -> None:
+        """Durably forget one candidate without touching unrelated age state."""
+        assert linux_conn is not None
+        linux_conn.execute("DELETE FROM observations WHERE name = ?", (name,))
+        linux_conn.commit()
+
     try:
         for name, captured_identity, captured_generation, is_tombstone in candidates:
             detached_name: Optional[str] = None
@@ -3485,8 +3593,7 @@ def gc_orphaned_output(
                             if job.get("id")
                         }
                         if not is_tombstone and name in current_live_ids:
-                            first_seen.pop(name, None)
-                            state_changed = True
+                            forget_observation(name)
                             continue
                         canonical_root = os.stat(output_dir, follow_symlinks=False)
                         opened_root = os.fstat(root_fd)
@@ -3503,16 +3610,14 @@ def gc_orphaned_output(
                             not stat.S_ISDIR(entry_stat.st_mode)
                             or _output_directory_identity(entry_stat) != captured_identity
                         ):
-                            first_seen.pop(name, None)
-                            state_changed = True
+                            forget_observation(name)
                             continue
                         if (
                             not is_tombstone
                             and _read_output_generation(output_dir / name)
                             != captured_generation
                         ):
-                            first_seen.pop(name, None)
-                            state_changed = True
+                            forget_observation(name)
                             continue
                         if is_tombstone:
                             detached_name = name
@@ -3540,27 +3645,32 @@ def gc_orphaned_output(
                                 raise RuntimeError(
                                     "cron output GC detached an unexpected directory"
                                 )
+                            # Commit the age removal while publication is still
+                            # fenced. A same-name generation created after guard
+                            # release must never inherit this directory's age.
+                            forget_observation(name)
                 if detached_name is None:
                     continue
                 # Recursive deletion can be slow. The original name is already
                 # atomically detached, so release both cross-process guards first.
                 shutil.rmtree(detached_name, dir_fd=root_fd)
                 removed += 1
-                first_seen.pop(name, None)
-                state_changed = True
-            except (OSError, RuntimeError) as exc:
+            except FileNotFoundError:
+                # A candidate that vanished before detach must not retain an age
+                # that a later same-name directory could inherit.
+                try:
+                    forget_observation(name)
+                except sqlite3.Error as exc:
+                    logger.debug(
+                        "Failed to forget missing cron output %s: %s", name, exc
+                    )
+            except (OSError, RuntimeError, sqlite3.Error) as exc:
                 logger.debug("Failed to prune orphaned cron output %s: %s", name, exc)
-        if state_changed:
-            # The pre-delete marker intentionally makes failed deletions retryable.
-            # Once deletion succeeds, durably remove those observations too so the
-            # marker cannot grow forever or resurrect stale ages on name reuse.
-            try:
-                _persist_gc_state()
-            except OSError as exc:
-                logger.debug("Failed to persist orphan GC deletions: %s", exc)
     finally:
         if root_fd is not None:
             os.close(root_fd)
+        if linux_conn is not None:
+            linux_conn.close()
     return removed
 
 
@@ -3596,12 +3706,18 @@ def save_job_output(job_id: str, output: str):
         return output_file
 
     if not portable:
-        with _portable_output_filesystem_guard(
-            timeout=_PORTABLE_OUTPUT_GC_BUSY_TIMEOUT_SECONDS
-        ) as acquired:
+        # Publication is the primary operation; retention is auxiliary. Wait for
+        # a healthy collector to release its short critical section rather than
+        # turning >100 ms of guard contention into a failed cron run.
+        with _portable_output_filesystem_guard() as acquired:
             if not acquired:
-                raise TimeoutError(
-                    "Timed out waiting for the cron output publication guard"
+                # If the guard itself is unavailable, publish a fresh durable
+                # generation. Linux GC also fails closed when it cannot acquire
+                # the same guard, and generation validation fences stale captures.
+                logger.warning(
+                    "Cron output publication guard unavailable for %s; "
+                    "publishing an independently fenced generation",
+                    job_output_dir.name,
                 )
             output_file = publish(write_generation=True)
     else:

@@ -1794,14 +1794,16 @@ print(json.dumps({{"records": records[0], "removed": removed}}))
         for name in names:
             (output / name).mkdir()
 
-        state_file = cron_dir / ".output-gc-state.json"
+        state_file = cron_dir / "output-gc-linux.sqlite3"
         self._run_output_gc_process(home, retention_days=30, max_directories=5)
-        first = json.loads(state_file.read_text(encoding="utf-8"))
-        first_seen = set(first["first_seen"])
+        with sqlite3.connect(state_file) as conn:
+            first_seen = {row[0] for row in conn.execute("SELECT name FROM observations")}
+            first = conn.execute(
+                "SELECT root_dev, root_ino, cookie FROM state WHERE singleton = 1"
+            ).fetchone()
         assert 0 < len(first_seen) <= 5
-        assert first["version"] == 1
-        assert first["cookie"] > 0
-        assert (first["root_dev"], first["root_ino"]) == (
+        assert first[2] > 0
+        assert first[:2] == (
             output.stat().st_dev,
             output.stat().st_ino,
         )
@@ -1809,8 +1811,9 @@ print(json.dumps({{"records": records[0], "removed": removed}}))
         # A fresh interpreter must seek to the durable cookie, not replay the
         # first process's prefix. Only this page's bounded records may be new.
         self._run_output_gc_process(home, retention_days=30, max_directories=5)
-        second = json.loads(state_file.read_text(encoding="utf-8"))
-        newly_seen = set(second["first_seen"]) - first_seen
+        with sqlite3.connect(state_file) as conn:
+            second_seen = {row[0] for row in conn.execute("SELECT name FROM observations")}
+        newly_seen = second_seen - first_seen
         assert 0 < len(newly_seen) <= 5
 
         # Repeated process-equivalent restarts still finish the rotation and
@@ -1832,8 +1835,12 @@ print(json.dumps({{"records": records[0], "removed": removed}}))
             (output / f"old-{index:03d}").mkdir()
 
         self._run_output_gc_process(home, retention_days=30, max_directories=5)
-        state_file = cron_dir / ".output-gc-state.json"
-        old_state = json.loads(state_file.read_text(encoding="utf-8"))
+        state_file = cron_dir / "output-gc-linux.sqlite3"
+        with sqlite3.connect(state_file) as conn:
+            old_state = conn.execute(
+                "SELECT root_dev, root_ino FROM state WHERE singleton = 1"
+            ).fetchone()
+            old_seen = {row[0] for row in conn.execute("SELECT name FROM observations")}
         old_output = cron_dir / "old-output"
         output.rename(old_output)
         output.mkdir()
@@ -1841,14 +1848,39 @@ print(json.dumps({{"records": records[0], "removed": removed}}))
             (output / f"new-{index:03d}").mkdir()
 
         self._run_output_gc_process(home, retention_days=30, max_directories=5)
-        new_state = json.loads(state_file.read_text(encoding="utf-8"))
-        assert (new_state["root_dev"], new_state["root_ino"]) == (
+        with sqlite3.connect(state_file) as conn:
+            new_state = conn.execute(
+                "SELECT root_dev, root_ino FROM state WHERE singleton = 1"
+            ).fetchone()
+            new_seen = {row[0] for row in conn.execute("SELECT name FROM observations")}
+        assert new_state == (
             output.stat().st_dev,
             output.stat().st_ino,
         )
-        assert new_state["root_ino"] != old_state["root_ino"]
-        assert not (set(old_state["first_seen"]) & set(new_state["first_seen"]))
+        assert new_state[1] != old_state[1]
+        assert not (old_seen & new_seen)
         assert any(old_output.iterdir())
+
+    @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux output GC")
+    def test_linux_gc_state_work_is_bounded_to_page(self, tmp_path):
+        home = tmp_path / "bounded-linux-home"
+        cron_dir = home / "cron"
+        output = cron_dir / "output"
+        output.mkdir(parents=True)
+        (cron_dir / "jobs.json").write_text("[]", encoding="utf-8")
+        for index in range(3000):
+            (output / f"entry-{index:05d}").mkdir()
+
+        stats = self._run_output_gc_process(
+            home, retention_days=30, max_directories=7
+        )
+        assert stats["records"] <= 7
+        db_path = cron_dir / "output-gc-linux.sqlite3"
+        with sqlite3.connect(db_path) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM observations").fetchone()[0] <= 7
+        # The old monolithic map must be reset without reading or rewriting its
+        # population on the scheduler thread.
+        assert not (cron_dir / ".output-gc-state.json").exists()
 
     @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux output GC")
     def test_linux_gc_preserves_cross_process_publication_after_candidate_capture(
@@ -1883,16 +1915,17 @@ from pathlib import Path
 from cron import jobs
 captured = Path({str(captured)!r})
 release = Path({str(release)!r})
-real_replace = jobs.atomic_replace
-def barrier(source, destination):
-    if Path(destination).name == '.output-gc-state.json' and not captured.exists():
+real_persist = jobs._persist_linux_output_gc_page
+def barrier(*args, **kwargs):
+    result = real_persist(*args, **kwargs)
+    if not captured.exists():
         captured.write_text('ready', encoding='utf-8')
         deadline = time.monotonic() + 10
         while not release.exists() and time.monotonic() < deadline:
             time.sleep(0.01)
         assert release.exists()
-    return real_replace(source, destination)
-jobs.atomic_replace = barrier
+    return result
+jobs._persist_linux_output_gc_page = barrier
 print(jobs.gc_orphaned_output(
     retention_days=0, interval_seconds=0, max_directories=20
 ))
@@ -1998,30 +2031,28 @@ import json
 import time
 from cron import jobs
 started = time.monotonic()
-try:
-    jobs.save_job_output('blocked-writer', 'must not publish unsafely')
-except TimeoutError:
-    timed_out = True
-else:
-    timed_out = False
-print(json.dumps({'elapsed': time.monotonic() - started, 'timed_out': timed_out}))
+path = jobs.save_job_output('blocked-writer', 'published safely')
+print(json.dumps({'elapsed': time.monotonic() - started, 'path': str(path)}))
 """
-        writer = subprocess.run(
+        writer = subprocess.Popen(
             [sys.executable, "-c", writer_script],
-            check=True,
             cwd=os.getcwd(),
             env=env,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=5,
         )
-        writer_report = json.loads(writer.stdout)
-        assert writer_report["elapsed"] < 1.0
-        assert writer_report["timed_out"] is True
+        time.sleep(0.25)
+        assert writer.poll() is None
         assert not (output_root / "blocked-writer").exists()
         release.write_text("go", encoding="utf-8")
         _, stderr = holder.communicate(timeout=5)
         assert holder.returncode == 0, stderr
+        stdout, stderr = writer.communicate(timeout=5)
+        assert writer.returncode == 0, stderr
+        writer_report = json.loads(stdout)
+        assert writer_report["elapsed"] >= 0.1
+        assert (Path(writer_report["path"])).read_text(encoding="utf-8") == "published safely"
 
     @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux output GC")
     def test_linux_gc_recovers_crash_tombstone(self, tmp_cron_dir, monkeypatch):
@@ -2825,11 +2856,14 @@ print(json.dumps({{"counts": counts, "removed": removed}}))
         assert not (output / "fresh-orphan").exists()
         assert not stale.exists()
 
-        marker_state = json.loads(
-            (tmp_cron_dir / "cron" / ".output-gc-state.json").read_text()
-        )
-        assert "fresh-orphan" not in marker_state["first_seen"]
-        assert "stale-orphan" not in marker_state["first_seen"]
+        with sqlite3.connect(
+            tmp_cron_dir / "cron" / "output-gc-linux.sqlite3"
+        ) as conn:
+            observed = {
+                row[0] for row in conn.execute("SELECT name FROM observations")
+            }
+        assert "fresh-orphan" not in observed
+        assert "stale-orphan" not in observed
 
     def test_gc_orphaned_output_fails_closed_on_corrupt_jobs_store(self, tmp_cron_dir):
         from cron import jobs
@@ -2873,15 +2907,21 @@ print(json.dumps({{"counts": counts, "removed": removed}}))
         os.utime(first, (old, old))
 
         assert gc_orphaned_output(retention_days=0, interval_seconds=3600) == 1
-        marker = tmp_cron_dir / "cron" / ".output-gc-state.json"
-        marker_mtime = marker.stat().st_mtime
+        marker = tmp_cron_dir / "cron" / "output-gc-linux.sqlite3"
+        with sqlite3.connect(marker) as conn:
+            last_gc_at = conn.execute(
+                "SELECT last_gc_at FROM state WHERE singleton = 1"
+            ).fetchone()[0]
 
         second = output / "second"
         second.mkdir()
         os.utime(second, (old, old))
         assert gc_orphaned_output(retention_days=0, interval_seconds=3600) == 0
         assert second.exists()
-        assert marker.stat().st_mtime == marker_mtime
+        with sqlite3.connect(marker) as conn:
+            assert conn.execute(
+                "SELECT last_gc_at FROM state WHERE singleton = 1"
+            ).fetchone()[0] == last_gc_at
 
     def test_gc_orphaned_output_eventually_scans_past_live_directories(self, tmp_cron_dir):
         from cron.jobs import gc_orphaned_output, get_cron_output_dir, save_jobs
@@ -2940,7 +2980,7 @@ print(json.dumps({{"counts": counts, "removed": removed}}))
         directory_names = {f"entry-{index:04d}" for index in range(60)}
         for name in directory_names:
             (output / name).mkdir()
-        marker = tmp_cron_dir / "cron" / ".output-gc-state.json"
+        marker = tmp_cron_dir / "cron" / "output-gc-linux.sqlite3"
         next_calls = 0
         opens = 0
         closes = 0
@@ -2974,8 +3014,14 @@ print(json.dumps({{"counts": counts, "removed": removed}}))
                 max_directories=4,
             )
             assert next_calls - calls_before <= 4
-            state = json.loads(marker.read_text(encoding="utf-8"))
-            if directory_names <= set(state["first_seen"]) and state["cookie"] == 0:
+            with sqlite3.connect(marker) as conn:
+                observed = {
+                    row[0] for row in conn.execute("SELECT name FROM observations")
+                }
+                cookie = conn.execute(
+                    "SELECT cookie FROM state WHERE singleton = 1"
+                ).fetchone()[0]
+            if directory_names <= observed and cookie == 0:
                 break
         else:
             pytest.fail("output GC did not finish one bounded directory rotation")
