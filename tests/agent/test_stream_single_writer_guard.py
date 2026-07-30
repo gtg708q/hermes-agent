@@ -38,7 +38,7 @@ def _real_agent():
 def test_claim_on_fenceless_agent_does_not_raise():
     # Regression: this is the cron crash path — the streaming helper must not
     # explode when the agent lacks _claim_stream_writer.
-    assert claim_stream_writer(_NoFenceAgent()) == 0
+    assert claim_stream_writer(_NoFenceAgent()) is None
 
 
 def test_is_current_on_fenceless_agent_is_always_current():
@@ -56,7 +56,33 @@ def test_zero_token_is_never_fenced_even_with_a_real_fence():
 
 
 def test_claim_swallows_fence_exceptions():
-    assert claim_stream_writer(_RaisingFenceAgent()) == 0
+    assert claim_stream_writer(_RaisingFenceAgent()) is None
+
+
+def test_guarded_legacy_claim_degrades_without_unsafe_claim():
+    calls = []
+
+    class LegacyAgent:
+        def _claim_stream_writer(self):
+            calls.append("claimed")
+            return 7
+
+    assert claim_stream_writer(
+        LegacyAgent(), expected_generation=3, is_valid=lambda: True
+    ) is None
+    assert calls == []
+
+
+def test_guard_rejection_remains_distinct_from_unavailable_fence():
+    class GuardedAgent:
+        def _claim_stream_writer(self, *, expected_generation, is_valid):
+            assert expected_generation == 3
+            assert is_valid() is True
+            return 0
+
+    assert claim_stream_writer(
+        GuardedAgent(), expected_generation=3, is_valid=lambda: True
+    ) == 0
 
 
 def test_is_current_swallows_fence_exceptions_as_current():

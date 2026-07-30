@@ -2579,7 +2579,11 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     # atomic compare-and-swap against a newer writer claim.
                     is_valid=_bedrock_callback_allowed,
                 )
-                if not _writer_token:
+                # ``0`` is an atomic CAS rejection and proves this worker is
+                # stale. ``None`` means a version-skewed/duck-typed agent has no
+                # compatible fence; preserve documented unfenced degradation
+                # and rely on the immutable Bedrock callback turn fence.
+                if _writer_token == 0:
                     return
 
                 def _on_text(text):

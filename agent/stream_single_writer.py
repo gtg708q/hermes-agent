@@ -59,15 +59,14 @@ def claim_stream_writer(
     *,
     expected_generation: Optional[int] = None,
     is_valid: Optional[Callable[[], bool]] = None,
-) -> int:
+) -> Optional[int]:
     """Claim the delta sink for the calling stream attempt, best-effort.
 
-    Returns the agent's monotonic writer token when the fence is available, or
-    ``0`` when the agent doesn't expose it, the claim raised, or an atomic
-    ``expected_generation`` / ``is_valid`` guard rejected the claim. Guarded
-    callers must stop on ``0``; unguarded callers retain the historical
-    best-effort behavior, where :func:`stream_writer_is_current` treats ``0`` as
-    unfenced instead of crashing the turn.
+    Returns the agent's monotonic writer token when the fence is available,
+    ``0`` when an atomic ``expected_generation`` / ``is_valid`` guard rejected
+    the claim, or ``None`` when the fence is unavailable.  The distinction is
+    important for guarded callers: rejection proves the worker is stale, while
+    an unavailable fence must preserve the historical unfenced degradation.
     """
     claim = getattr(agent, "_claim_stream_writer", None)
     if callable(claim):
@@ -80,32 +79,30 @@ def claim_stream_writer(
             )
         except TypeError:
             # Version-skewed/duck-typed agents expose the original no-argument
-            # claim. Preserve their best-effort behavior, but perform the
-            # available checks immediately before that legacy claim.
+            # claim. A guarded caller cannot safely split its validity check
+            # from that claim, because a newer writer may win between them.
+            # Degrade without claiming instead; callback-level turn fences still
+            # protect guarded paths such as Bedrock.
+            if expected_generation is not None or is_valid is not None:
+                return None
             try:
-                if is_valid is not None and not is_valid():
-                    return 0
-                if (
-                    expected_generation is not None
-                    and getattr(agent, "_stream_writer_token", expected_generation)
-                    != expected_generation
-                ):
-                    return 0
                 return int(claim())
             except Exception:
                 logger.debug(
                     "stream single-writer: legacy claim failed; proceeding unfenced",
                     exc_info=True,
                 )
+                return None
         except Exception:
             logger.debug(
                 "stream single-writer: claim failed; proceeding unfenced",
                 exc_info=True,
             )
-    return 0
+            return None
+    return None
 
 
-def stream_writer_is_current(agent: Any, token: int) -> bool:
+def stream_writer_is_current(agent: Any, token: Optional[int]) -> bool:
     """True when ``token`` is still the active writer, best-effort.
 
     A falsy token (from a claim that no-oped) or an agent without the fence
