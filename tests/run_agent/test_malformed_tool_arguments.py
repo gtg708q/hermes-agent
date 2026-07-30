@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from agent.conversation_loop import _loop_guard_reason
 from run_agent import AIAgent
 
 
@@ -39,12 +40,24 @@ def _make_agent() -> AIAgent:
     return agent
 
 
-def _tool_call(call_id: str, arguments: str):
+def _tool_call(call_id: str, arguments: str, name: str = "web_search"):
     return SimpleNamespace(
         id=call_id,
         type="function",
-        function=SimpleNamespace(name="web_search", arguments=arguments),
+        function=SimpleNamespace(name=name, arguments=arguments),
     )
+
+
+def _execute_malformed_calls(dispatch_mode: str, calls: list) -> list[dict]:
+    agent = _make_agent()
+    messages = []
+    with patch(
+        "agent.tool_executor.maybe_persist_tool_result",
+        side_effect=lambda **kwargs: kwargs["content"],
+    ):
+        execute = getattr(agent, f"_execute_tool_calls_{dispatch_mode}")
+        execute(SimpleNamespace(content="", tool_calls=calls), messages, "task-1")
+    return messages
 
 
 @pytest.mark.parametrize("dispatch_mode", ["sequential", "concurrent"])
@@ -96,3 +109,66 @@ def test_malformed_arguments_are_rejected_without_blocking_valid_sibling(
     assert '"error": "Invalid tool arguments"' in messages[0]["content"]
     assert "JSON object" in messages[0]["content"]
     assert json.loads(messages[1]["content"]) == {"ok": "valid"}
+
+
+@pytest.mark.parametrize("dispatch_mode", ["sequential", "concurrent"])
+def test_distinct_malformed_calls_have_distinct_loop_guard_signatures(dispatch_mode: str):
+    messages = _execute_malformed_calls(
+        dispatch_mode,
+        [
+            _tool_call("call-a", '{"query":"alpha"', "web_search"),
+            _tool_call("call-b", '{"query":"beta"', "web_extract"),
+        ],
+    )
+    agent = SimpleNamespace(
+        max_wall_clock_seconds=0,
+        repeated_tool_error_limit=2,
+        no_progress_tool_limit=0,
+    )
+
+    assert messages[0]["_tool_execution_signature"] != messages[1]["_tool_execution_signature"]
+    assert _loop_guard_reason(agent, messages, 0) is None
+
+
+@pytest.mark.parametrize("dispatch_mode", ["sequential", "concurrent"])
+def test_repeated_malformed_call_triggers_repeated_error_guard(dispatch_mode: str):
+    raw_arguments = '{"query":"same"'
+    messages = _execute_malformed_calls(
+        dispatch_mode,
+        [
+            _tool_call("call-a", raw_arguments),
+            _tool_call("call-b", raw_arguments),
+        ],
+    )
+    agent = SimpleNamespace(
+        max_wall_clock_seconds=0,
+        repeated_tool_error_limit=2,
+        no_progress_tool_limit=0,
+    )
+
+    assert messages[0]["_tool_execution_signature"] == messages[1]["_tool_execution_signature"]
+    assert _loop_guard_reason(agent, messages, 0) == "repeated_tool_error_limit_reached"
+
+
+@pytest.mark.parametrize("dispatch_mode", ["sequential", "concurrent"])
+def test_malformed_argument_secret_is_only_used_in_opaque_signature(
+    dispatch_mode: str,
+    caplog: pytest.LogCaptureFixture,
+    capsys: pytest.CaptureFixture[str],
+):
+    secret = "sk-malformed-secret-should-not-leak"
+    first = _execute_malformed_calls(
+        dispatch_mode,
+        [_tool_call("call-secret", f'{{"api_key":"{secret}"')],
+    )[0]
+    second = _execute_malformed_calls(
+        dispatch_mode,
+        [_tool_call("call-other", '{"api_key":"different-secret"')],
+    )[0]
+
+    captured = capsys.readouterr()
+    assert first["_tool_execution_signature"] != second["_tool_execution_signature"]
+    assert secret not in json.dumps(first)
+    assert secret not in caplog.text
+    assert secret not in captured.out
+    assert secret not in captured.err

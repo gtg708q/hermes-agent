@@ -524,6 +524,7 @@ def _execute_tool_calls_concurrent_inline(agent, assistant_message, messages: li
 
     # ── Parse args + pre-execution bookkeeping ───────────────────────
     parsed_calls = []  # list of (tool_call, function_name, function_args, middleware_trace, block_result, blocked_by_guardrail)
+    malformed_execution_signatures: dict[int, str] = {}
     for tool_call in tool_calls:
         function_name = tool_call.function.name
 
@@ -532,6 +533,11 @@ def _execute_tool_calls_concurrent_inline(agent, assistant_message, messages: li
         )
 
         if malformed_args_result is not None:
+            malformed_execution_signatures[id(tool_call)] = _tool_execution_signature(
+                function_name,
+                tool_call.function.arguments,
+                malformed_args_result,
+            )
             parsed_calls.append(
                 (
                     tool_call,
@@ -1140,7 +1146,9 @@ def _execute_tool_calls_concurrent_inline(agent, assistant_message, messages: li
             if blocked:
                 effect_disposition = "none"
 
-            _execution_signature = _tool_execution_signature(
+            _execution_signature = malformed_execution_signatures.get(
+                id(tc)
+            ) or _tool_execution_signature(
                 function_name, function_args, function_result
             )
             if not blocked:
@@ -1358,12 +1366,18 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_call.function.arguments
         )
         if malformed_args_result is not None:
+            execution_signature = _tool_execution_signature(
+                function_name,
+                tool_call.function.arguments,
+                malformed_args_result,
+            )
             messages.append(
                 make_tool_result_message(
                     function_name,
                     malformed_args_result,
                     tool_call.id,
                     execution_status="error",
+                    execution_signature=execution_signature,
                 )
             )
             if not _flush_session_db_after_tool_progress(
