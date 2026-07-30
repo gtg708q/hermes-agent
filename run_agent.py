@@ -5565,7 +5565,12 @@ class AIAgent:
         if not hasattr(self, "_stream_writer_dropped"):
             self._stream_writer_dropped = 0
 
-    def _claim_stream_writer(self) -> int:
+    def _claim_stream_writer(
+        self,
+        *,
+        expected_generation: Optional[int] = None,
+        is_valid: Optional[Callable[[], bool]] = None,
+    ) -> int:
         """Claim exclusive ownership of the streaming delta sink for the calling
         stream attempt and return its monotonic writer token (#65991).
 
@@ -5579,9 +5584,21 @@ class AIAgent:
         """
         self._ensure_stream_writer_state()
         with self._stream_writer_lock:
+            # Bedrock opens its socket before claiming the callback sink. A
+            # timed-out worker may therefore arrive here after a newer turn or
+            # retry already claimed. Check immutable validity and CAS the writer
+            # generation under this same lock so the stale worker cannot bump
+            # the token and supersede the current stream.
+            if (
+                expected_generation is not None
+                and self._stream_writer_token != expected_generation
+            ):
+                return 0
+            if is_valid is not None and not is_valid():
+                return 0
             self._stream_writer_token += 1
             token = self._stream_writer_token
-        self._stream_writer_tls.token = token
+            self._stream_writer_tls.token = token
         return token
 
     def _stream_writer_is_current(self, token: int) -> bool:

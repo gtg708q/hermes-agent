@@ -16,6 +16,7 @@ from unittest.mock import patch
 import pytest
 
 from agent import chat_completion_helpers as cch
+from agent.stream_single_writer import claim_stream_writer as real_claim_stream_writer
 
 
 class _FakeAgent:
@@ -167,3 +168,106 @@ def test_bedrock_deadline_fences_worker_before_late_stream_writer_claim():
 
     assert claims == []
     stream_callbacks.assert_not_called()
+
+
+def test_bedrock_old_turn_cannot_reclaim_writer_after_new_turn_streams():
+    agent = _FakeAgent()
+    agent._current_turn_id = "old-turn"
+    agent._stream_writer_lock = threading.Lock()
+    agent._stream_writer_token = 0
+    agent._stream_writer_tls = threading.local()
+    delivered = []
+    agent.stream_delta_callback = delivered.append
+    agent._has_stream_consumers = lambda: True
+
+    def _claim(*, expected_generation=None, is_valid=None):
+        with agent._stream_writer_lock:
+            if (
+                expected_generation is not None
+                and agent._stream_writer_token != expected_generation
+            ):
+                return 0
+            if is_valid is not None and not is_valid():
+                return 0
+            agent._stream_writer_token += 1
+            token = agent._stream_writer_token
+            agent._stream_writer_tls.token = token
+            return token
+
+    def _fire_stream_delta(text):
+        if agent._stream_writer_tls.token == agent._stream_writer_token:
+            delivered.append(text)
+
+    agent._claim_stream_writer = _claim
+    agent._fire_stream_delta = _fire_stream_delta
+
+    old_at_claim_boundary = threading.Event()
+    resume_old = threading.Event()
+    old_error = []
+
+    def _claim_with_old_pause(claim_agent, **kwargs):
+        if threading.current_thread().name == "old-bedrock-provider-worker":
+            old_at_claim_boundary.set()
+            assert resume_old.wait(timeout=2)
+        return real_claim_stream_writer(claim_agent, **kwargs)
+
+    def _stream_response(raw_response, **kwargs):
+        kwargs["on_text_delta"](raw_response["label"])
+        return SimpleNamespace(choices=[], usage=None, stop_reason="end_turn")
+
+    def _run_old_turn():
+        try:
+            cch.interruptible_streaming_api_call(
+                agent,
+                {
+                    "modelId": "old",
+                    "__bedrock_region__": "us-east-1",
+                    "__bedrock_converse__": True,
+                },
+            )
+        except BaseException as exc:
+            old_error.append(exc)
+
+    def _converse_stream(**kwargs):
+        if kwargs["modelId"] == "old":
+            threading.current_thread().name = "old-bedrock-provider-worker"
+        return {"label": kwargs["modelId"]}
+
+    fake_client = SimpleNamespace(converse_stream=_converse_stream)
+    with patch("agent.bedrock_adapter._get_bedrock_runtime_client", return_value=fake_client), \
+         patch("agent.bedrock_adapter.stream_converse_with_callbacks", side_effect=_stream_response), \
+         patch("agent.bedrock_adapter.is_stale_connection_error", return_value=False), \
+         patch("agent.bedrock_adapter.is_streaming_access_denied_error", return_value=False), \
+         patch("agent.bedrock_adapter.invalidate_runtime_client", lambda *a, **k: None), \
+         patch("agent.chat_completion_helpers.claim_stream_writer", side_effect=_claim_with_old_pause):
+        # Start the deadline only after importing/patching the optional Bedrock
+        # adapter, so a first-run lazy dependency install cannot consume it.
+        agent._turn_deadline_monotonic = time.monotonic() + 0.05
+        old_turn = threading.Thread(target=_run_old_turn)
+        old_turn.start()
+        assert old_at_claim_boundary.wait(timeout=2)
+
+        # Let the immutable old deadline expire, then roll the cached agent to a
+        # new turn and let that turn claim and stream before the old worker runs.
+        time.sleep(0.06)
+        old_turn.join(timeout=1)
+        assert not old_turn.is_alive()
+        agent._current_turn_id = "new-turn"
+        agent._turn_deadline_monotonic = time.monotonic() + 30
+        new_response = cch.interruptible_streaming_api_call(
+            agent,
+            {
+                "modelId": "new",
+                "__bedrock_region__": "us-east-1",
+                "__bedrock_converse__": True,
+            },
+        )
+        new_writer_token = agent._stream_writer_token
+
+        resume_old.set()
+        time.sleep(0.1)
+
+    assert old_error and "wall_clock_budget_reached" in str(old_error[0])
+    assert new_response.stop_reason == "end_turn"
+    assert delivered == ["new"]
+    assert agent._stream_writer_token == new_writer_token

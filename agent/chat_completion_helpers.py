@@ -38,7 +38,11 @@ from agent.message_sanitization import (
     _sanitize_surrogates,
     _repair_tool_call_arguments,
 )
-from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
+from agent.stream_single_writer import (
+    claim_stream_writer,
+    stream_writer_generation,
+    stream_writer_is_current,
+)
 from tools.terminal_tool import is_persistent_env
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 
@@ -2470,10 +2474,21 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # late worker must not consult agent state that now belongs to a newer
         # turn.
         _bedrock_origin_deadline = getattr(agent, "_turn_deadline_monotonic", None)
+        _bedrock_origin_turn_id = getattr(agent, "_current_turn_id", None)
+        # Immutable CAS generation captured before the provider worker opens its
+        # socket. A newer retry/turn claim changes this generation; the old
+        # worker must then fail its claim instead of superseding that writer.
+        _bedrock_origin_writer_generation = stream_writer_generation(agent)
         _bedrock_callback_fence = threading.Event()
 
         def _bedrock_callback_allowed() -> bool:
             if _bedrock_callback_fence.is_set():
+                return False
+            if (
+                _bedrock_origin_turn_id is not None
+                and getattr(agent, "_current_turn_id", None)
+                != _bedrock_origin_turn_id
+            ):
                 return False
             return not (
                 isinstance(_bedrock_origin_deadline, (int, float))
@@ -2556,9 +2571,16 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # The socket call above can unblock after this turn already
                 # expired. Never let that stale worker supersede a newer turn's
                 # writer token before its callback fence gets a chance to run.
-                if not _bedrock_callback_allowed():
+                _writer_token = claim_stream_writer(
+                    agent,
+                    expected_generation=_bedrock_origin_writer_generation,
+                    # AIAgent evaluates this under _stream_writer_lock, making
+                    # the immutable turn/deadline check and token bump one
+                    # atomic compare-and-swap against a newer writer claim.
+                    is_valid=_bedrock_callback_allowed,
+                )
+                if not _writer_token:
                     return
-                claim_stream_writer(agent)
 
                 def _on_text(text):
                     if not _bedrock_callback_allowed():
