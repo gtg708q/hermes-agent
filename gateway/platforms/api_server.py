@@ -6374,6 +6374,7 @@ class APIServerAdapter(BasePlatformAdapter):
     _RUN_OWNER_LEASE_SECONDS = 30.0
     _RUN_OWNER_HEARTBEAT_SECONDS = 10.0
     _RUN_TERMINAL_WRITE_RETRY_SECONDS = 0.1
+    _RUN_TERMINAL_STATUSES = frozenset({"completed", "failed", "cancelled"})
 
     def _set_run_status(
         self,
@@ -6385,7 +6386,7 @@ class APIServerAdapter(BasePlatformAdapter):
     ) -> Dict[str, Any]:
         """Update pollable run status without exposing private agent objects."""
         now = time.time()
-        current = self._run_statuses.get(run_id, {})
+        current = dict(self._run_statuses.get(run_id, {}))
         current.update({
             "object": "hermes.run",
             "run_id": run_id,
@@ -6394,7 +6395,6 @@ class APIServerAdapter(BasePlatformAdapter):
         })
         current.setdefault("created_at", fields.pop("created_at", now))
         current.update(fields)
-        self._run_statuses[run_id] = current
         try:
             persisted = self._response_store.put_run_status(
                 run_id,
@@ -6408,6 +6408,7 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.exception("Failed to persist durable run status for %s", run_id)
             if _require_persisted:
                 raise
+        self._run_statuses[run_id] = current
         return current
 
     def _evict_lost_run_owner_cache(self, run_id: str, generation: str) -> bool:
@@ -6838,6 +6839,12 @@ class APIServerAdapter(BasePlatformAdapter):
                 ):
                     q.put_nowait(event)
 
+        def _close_stream_if_current() -> None:
+            """Close this generation's queue even after durable ownership loss."""
+            with self._run_owner_state_lock:
+                if self._run_streams.get(run_id) is q:
+                    q.put_nowait(None)
+
         # Also wire stream_delta_callback so message.delta events flow through.
         def _text_cb(delta: Optional[str]) -> None:
             if delta is None:
@@ -6910,16 +6917,16 @@ class APIServerAdapter(BasePlatformAdapter):
                 lease_heartbeat = asyncio.get_running_loop().create_task(_renew_owner_lease())
                 self._set_run_status(run_id, "running", _require_persisted=True)
                 if run_id in self._stopping_run_ids:
-                    _put_event_if_active({
-                        "event": "run.cancelled",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                    })
                     await _set_owned_terminal(
                         run_id,
                         "cancelled",
                         last_event="run.cancelled",
                     )
+                    _put_event_if_active({
+                        "event": "run.cancelled",
+                        "run_id": run_id,
+                        "timestamp": time.time(),
+                    })
                     return
                 with self._profile_scope(request_profile):
                     agent = self._create_agent(
@@ -7051,42 +7058,35 @@ class APIServerAdapter(BasePlatformAdapter):
                     # but it must emit no terminal event or status write.
                     return
                 if run_id in self._stopping_run_ids:
-                    _put_event_if_active({
-                        "event": "run.cancelled",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                    })
                     await _set_owned_terminal(
                         run_id,
                         "cancelled",
                         last_event="run.cancelled",
                     )
+                    _put_event_if_active({
+                        "event": "run.cancelled",
+                        "run_id": run_id,
+                        "timestamp": time.time(),
+                    })
                 # Check for structured failure (non-retryable client errors like
                 # 401/400 return failed=True instead of raising, so the except
                 # block below never fires — issue #15561).
                 elif isinstance(result, dict) and result.get("failed"):
                     error_msg = _redact_api_error_text(result.get("error") or "agent run failed")
-                    _put_event_if_active({
-                        "event": "run.failed",
-                        "run_id": run_id,
-                        "timestamp": time.time(),
-                        "error": error_msg,
-                    })
                     await _set_owned_terminal(
                         run_id,
                         "failed",
                         error=error_msg,
                         last_event="run.failed",
                     )
-                else:
-                    final_response = result.get("final_response", "") if isinstance(result, dict) else ""
                     _put_event_if_active({
-                        "event": "run.completed",
+                        "event": "run.failed",
                         "run_id": run_id,
                         "timestamp": time.time(),
-                        "output": final_response,
-                        "usage": usage,
+                        "error": error_msg,
                     })
+                else:
+                    final_response = result.get("final_response", "") if isinstance(result, dict) else ""
                     await _set_owned_terminal(
                         run_id,
                         "completed",
@@ -7094,6 +7094,13 @@ class APIServerAdapter(BasePlatformAdapter):
                         usage=usage,
                         last_event="run.completed",
                     )
+                    _put_event_if_active({
+                        "event": "run.completed",
+                        "run_id": run_id,
+                        "timestamp": time.time(),
+                        "output": final_response,
+                        "usage": usage,
+                    })
             except asyncio.CancelledError:
                 if ownership_lost:
                     # The heartbeat proved this executor no longer owns the
@@ -7182,7 +7189,7 @@ class APIServerAdapter(BasePlatformAdapter):
                     pass
                 # Sentinel: signal SSE stream to close
                 try:
-                    _put_event_if_active(None)
+                    _close_stream_if_current()
                 except Exception:
                     pass
                 self._active_run_agents.pop(run_id, None)
@@ -7426,15 +7433,77 @@ class APIServerAdapter(BasePlatformAdapter):
                 _openai_error(f"Run not found: {run_id}", code="run_not_found"),
                 status=404,
             )
-        agent = self._active_run_agents.get(run_id)
-        task = self._active_run_tasks.get(run_id)
+        with self._run_owner_state_lock:
+            local_status = self._run_statuses.get(run_id)
+            try:
+                durable_status = self._response_store.get_run_status(
+                    run_id, profile=request_profile
+                )
+            except Exception as exc:
+                logger.exception("Failed to read durable run status before stopping %s", run_id)
+                if (
+                    local_status is not None
+                    and local_status.get("status") in self._RUN_TERMINAL_STATUSES
+                ):
+                    durable_status = None
+                else:
+                    return web.json_response(
+                        _openai_error(
+                            f"Unable to verify run state before stopping: {exc}",
+                            code="run_store_unavailable",
+                        ),
+                        status=503,
+                    )
 
-        if agent is None and task is None:
-            return web.json_response(_openai_error(f"Run not found: {run_id}", code="run_not_found"), status=404)
+            terminal_status = next(
+                (
+                    status
+                    for status in (durable_status, local_status)
+                    if status is not None
+                    and status.get("status") in self._RUN_TERMINAL_STATUSES
+                ),
+                None,
+            )
+            if terminal_status is not None:
+                self._run_statuses[run_id] = terminal_status
+                return web.json_response(terminal_status)
 
-        if run_id in self._run_owner_generations:
-            self._set_run_status(run_id, "stopping", last_event="run.stopping")
-            self._stopping_run_ids.add(run_id)
+            agent = self._active_run_agents.get(run_id)
+            task = self._active_run_tasks.get(run_id)
+            owner_generation = self._run_owner_generations.get(run_id)
+            if agent is None and task is None:
+                return web.json_response(
+                    _openai_error(f"Run not found: {run_id}", code="run_not_found"),
+                    status=404,
+                )
+
+            if owner_generation is not None:
+                try:
+                    self._set_run_status(
+                        run_id,
+                        "stopping",
+                        _require_persisted=True,
+                        last_event="run.stopping",
+                    )
+                except Exception:
+                    authoritative = self._response_store.get_run_status(
+                        run_id, profile=request_profile
+                    )
+                    if (
+                        authoritative is not None
+                        and authoritative.get("status") in self._RUN_TERMINAL_STATUSES
+                    ):
+                        self._run_statuses[run_id] = authoritative
+                        return web.json_response(authoritative)
+                    self._evict_lost_run_owner_cache(run_id, owner_generation)
+                    return web.json_response(
+                        _openai_error(
+                            "Run ownership was lost before the stop transition.",
+                            code="run_ownership_lost",
+                        ),
+                        status=409,
+                    )
+                self._stopping_run_ids.add(run_id)
 
         if agent is not None:
             try:

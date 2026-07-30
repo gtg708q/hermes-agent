@@ -1098,6 +1098,7 @@ class TestStartRun:
         app = _create_runs_app(adapter)
         original_put = adapter._response_store.put_run_status
         terminal_attempts = 0
+        successor_error = "successor durably failed"
 
         def _lose_terminal_write(run_id, status, **kwargs):
             nonlocal terminal_attempts
@@ -1105,6 +1106,32 @@ class TestStartRun:
                 terminal_attempts += 1
                 return False
             return original_put(run_id, status, **kwargs)
+
+        def _successor_terminalizes(run_id, *_args, **_kwargs):
+            store = adapter._response_store
+            successor_status = {
+                **store.get_run_status(run_id),
+                "status": "failed",
+                "error": successor_error,
+                "last_event": "run.failed",
+            }
+            now = time.time()
+            with store._lock:
+                store._conn.execute(
+                    """UPDATE run_idempotency
+                       SET status_json = ?, updated_at = ?, terminal_at = ?,
+                           owner_id = ?, lease_expires_at = NULL
+                       WHERE run_id = ?""",
+                    (
+                        json.dumps(successor_status, sort_keys=True),
+                        now,
+                        now,
+                        "successor-owner",
+                        run_id,
+                    ),
+                )
+                store._conn.commit()
+            return False
 
         with (
             patch.object(
@@ -1115,7 +1142,7 @@ class TestStartRun:
             patch.object(
                 adapter._response_store,
                 "renew_run_lease",
-                return_value=False,
+                side_effect=_successor_terminalizes,
             ) as renew_lease,
             patch.object(adapter, "_create_agent") as create_agent,
         ):
@@ -1129,11 +1156,22 @@ class TestStartRun:
             async with TestClient(TestServer(app)) as cli:
                 response = await cli.post("/v1/runs", json={"input": "hello"})
                 run_id = (await response.json())["run_id"]
+                queue = adapter._run_streams[run_id]
                 task = adapter._active_run_tasks[run_id]
                 await asyncio.wait_for(task, timeout=1)
 
+                status_response = await cli.get(f"/v1/runs/{run_id}")
+                status_payload = await status_response.json()
+
         assert terminal_attempts == 1
         renew_lease.assert_called_once()
+        assert status_response.status == 200
+        assert status_payload["status"] == "failed"
+        assert status_payload["error"] == successor_error
+        queued = []
+        while not queue.empty():
+            queued.append(queue.get_nowait())
+        assert queued == [None]
         assert run_id not in adapter._active_run_tasks
         assert run_id not in adapter._active_run_agents
         assert run_id not in adapter._run_approval_sessions
@@ -2319,6 +2357,67 @@ class TestRunLifecycleSweep:
 
 class TestStopRun:
     @pytest.mark.asyncio
+    async def test_stop_cannot_overwrite_terminal_status_during_cleanup(self, adapter):
+        app = _create_runs_app(adapter)
+        terminal_persisted = asyncio.Event()
+        allow_cleanup = asyncio.Event()
+        original_set_terminal = adapter._set_terminal_run_status
+
+        async def _pause_after_terminal_persistence(*args, **kwargs):
+            status = await original_set_terminal(*args, **kwargs)
+            terminal_persisted.set()
+            await allow_cleanup.wait()
+            return status
+
+        with (
+            patch.object(
+                adapter,
+                "_set_terminal_run_status",
+                side_effect=_pause_after_terminal_persistence,
+            ),
+            patch.object(adapter, "_create_agent") as create_agent,
+        ):
+            agent = MagicMock()
+            agent.run_conversation.return_value = {"final_response": "done"}
+            agent.session_prompt_tokens = 0
+            agent.session_completion_tokens = 0
+            agent.session_total_tokens = 0
+            create_agent.return_value = agent
+
+            async with TestClient(TestServer(app)) as cli:
+                response = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await response.json())["run_id"]
+                queue = adapter._run_streams[run_id]
+                await asyncio.wait_for(terminal_persisted.wait(), timeout=1)
+
+                assert run_id in adapter._active_run_tasks
+                assert queue.empty()
+                stop_response = await cli.post(f"/v1/runs/{run_id}/stop")
+                stop_payload = await stop_response.json()
+                status_response = await cli.get(f"/v1/runs/{run_id}")
+                status_payload = await status_response.json()
+
+                assert stop_response.status == 200
+                assert stop_payload["status"] == "completed"
+                assert status_payload["status"] == "completed"
+                agent.interrupt.assert_not_called()
+
+                allow_cleanup.set()
+                await asyncio.wait_for(adapter._active_run_tasks[run_id], timeout=1)
+
+        terminal_events = []
+        while not queue.empty():
+            event = queue.get_nowait()
+            if event is not None and event["event"] in {
+                "run.completed",
+                "run.failed",
+                "run.cancelled",
+            }:
+                terminal_events.append(event)
+        assert [event["event"] for event in terminal_events] == ["run.completed"]
+        assert adapter._response_store.get_run_status(run_id)["status"] == "completed"
+
+    @pytest.mark.asyncio
     async def test_stop_before_agent_creation_prevents_run_start(self, adapter):
         """A stop accepted while queued must prevent agent construction."""
         app = _create_runs_app(adapter)
@@ -2457,8 +2556,8 @@ class TestStopRun:
         assert resp.status == 401
 
     @pytest.mark.asyncio
-    async def test_stop_already_completed_run_returns_404(self, adapter):
-        """Stopping a run that already finished should return 404 (refs cleaned up)."""
+    async def test_stop_already_completed_run_returns_terminal_status(self, adapter):
+        """Stopping a finished run idempotently returns its terminal status."""
         app = _create_runs_app(adapter)
         async with TestClient(TestServer(app)) as cli:
             with patch.object(adapter, "_create_agent") as mock_create:
@@ -2480,9 +2579,14 @@ class TestStopRun:
                 # Run should be done, refs cleaned up
                 assert run_id not in adapter._active_run_agents
 
-                # Stop should return 404
+                # Force the endpoint to consult durable state after local cleanup.
+                adapter._run_statuses.pop(run_id, None)
+
+                # Stop must not replace the durable terminal status with stopping.
                 stop_resp = await cli.post(f"/v1/runs/{run_id}/stop")
-                assert stop_resp.status == 404
+                stop_payload = await stop_resp.json()
+                assert stop_resp.status == 200
+                assert stop_payload["status"] == "completed"
 
     @pytest.mark.asyncio
     async def test_stop_interrupt_exception_does_not_crash(self, adapter):
