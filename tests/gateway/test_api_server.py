@@ -1179,6 +1179,8 @@ class TestHealthDetailedEndpoint:
                 assert data["gateway_drainable"] is True
                 assert isinstance(data["pid"], int)
                 assert "updated_at" in data
+                assert data["runtime_resources"]["threads"] >= 1
+                assert data["runtime_resources"]["tool_workers"]["capacity_in_use"] >= 0
 
     @pytest.mark.asyncio
     async def test_health_detailed_no_runtime_status(self, adapter):
@@ -1205,6 +1207,7 @@ class TestHealthDetailedEndpoint:
             async with TestClient(TestServer(app)) as cli:
                 resp = await cli.get("/health/detailed")
                 assert resp.status == 401
+                assert "runtime_resources" not in await resp.json()
 
     @pytest.mark.asyncio
     async def test_health_detailed_allows_authenticated_request(self, auth_adapter):

@@ -222,9 +222,11 @@ answered after it). Slow servers that haven't re-checked yet result
 in "no data" for that edit — never in yesterday's errors being
 re-reported as current.
 
-Servers are kept alive for the life of the Hermes process. There's
-no idle-timeout reaper — the cost of restarting the server's index
-on every write would be far higher than holding the daemon.
+Servers are reused while active, reaped after `lsp.idle_timeout` seconds
+(10 minutes by default), and bounded by `lsp.max_clients` (8 by default).
+Busy clients are leased for the duration of an edit check and are never reaped
+mid-request. When every client is busy or recently used at the cap, the new
+workspace falls back to the in-process syntax check for that edit.
 
 ## Disabling
 

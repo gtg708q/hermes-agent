@@ -1953,7 +1953,7 @@ class ShellFileOperations(FileOperations):
         if svc is None:
             return False
         try:
-            return bool(svc.enabled_for(path))
+            return bool(svc.available_for(path))
         except Exception:  # noqa: BLE001
             return False
 

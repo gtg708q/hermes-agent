@@ -35,6 +35,7 @@ in-process syntax check.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import threading
@@ -59,6 +60,7 @@ from agent.lsp.workspace import (
 logger = logging.getLogger("agent.lsp.manager")
 
 DEFAULT_IDLE_TIMEOUT = 600  # seconds; servers idle for >10min get reaped
+DEFAULT_MAX_CLIENTS = 8
 
 
 class _BackgroundLoop:
@@ -155,6 +157,7 @@ class LSPService:
         init_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
         disabled_servers: Optional[List[str]] = None,
         idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
+        max_clients: int = DEFAULT_MAX_CLIENTS,
     ) -> None:
         self._enabled = enabled
         self._wait_mode = wait_mode if wait_mode in {"document", "full"} else "document"
@@ -164,24 +167,29 @@ class LSPService:
         self._env_overrides = env_overrides or {}
         self._init_overrides = init_overrides or {}
         self._disabled_servers = set(disabled_servers or [])
-        self._idle_timeout = idle_timeout
-
-        self._loop = _BackgroundLoop()
-        if self._enabled:
-            self._loop.start()
+        self._idle_timeout = max(0.0, float(idle_timeout))
+        self._max_clients = max(1, int(max_clients))
 
         # Per-(server_id, workspace_root) state
         self._clients: Dict[Tuple[str, str], LSPClient] = {}
         self._broken: set = set()
         self._spawning: Dict[Tuple[str, str], asyncio.Future] = {}
         self._last_used: Dict[Tuple[str, str], float] = {}
+        self._client_leases: Dict[Tuple[str, str], int] = {}
         self._state_lock = threading.Lock()
+        self._idle_reaper_task: Optional[asyncio.Task] = None
 
         # Delta baseline: file path → snapshot of diagnostics taken
         # immediately before a write.  ``get_diagnostics_sync`` filters
         # out anything in the baseline so the agent only sees errors
         # introduced by the current edit.
         self._delta_baseline: Dict[str, List[Dict[str, Any]]] = {}
+
+        self._loop = _BackgroundLoop()
+        if self._enabled:
+            self._loop.start()
+            if self._idle_timeout > 0:
+                self._loop.run(self._start_idle_reaper(), timeout=2.0)
 
     @classmethod
     def create_from_config(cls) -> Optional["LSPService"]:
@@ -205,6 +213,15 @@ class LSPService:
         wait_mode = lsp_cfg.get("wait_mode", "document")
         wait_timeout = float(lsp_cfg.get("wait_timeout", DIAGNOSTICS_DOCUMENT_WAIT))
         install_strategy = lsp_cfg.get("install_strategy", "auto")
+        try:
+            idle_timeout = float(lsp_cfg.get("idle_timeout", DEFAULT_IDLE_TIMEOUT))
+            idle_timeout = 0.0 if idle_timeout <= 0 else min(max(idle_timeout, 30.0), 86400.0)
+        except (TypeError, ValueError):
+            idle_timeout = DEFAULT_IDLE_TIMEOUT
+        try:
+            max_clients = max(1, min(int(lsp_cfg.get("max_clients", DEFAULT_MAX_CLIENTS)), 128))
+        except (TypeError, ValueError):
+            max_clients = DEFAULT_MAX_CLIENTS
         servers_cfg = lsp_cfg.get("servers") or {}
         disabled = []
         binary_overrides: Dict[str, List[str]] = {}
@@ -235,6 +252,8 @@ class LSPService:
             env_overrides=env_overrides,
             init_overrides=init_overrides,
             disabled_servers=disabled,
+            idle_timeout=idle_timeout,
+            max_clients=max_clients,
         )
 
     # ------------------------------------------------------------------
@@ -277,6 +296,31 @@ class LSPService:
         if (srv.server_id, per_server_root) in self._broken:
             return False
         return True
+
+    def available_for(self, file_path: str) -> bool:
+        """Return whether this file can use LSP without exceeding capacity.
+
+        This is a conservative, non-spawning probe for the syntax-linter
+        fallback. Existing and already-spawning workspace clients remain
+        eligible; a new workspace at capacity must keep the shell linter.
+        """
+        if not self.enabled_for(file_path):
+            return False
+        srv = find_server_for_file(file_path)
+        if srv is None:
+            return False
+        ws_root, gated = resolve_workspace_for_file(file_path)
+        if not (ws_root and gated):
+            return False
+        try:
+            per_server_root = srv.resolve_root(file_path, ws_root) or ws_root
+        except Exception:  # noqa: BLE001
+            per_server_root = ws_root
+        key = (srv.server_id, per_server_root)
+        with self._state_lock:
+            if key in self._clients or key in self._spawning:
+                return True
+            return len(set(self._clients) | set(self._spawning)) < self._max_clients
 
     def snapshot_baseline(self, file_path: str) -> None:
         """Snapshot current diagnostics for ``file_path`` as the delta baseline.
@@ -434,6 +478,8 @@ class LSPService:
         # ``_clients`` with a half-initialized state.
         with self._state_lock:
             client = self._clients.pop(key, None)
+            self._last_used.pop(key, None)
+            self._client_leases.pop(key, None)
         if client is not None:
             try:
                 # Fire-and-forget shutdown — give it a second to cleanup,
@@ -470,11 +516,9 @@ class LSPService:
         except Exception as e:  # noqa: BLE001
             logger.debug("snapshot open/wait failed: %s", e)
             return []
-        self._last_used[(client.server_id, client.workspace_root)] = time.time()
+        finally:
+            self._release_client_lease((client.server_id, client.workspace_root))
         if not fresh:
-            # No fresh data for the pre-edit content — an empty baseline
-            # is safe: worst case the delta filter removes less, never
-            # more.  Never seed the baseline from stale stores.
             return []
         return list(client.diagnostics_for(file_path, fresh_only=True))
 
@@ -499,7 +543,8 @@ class LSPService:
         except Exception as e:  # noqa: BLE001
             logger.debug("open/wait failed for %s: %s", file_path, e)
             return None
-        self._last_used[(client.server_id, client.workspace_root)] = time.time()
+        finally:
+            self._release_client_lease((client.server_id, client.workspace_root))
         if not fresh:
             return None
         return list(client.diagnostics_for(file_path, fresh_only=True))
@@ -510,10 +555,16 @@ class LSPService:
         if not (ws and gated and srv):
             return []
         with self._state_lock:
-            client = self._clients.get((srv.server_id, ws))
+            key = (srv.server_id, ws)
+            client = self._clients.get(key)
+            if client is not None:
+                self._client_leases[key] = self._client_leases.get(key, 0) + 1
         if client is None:
             return []
-        return list(client.diagnostics_for(file_path, fresh_only=True))
+        try:
+            return list(client.diagnostics_for(file_path, fresh_only=True))
+        finally:
+            self._release_client_lease(key)
 
     async def _get_or_spawn(self, file_path: str) -> Optional[LSPClient]:
         srv = find_server_for_file(file_path)
@@ -536,23 +587,72 @@ class LSPService:
         key = (srv.server_id, per_server_root)
         if key in self._broken:
             return None
+        dead_client = None
         with self._state_lock:
             client = self._clients.get(key)
             if client is not None and client.is_running:
+                self._client_leases[key] = self._client_leases.get(key, 0) + 1
+                self._last_used[key] = time.time()
                 eventlog.log_active(srv.server_id, per_server_root)
                 return client
+            if client is not None:
+                dead_client = self._clients.pop(key, None)
+                self._last_used.pop(key, None)
+                self._client_leases.pop(key, None)
             spawning = self._spawning.get(key)
+        if dead_client is not None:
+            await self._shutdown_client(dead_client)
         if spawning is not None:
             try:
-                return await spawning
+                client = await spawning
+                if client is not None:
+                    with self._state_lock:
+                        self._client_leases[key] = self._client_leases.get(key, 0) + 1
+                        self._last_used[key] = time.time()
+                return client
             except Exception:  # noqa: BLE001
                 return None
 
-        # Begin spawn
+        await self._reap_idle_clients()
         loop = asyncio.get_running_loop()
-        spawn_future: asyncio.Future = loop.create_future()
+        spawn_future: Optional[asyncio.Future] = None
         with self._state_lock:
-            self._spawning[key] = spawn_future
+            client = self._clients.get(key)
+            if client is not None and client.is_running:
+                self._client_leases[key] = self._client_leases.get(key, 0) + 1
+                self._last_used[key] = time.time()
+            else:
+                client = None
+            spawning = self._spawning.get(key)
+            at_capacity = (
+                len(set(self._clients) | set(self._spawning)) >= self._max_clients
+            )
+            if client is None and spawning is None and not at_capacity:
+                spawn_future = loop.create_future()
+                self._spawning[key] = spawn_future
+        if client is not None:
+            eventlog.log_active(srv.server_id, per_server_root)
+            return client
+        if spawning is not None:
+            try:
+                client = await spawning
+                if client is not None:
+                    with self._state_lock:
+                        self._client_leases[key] = self._client_leases.get(key, 0) + 1
+                        self._last_used[key] = time.time()
+                return client
+            except Exception:  # noqa: BLE001
+                return None
+        if spawn_future is None:
+            logger.warning(
+                "LSP client capacity exhausted (%d); refusing %s for %s",
+                self._max_clients,
+                srv.server_id,
+                per_server_root,
+            )
+            return None
+
+        # Begin the spawn whose capacity slot was reserved atomically above.
         try:
             ctx = ServerContext(
                 workspace_root=per_server_root,
@@ -589,7 +689,8 @@ class LSPService:
                 return None
             with self._state_lock:
                 self._clients[key] = client
-            self._last_used[key] = time.time()
+                self._client_leases[key] = 1
+                self._last_used[key] = time.time()
             eventlog.log_active(srv.server_id, per_server_root)
             spawn_future.set_result(client)
             return client
@@ -597,14 +698,77 @@ class LSPService:
             with self._state_lock:
                 self._spawning.pop(key, None)
 
+    def _release_client_lease(self, key: Tuple[str, str]) -> None:
+        with self._state_lock:
+            leases = self._client_leases.get(key, 0)
+            if leases <= 1:
+                self._client_leases.pop(key, None)
+            else:
+                self._client_leases[key] = leases - 1
+            if key in self._clients:
+                self._last_used[key] = time.time()
+
+    async def _start_idle_reaper(self) -> None:
+        if self._idle_reaper_task is None:
+            self._idle_reaper_task = asyncio.create_task(
+                self._idle_reaper_loop(), name="hermes-lsp-idle-reaper"
+            )
+
+    async def _idle_reaper_loop(self) -> None:
+        interval = max(1.0, min(60.0, self._idle_timeout / 2.0))
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await self._reap_idle_clients()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("LSP idle reaper sweep failed: %s", exc)
+
+    @staticmethod
+    async def _shutdown_client(client: LSPClient) -> None:
+        try:
+            await client.shutdown()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("LSP client shutdown failed: %s", exc)
+
+    async def _reap_idle_clients(self) -> int:
+        if self._idle_timeout <= 0:
+            return 0
+        cutoff = time.time() - self._idle_timeout
+        with self._state_lock:
+            stale_keys = [
+                key
+                for key, client in self._clients.items()
+                if (not client.is_running or self._last_used.get(key, 0) < cutoff)
+                and self._client_leases.get(key, 0) == 0
+                and key not in self._spawning
+            ]
+            clients = [self._clients.pop(key) for key in stale_keys]
+            for key in stale_keys:
+                self._last_used.pop(key, None)
+                self._client_leases.pop(key, None)
+        if clients:
+            await asyncio.gather(
+                *(self._shutdown_client(client) for client in clients),
+                return_exceptions=True,
+            )
+            logger.info("reaped %d idle LSP client(s)", len(clients))
+        return len(clients)
+
     async def _shutdown_async(self) -> None:
+        reaper = self._idle_reaper_task
+        self._idle_reaper_task = None
+        if reaper is not None:
+            reaper.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await reaper
         with self._state_lock:
             clients = list(self._clients.values())
             self._clients.clear()
             self._broken.clear()
             self._last_used.clear()
+            self._client_leases.clear()
         await asyncio.gather(
-            *(c.shutdown() for c in clients),
+            *(self._shutdown_client(c) for c in clients),
             return_exceptions=True,
         )
 
@@ -625,11 +789,15 @@ class LSPService:
                 for k, c in self._clients.items()
             ]
             broken = list(self._broken)
+            active_leases = sum(self._client_leases.values())
         return {
             "enabled": self._enabled,
             "wait_mode": self._wait_mode,
             "wait_timeout": self._wait_timeout,
             "install_strategy": self._install_strategy,
+            "idle_timeout": self._idle_timeout,
+            "max_clients": self._max_clients,
+            "active_leases": active_leases,
             "clients": clients,
             "broken": broken,
             "disabled_servers": sorted(self._disabled_servers),

@@ -150,7 +150,7 @@ def test_lsp_will_handle_returns_false_on_remote_backend(tmp_path):
     assert not get_service_mock.called
 
 
-def test_lsp_will_handle_swallows_enabled_for_exception(tmp_path):
+def test_lsp_will_handle_swallows_availability_exception(tmp_path):
     """A flaky LSP service must never break the shell-linter fallback —
     if ``enabled_for`` raises, we treat the file as "not handled" so the
     shell linter still runs."""
@@ -159,11 +159,25 @@ def test_lsp_will_handle_swallows_enabled_for_exception(tmp_path):
     src.write_text("const x = 1\n")
 
     fake_svc = MagicMock()
-    fake_svc.enabled_for.side_effect = RuntimeError("server crashed")
+    fake_svc.available_for.side_effect = RuntimeError("server crashed")
 
     with patch.object(fops, "_lsp_local_only", return_value=True), \
          patch("agent.lsp.get_service", return_value=fake_svc):
         assert fops._lsp_will_handle(str(src)) is False
+
+
+def test_lsp_will_handle_keeps_shell_linter_when_capacity_is_exhausted(tmp_path):
+    fops = _make_fops()
+    src = tmp_path / "foo.ts"
+    src.write_text("const x = 1\n")
+    fake_svc = MagicMock()
+    fake_svc.available_for.return_value = False
+
+    with patch.object(fops, "_lsp_local_only", return_value=True), \
+         patch("agent.lsp.get_service", return_value=fake_svc):
+        assert fops._lsp_will_handle(str(src)) is False
+
+    fake_svc.available_for.assert_called_once_with(str(src))
 
 
 def test_tsx_stays_out_of_linters_table_for_default_compatibility():
