@@ -603,6 +603,9 @@ def init_agent(
     agent.no_progress_tool_limit = _bounded_setting(
         "no_progress_tool_limit", 1000, integer=True
     )
+    agent.detached_tool_worker_limit = _bounded_setting(
+        "detached_tool_worker_limit", 256, integer=True
+    ) or 8
     # Shared iteration budget — parent creates, children inherit.
     # Consumed by every LLM turn across parent + all subagents.
     agent.iteration_budget = iteration_budget or IterationBudget(max_iterations)

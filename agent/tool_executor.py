@@ -100,6 +100,49 @@ _MAX_TOOL_WORKERS = 8
 _DEFAULT_CONCURRENT_TOOL_TIMEOUT_S = 420.0
 _TERMINAL_DEFAULT_FOREGROUND_TIMEOUT_S = 180.0
 
+# Process-wide admission accounting for concurrent tool workers.  Timed-out
+# workers cannot be killed safely in CPython, so their admission remains held
+# until the underlying callable really exits.  This turns repeated wedged
+# batches from an unbounded thread leak into explicit backpressure.
+_tool_worker_lifecycle_lock = threading.Lock()
+_tool_worker_lifecycle: dict[int, float | None] = {}
+_tool_worker_lifecycle_seq = 0
+
+
+def _reserve_tool_worker(limit: int) -> int | None:
+    global _tool_worker_lifecycle_seq
+    with _tool_worker_lifecycle_lock:
+        if len(_tool_worker_lifecycle) >= limit:
+            return None
+        _tool_worker_lifecycle_seq += 1
+        token = _tool_worker_lifecycle_seq
+        _tool_worker_lifecycle[token] = None
+        return token
+
+
+def _mark_tool_worker_detached(token: int) -> None:
+    with _tool_worker_lifecycle_lock:
+        if token in _tool_worker_lifecycle and _tool_worker_lifecycle[token] is None:
+            _tool_worker_lifecycle[token] = time.monotonic()
+
+
+def _release_tool_worker(token: int) -> None:
+    with _tool_worker_lifecycle_lock:
+        _tool_worker_lifecycle.pop(token, None)
+
+
+def get_tool_worker_lifecycle_status() -> dict[str, Any]:
+    """Return bounded, secret-free process lifecycle counters."""
+    now = time.monotonic()
+    with _tool_worker_lifecycle_lock:
+        workers = list(_tool_worker_lifecycle.values())
+    detached_ages = [max(0.0, now - detached_at) for detached_at in workers if detached_at]
+    return {
+        "capacity_in_use": len(workers),
+        "detached": len(detached_ages),
+        "oldest_detached_seconds": max(detached_ages, default=0.0),
+    }
+
 
 
 def _parse_tool_arguments(raw_arguments: Any) -> tuple[dict, Optional[str]]:
@@ -885,9 +928,15 @@ def _execute_tool_calls_concurrent_inline(agent, assistant_message, messages: li
         ]
         futures = []
         future_to_index = {}
+        future_to_lifecycle_token = {}
         timed_out_indices: set[int] = set()
         if runnable_calls:
             max_workers = min(len(runnable_calls), _MAX_TOOL_WORKERS)
+            worker_limit = getattr(agent, "detached_tool_worker_limit", _MAX_TOOL_WORKERS)
+            try:
+                worker_limit = max(1, min(int(worker_limit), 256))
+            except (TypeError, ValueError):
+                worker_limit = _MAX_TOOL_WORKERS
             # Daemon workers: an interrupted/timed-out batch is abandoned with
             # shutdown(wait=False), but stdlib ThreadPoolExecutor workers are
             # non-daemon and registered in concurrent.futures' atexit hook,
@@ -920,14 +969,39 @@ def _execute_tool_calls_concurrent_inline(agent, assistant_message, messages: li
                                     parsed_calls[skipped_i][3],
                                 )
                         break
+                    lifecycle_token = _reserve_tool_worker(worker_limit)
+                    if lifecycle_token is None:
+                        results[i] = (
+                            name,
+                            args,
+                            f"Error executing tool '{name}': concurrent tool worker capacity "
+                            f"is exhausted ({worker_limit}); wait for timed-out work to exit",
+                            0.0,
+                            True,
+                            False,
+                            parsed_calls[i][3],
+                        )
+                        logger.warning(
+                            "concurrent tool worker capacity exhausted (%d); refusing %s",
+                            worker_limit,
+                            name,
+                        )
+                        continue
                     # Propagate the agent turn's ContextVars (e.g.
                     # _approval_session_key) AND thread-local approval/sudo
                     # callbacks into the worker thread; clears callbacks on exit.
                     try:
+                        def _run_tracked(*run_args, _token=lifecycle_token):
+                            try:
+                                return _run_tool(*run_args)
+                            finally:
+                                _release_tool_worker(_token)
+
                         f = executor.submit(
-                            propagate_context_to_thread(_run_tool), i, tc, name, args, parsed_calls[i][3]
+                            propagate_context_to_thread(_run_tracked), i, tc, name, args, parsed_calls[i][3]
                         )
                     except RuntimeError as submit_error:
+                        _release_tool_worker(lifecycle_token)
                         if not _is_interpreter_shutdown_submit_error(submit_error):
                             raise
                         skipped_calls = runnable_calls[submit_index:]
@@ -953,8 +1027,14 @@ def _execute_tool_calls_concurrent_inline(agent, assistant_message, messages: li
                                     middleware_trace,
                                 )
                         break
+                    f.add_done_callback(
+                        lambda future, token=lifecycle_token: (
+                            _release_tool_worker(token) if future.cancelled() else None
+                        )
+                    )
                     futures.append(f)
                     future_to_index[f] = i
+                    future_to_lifecycle_token[f] = lifecycle_token
 
                 # Wait for all to complete with periodic heartbeats so the
                 # gateway's inactivity monitor doesn't kill us during long
@@ -1023,6 +1103,9 @@ def _execute_tool_calls_concurrent_inline(agent, assistant_message, messages: li
                             ", ".join(_still_running[:5]),
                         )
                         for f in not_done:
+                            lifecycle_token = future_to_lifecycle_token.get(f)
+                            if lifecycle_token is not None:
+                                _mark_tool_worker_detached(lifecycle_token)
                             f.cancel()
                         with agent._tool_worker_threads_lock:
                             worker_tids = list(agent._tool_worker_threads)
@@ -1048,6 +1131,9 @@ def _execute_tool_calls_concurrent_inline(agent, assistant_message, messages: li
                                 force=True,
                             )
                         for f in not_done:
+                            lifecycle_token = future_to_lifecycle_token.get(f)
+                            if lifecycle_token is not None:
+                                _mark_tool_worker_detached(lifecycle_token)
                             f.cancel()
                         # Give already-running tools a moment to notice the
                         # per-thread interrupt signal and exit gracefully.

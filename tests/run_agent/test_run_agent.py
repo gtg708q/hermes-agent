@@ -2996,6 +2996,64 @@ class TestConcurrentToolExecution:
         assert "fast-result" in flushed[0][-1]["content"]
         assert "timed out after" in flushed[1][-1]["content"]
 
+    def test_concurrent_timeout_holds_global_worker_capacity_until_worker_exits(self, agent, monkeypatch):
+        """A detached worker consumes capacity so repeated timeouts stay bounded."""
+        from agent import tool_executor
+
+        monkeypatch.setenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "0.05")
+        agent.detached_tool_worker_limit = 1
+        drain_deadline = time.monotonic() + 2
+        while time.monotonic() < drain_deadline:
+            if tool_executor.get_tool_worker_lifecycle_status()["capacity_in_use"] == 0:
+                break
+            time.sleep(0.01)
+        assert tool_executor.get_tool_worker_lifecycle_status()["capacity_in_use"] == 0
+        blocker = threading.Event()
+        calls = []
+
+        def fake_handle(name, args, task_id, **kwargs):
+            calls.append(args["q"])
+            if args["q"] == "wedged":
+                blocker.wait(5)
+            return args["q"]
+
+        def run_batch(query):
+            tc = _mock_tool_call(
+                name="web_search",
+                arguments=json.dumps({"q": query}),
+                call_id=f"call-{query}",
+            )
+            batch_messages = []
+            with patch("run_agent.handle_function_call", side_effect=fake_handle):
+                agent._execute_tool_calls_concurrent(
+                    _mock_assistant_msg(content="", tool_calls=[tc]),
+                    batch_messages,
+                    "task-1",
+                )
+            return batch_messages
+
+        try:
+            first = run_batch("wedged")
+            assert "timed out" in first[0]["content"]
+            status = tool_executor.get_tool_worker_lifecycle_status()
+            assert status["detached"] == 1
+            assert status["capacity_in_use"] == 1
+
+            started = time.monotonic()
+            second = run_batch("must-not-start")
+            assert time.monotonic() - started < 0.5
+            assert "worker capacity" in second[0]["content"].lower()
+            assert calls == ["wedged"]
+        finally:
+            blocker.set()
+
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            if tool_executor.get_tool_worker_lifecycle_status()["capacity_in_use"] == 0:
+                break
+            time.sleep(0.01)
+        assert tool_executor.get_tool_worker_lifecycle_status()["capacity_in_use"] == 0
+
     def test_concurrent_timeout_fences_late_real_result_after_deadline(self, agent, monkeypatch):
         """Once the deadline snapshot fences a call, a concurrent worker that
         publishes afterward must not replace the truthful unknown result."""

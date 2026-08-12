@@ -10999,6 +10999,23 @@ def _size_delta_label(saved_mb: float) -> str:
     return f"grew by {-saved_mb:.1f} MB"
 
 
+def _maintenance_chunk_rows_arg(value: str) -> int:
+    """Parse the exclusive-maintenance FTS chunk size CLI option."""
+    try:
+        rows = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if not 500 <= rows <= 100_000:
+        raise argparse.ArgumentTypeError("must be between 500 and 100000")
+    return rows
+
+
+def _apply_maintenance_chunk_rows(db, rows: int | None) -> None:
+    """Increase chunks for one explicitly offline optimize operation."""
+    if rows is not None:
+        db._FTS_REBUILD_CHUNK_ROWS = rows
+
+
 _PRE_UPDATE_SNAPSHOT_KEEP = 1
 
 # Per-file size cap for the pre-update quick snapshot. Anything larger is
@@ -16661,6 +16678,17 @@ def main():
         default=False,
         help="Skip the disk-space confirmation prompt",
     )
+    sessions_optimize_storage.add_argument(
+        "--maintenance-chunk-rows",
+        type=_maintenance_chunk_rows_arg,
+        default=None,
+        metavar="ROWS",
+        help=(
+            "Use larger migration transactions during exclusive offline "
+            "maintenance (500-100000). Never use while a gateway or another "
+            "state.db writer is running."
+        ),
+    )
 
     sessions_repair = sessions_subparsers.add_parser(
         "repair",
@@ -17770,6 +17798,8 @@ def main():
 
         elif action == "optimize-storage":
             db_path = db.db_path
+            maintenance_chunk_rows = getattr(args, "maintenance_chunk_rows", None)
+            _apply_maintenance_chunk_rows(db, maintenance_chunk_rows)
             if not db.fts_optimize_available():
                 print("Search index is already on the compact layout — nothing to do.")
                 db.close()
@@ -17832,6 +17862,11 @@ def main():
                 _last["phase"] = phase
 
             print("Optimizing search-index storage…")
+            if maintenance_chunk_rows is not None:
+                print(
+                    "  Exclusive-maintenance chunk size: "
+                    f"{maintenance_chunk_rows:,} rows"
+                )
             try:
                 result = db.optimize_fts_storage(
                     progress_cb=_progress, vacuum=do_vacuum

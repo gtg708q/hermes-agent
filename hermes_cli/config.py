@@ -951,6 +951,10 @@ DEFAULT_CONFIG = {
         "max_wall_clock_seconds": 0,
         "repeated_tool_error_limit": 0,
         "no_progress_tool_limit": 0,
+        # Process-wide cap for concurrent tool workers. A timed-out worker
+        # continues consuming a slot until its callable actually exits, which
+        # prevents non-cooperative tools from accumulating detached threads.
+        "detached_tool_worker_limit": 8,
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling
         # tools or receiving API responses.  Only fires when the agent has
@@ -3507,6 +3511,10 @@ DEFAULT_CONFIG = {
         # ``"manual"`` — only use binaries already on PATH.
         # ``"off"`` — alias for ``manual``.
         "install_strategy": "auto",
+
+        # Lifecycle bounds for per-workspace language-server processes.
+        "idle_timeout": 600,
+        "max_clients": 8,
 
         # Per-server overrides.  Each key is a server_id from the
         # registry (``pyright``, ``typescript``, ``gopls``,

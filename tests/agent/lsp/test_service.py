@@ -8,7 +8,9 @@ on.
 from __future__ import annotations
 
 import sys
+import time
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -172,5 +174,107 @@ def test_service_status_includes_clients(mock_pyright):
         info = svc.get_status()
         assert info["enabled"] is True
         assert any(c["server_id"] == "pyright" for c in info["clients"])
+    finally:
+        svc.shutdown()
+
+
+def test_idle_reaper_shuts_down_and_removes_stale_client():
+    svc = LSPService(
+        enabled=True,
+        wait_mode="document",
+        wait_timeout=1.0,
+        install_strategy="manual",
+        idle_timeout=0.01,
+        max_clients=4,
+    )
+    client = MagicMock()
+    client.shutdown = AsyncMock()
+    key = ("pyright", "/tmp/stale-workspace")
+    svc._clients[key] = client
+    svc._last_used[key] = time.time() - 60
+    try:
+        reaped = svc._loop.run(svc._reap_idle_clients(), timeout=1.0)
+        assert reaped == 1
+        assert key not in svc._clients
+        client.shutdown.assert_awaited_once()
+    finally:
+        svc.shutdown()
+
+
+def test_client_cap_refuses_new_workspace_when_every_client_is_recent(monkeypatch):
+    svc = LSPService(
+        enabled=True,
+        wait_mode="document",
+        wait_timeout=1.0,
+        install_strategy="manual",
+        idle_timeout=600,
+        max_clients=1,
+    )
+    existing = MagicMock()
+    existing.is_running = True
+    key = ("pyright", "/tmp/recent-workspace")
+    svc._clients[key] = existing
+    svc._last_used[key] = time.time()
+    server = MagicMock()
+    server.server_id = "pyright"
+    server.resolve_root.return_value = "/tmp/new-workspace"
+    monkeypatch.setattr("agent.lsp.manager.find_server_for_file", lambda _path: server)
+    monkeypatch.setattr(
+        "agent.lsp.manager.resolve_workspace_for_file",
+        lambda _path: ("/tmp/new-workspace", True),
+    )
+    try:
+        assert svc.available_for("/tmp/new-workspace/new.py") is False
+        client = svc._loop.run(svc._get_or_spawn("/tmp/new-workspace/new.py"), timeout=1.0)
+        assert client is None
+        assert len(svc._clients) == 1
+    finally:
+        svc.shutdown()
+
+
+def test_idle_reaper_never_shuts_down_a_leased_client():
+    svc = LSPService(
+        enabled=True,
+        wait_mode="document",
+        wait_timeout=1.0,
+        install_strategy="manual",
+        idle_timeout=0.01,
+        max_clients=1,
+    )
+    client = MagicMock()
+    client.shutdown = AsyncMock()
+    key = ("pyright", "/tmp/busy-workspace")
+    svc._clients[key] = client
+    svc._last_used[key] = time.time() - 60
+    svc._client_leases[key] = 1
+    try:
+        reaped = svc._loop.run(svc._reap_idle_clients(), timeout=1.0)
+        assert reaped == 0
+        assert svc._clients[key] is client
+        client.shutdown.assert_not_awaited()
+    finally:
+        svc.shutdown()
+
+
+def test_idle_reaper_removes_recent_dead_client():
+    svc = LSPService(
+        enabled=True,
+        wait_mode="document",
+        wait_timeout=1.0,
+        install_strategy="manual",
+        idle_timeout=600,
+        max_clients=1,
+    )
+    client = MagicMock()
+    client.is_running = False
+    client.shutdown = AsyncMock()
+    key = ("pyright", "/tmp/dead-workspace")
+    svc._clients[key] = client
+    svc._last_used[key] = time.time()
+    try:
+        reaped = svc._loop.run(svc._reap_idle_clients(), timeout=1.0)
+        assert reaped == 1
+        assert key not in svc._clients
+        client.shutdown.assert_awaited_once()
     finally:
         svc.shutdown()

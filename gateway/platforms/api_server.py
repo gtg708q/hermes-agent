@@ -120,6 +120,61 @@ def _hermes_version() -> str:
         return "dev"
 
 
+def _runtime_resource_status(runner: Any = None) -> Dict[str, Any]:
+    """Return bounded, secret-free process and cgroup lifecycle counters."""
+    from agent.tool_executor import get_tool_worker_lifecycle_status
+
+    result: Dict[str, Any] = {
+        "threads": threading.active_count(),
+        "tool_workers": get_tool_worker_lifecycle_status(),
+    }
+    if runner is not None:
+        from gateway.run import _AGENT_CACHE_MAX_SIZE
+
+        cache = getattr(runner, "_agent_cache", None)
+        result["agent_cache"] = {
+            "size": len(cache) if cache is not None else 0,
+            "limit": _AGENT_CACHE_MAX_SIZE,
+            "running": len(getattr(runner, "_running_agents", {})),
+        }
+
+    cgroup: Dict[str, int] = {}
+    try:
+        cgroup["current_bytes"] = int(
+            Path("/sys/fs/cgroup/memory.current").read_text(encoding="utf-8").strip()
+        )
+    except (OSError, ValueError):
+        pass
+    try:
+        selected = {"anon", "file", "kernel", "slab", "sock"}
+        for line in Path("/sys/fs/cgroup/memory.stat").read_text(encoding="utf-8").splitlines():
+            key, _, raw = line.partition(" ")
+            if key in selected:
+                cgroup[f"{key}_bytes"] = int(raw)
+    except (OSError, ValueError):
+        pass
+    if cgroup:
+        result["cgroup_memory"] = cgroup
+
+    # Health probes must not instantiate LSP and spawn a background loop.
+    try:
+        from agent import lsp as lsp_module
+
+        service = getattr(lsp_module, "_service", None)
+        if service is not None:
+            status = service.get_status()
+            result["lsp"] = {
+                "enabled": status.get("enabled", False),
+                "client_count": len(status.get("clients", [])),
+                "broken_count": len(status.get("broken", [])),
+                "max_clients": status.get("max_clients"),
+                "active_leases": status.get("active_leases", 0),
+            }
+    except Exception:  # noqa: BLE001
+        pass
+    return result
+
+
 # Default settings
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8642
@@ -3101,7 +3156,7 @@ class APIServerAdapter(BasePlatformAdapter):
         /proc access.  Requires the same Bearer auth as other API routes.
         """
         auth_err = self._check_auth(request)
-        if auth_err:
+        if auth_err is not None:
             return auth_err
 
         from gateway.status import (
@@ -3128,6 +3183,7 @@ class APIServerAdapter(BasePlatformAdapter):
             process_completion_queue_depth=process_depth,
             active_delegations=active_delegations,
         )
+        runner = self.gateway_runner or request.app.get("gateway_runner")
         return web.json_response({
             "status": readiness["status"],
             "readiness": readiness,
@@ -3150,6 +3206,7 @@ class APIServerAdapter(BasePlatformAdapter):
             # the state file may carry legacy epoch floats or hand-edited junk.
             "updated_at": normalize_updated_at(runtime.get("updated_at")),
             "pid": os.getpid(),
+            "runtime_resources": await asyncio.to_thread(_runtime_resource_status, runner),
         })
 
     async def _handle_models(self, request: "web.Request") -> "web.Response":
